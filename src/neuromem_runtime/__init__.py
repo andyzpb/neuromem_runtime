@@ -18,7 +18,7 @@ from neuromem_runtime.runtime import MemoryRuntime
 from neuromem_runtime.deltas import ExecutionDeltaPlan, GraphDelta, IndexDelta, LifecycleDelta, MemoryDelta, MemorySnapshot, MutationExecutionResult
 from neuromem_runtime.ledger import ExperienceEvent, LedgerEvent, MemoryLedger
 from neuromem_runtime.lifecycle import LifecycleStateMachine
-from neuromem_runtime.policy_v2 import AssociativeEdgeProposal, FrameDeltaProposal, GraphDeltaProposal, LogicEdgeProposal, MemoryPolicyV2, ValidatedMutation
+from neuromem_runtime.policy_v2 import AssociativeEdgeProposal, FrameDeltaProposal, GraphDeltaProposal, LogicEdgeProposal, MemoryPolicyV2, ValidatedMutation, WriteGate
 from neuromem_runtime.plasticity import PlasticityEngine
 from neuromem_runtime.retrieval import (
     ActivationResult,
@@ -66,6 +66,7 @@ __all__ = [
     "MemoryTrace",
     "ExperienceEvent",
     "MemoryPolicyV2",
+    "WriteGate",
     "FrameDeltaProposal",
     "AssociativeEdgeProposal",
     "LogicEdgeProposal",

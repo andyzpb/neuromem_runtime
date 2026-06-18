@@ -10,10 +10,13 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 ProposalSource = Literal["deterministic", "small_llm", "user", "system", "tool", "admin"]
 PolicyIntent = Literal["retrieve", "add", "update", "link", "suppress", "supersede", "consolidate", "delete_request", "noop"]
 RiskLevel = Literal["low", "medium", "high", "critical"]
+WriteGateDecision = Literal["commit", "defer", "noop"]
+DurabilityHorizon = Literal["none", "thread", "cross_thread", "long_term"]
+WriteGateBasis = Literal["current_user_message", "short_term_context", "retrieved_memory", "tool_result", "system"]
 GraphDeltaOperation = Literal["add_edge", "update_edge", "inhibit_edge", "expire_edge"]
 FrameDeltaOperation = Literal["propose_frame", "validate_frame", "promote_frame", "inhibit_frame", "archive_frame"]
 EdgeDeltaOperation = Literal["add_edge", "update_edge", "inhibit_edge", "expire_edge"]
-SemanticCommitmentLevel = Literal["raw_experience", "associative_link", "candidate_frame", "validated_logic", "compiled_schema"]
+SemanticCommitmentLevel = Literal["raw_experience", "durable_memory", "associative_link", "candidate_frame", "validated_logic", "compiled_schema"]
 FrameType = Literal["episode", "fact", "claim", "procedure", "preference", "constraint", "entity", "schema", "failure_pattern"]
 
 
@@ -121,6 +124,17 @@ class TargetSelector(BaseModel):
     namespace: str | None = None
 
 
+class WriteGate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    decision: WriteGateDecision = "noop"
+    durability_horizon: DurabilityHorizon = "none"
+    commitment_level: SemanticCommitmentLevel = "raw_experience"
+    basis: WriteGateBasis = "current_user_message"
+    signals: list[str] = Field(default_factory=list)
+    rationale: str = ""
+
+
 class MemoryPolicyV2(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -137,6 +151,7 @@ class MemoryPolicyV2(BaseModel):
     logic_deltas: list[LogicEdgeProposal] = Field(default_factory=list)
     graph_deltas: list[GraphDeltaProposal] = Field(default_factory=list)
     safety_annotations: dict[str, object] = Field(default_factory=dict)
+    write_gate: WriteGate | None = None
     temporal_scope: str = "all_valid"
     retention_policy: str = "keep_for_audit"
     rollback_plan: str | None = None
@@ -150,6 +165,20 @@ class MemoryPolicyV2(BaseModel):
             evidence_ids = getattr(delta, "evidence_ids", None)
             if isinstance(evidence_ids, list) and not evidence_ids and self.evidence_chain:
                 evidence_ids.extend(evidence.event_id for evidence in self.evidence_chain)
+        return self
+
+    @model_validator(mode="after")
+    def normalize_write_gate(self):
+        if self.write_gate is None:
+            raw = self.safety_annotations.get("write_gate")
+            if isinstance(raw, dict):
+                self.write_gate = WriteGate.model_validate(raw)
+            elif self.proposed_deltas and self.intent in {"add", "update", "link"}:
+                self.write_gate = WriteGate(decision="commit", durability_horizon="long_term", commitment_level="durable_memory")
+            elif self.intent == "noop":
+                self.write_gate = WriteGate(decision="noop")
+        if self.write_gate is not None:
+            self.safety_annotations["write_gate"] = self.write_gate.model_dump(mode="json")
         return self
 
 
@@ -183,4 +212,5 @@ __all__ = [
     "TargetSelector",
     "ValidatedMutation",
     "ValidationStep",
+    "WriteGate",
 ]

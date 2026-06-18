@@ -6,6 +6,7 @@ from typing import Literal, Protocol
 
 from neuromem.core.models import MemoryEdge, MemoryItem, MemoryRelation, utcnow
 from neuromem.stores.base import MemoryStore
+from neuromem_runtime.retrieval import EmbeddingProvider
 from neuromem_runtime.policy_v2 import GraphDeltaProposal, ValidationStep
 
 
@@ -73,6 +74,7 @@ class GraphBuildContext:
     sleep_clusters: list[list[str]] = field(default_factory=list)
     outcome: str = "unknown"
     proposer: str = "deterministic"
+    embedding_provider: EmbeddingProvider | None = None
 
     def memory_by_id(self) -> dict[str, MemoryItem]:
         return {memory.id: memory for memory in self.memories}
@@ -90,6 +92,8 @@ class GraphCandidateGenerator:
     def generate(self, context: GraphBuildContext) -> list[GraphRelationCandidate]:
         by_id = context.memory_by_id()
         pairs: dict[tuple[str, str], GraphRelationCandidate] = {}
+        bulk_import_context = _is_bulk_import_context(context)
+        embedding_scores, embedding_mode = _embedding_similarity_scores(context, list(by_id.values()))
 
         def add_pair(left_id: str, right_id: str, source: str, score: float, suggested: list[str], evidence: list[str] | None = None) -> None:
             if left_id == right_id or left_id not in by_id or right_id not in by_id:
@@ -105,7 +109,7 @@ class GraphCandidateGenerator:
                     source_memory_id=key[0],
                     target_memory_id=key[1],
                     namespace=context.namespace,
-                    evidence_ids=list(dict.fromkeys([*(evidence or []), *context.evidence_ids, *left.evidence, *right.evidence])),
+                    evidence_ids=_candidate_evidence(source, left, right, context, evidence),
                     reason="candidate graph relation from bounded retrieval/mutation context",
                 )
                 pairs[key] = existing
@@ -118,13 +122,14 @@ class GraphCandidateGenerator:
 
         selected = [memory_id for memory_id in context.selected_memory_ids if memory_id in by_id]
         targets = [memory_id for memory_id in context.target_memory_ids if memory_id in by_id]
-        for source_id in selected:
-            for target_id in targets:
-                add_pair(source_id, target_id, "co_use_outcome", 0.42 if context.outcome == "success" else 0.18, ["supports", "retrieved_with"])
-        for ids in [selected, targets, [*selected, *targets]]:
-            for index, left_id in enumerate(ids):
-                for right_id in ids[index + 1 :]:
-                    add_pair(left_id, right_id, "same_query_retrieval", 0.22, ["retrieved_with", "coactivated_with"])
+        if not bulk_import_context:
+            for source_id in selected:
+                for target_id in targets:
+                    add_pair(source_id, target_id, "co_use_outcome", 0.42 if context.outcome == "success" else 0.18, ["supports", "retrieved_with"])
+            for ids in [selected, targets, [*selected, *targets]]:
+                for index, left_id in enumerate(ids):
+                    for right_id in ids[index + 1 :]:
+                        add_pair(left_id, right_id, "same_query_retrieval", 0.22, ["retrieved_with", "coactivated_with"])
         for cluster in context.sleep_clusters:
             cluster_ids = [memory_id for memory_id in cluster if memory_id in by_id]
             for index, left_id in enumerate(cluster_ids):
@@ -132,6 +137,11 @@ class GraphCandidateGenerator:
                     add_pair(left_id, right_id, "same_sleep_cluster", 0.46, ["generalizes", "procedure_for", "derived_from"])
 
         memories = list(by_id.values())
+        lexical_fallback = not (embedding_mode == "usable" and embedding_scores)
+        if not lexical_fallback:
+            for (left_id, right_id), score in embedding_scores.items():
+                if score >= 0.72:
+                    add_pair(left_id, right_id, "embedding_similarity", score * 0.6, ["associated_with", "coactivated_with"])
         for index, left in enumerate(memories):
             for right in memories[index + 1 :]:
                 shared_evidence = sorted(set(left.evidence) & set(right.evidence))
@@ -142,16 +152,20 @@ class GraphCandidateGenerator:
                     add_pair(left.id, right.id, "same_entity", min(0.28, 0.12 + 0.04 * len(shared_entities)), ["associated_with", "supports"])
                 if _canonical_fact_key(left) and _canonical_fact_key(left) == _canonical_fact_key(right):
                     add_pair(left.id, right.id, "same_canonical_fact_key", 0.5, ["same_as", "supersedes", "contradicts"])
-                lexical = _jaccard(left.content, right.content)
-                if lexical >= 0.18:
-                    add_pair(left.id, right.id, "lexical_overlap", lexical * 0.4, ["associated_with", "same_as"])
+                if lexical_fallback:
+                    lexical = _jaccard(left.content, right.content)
+                    if lexical >= 0.18:
+                        add_pair(left.id, right.id, "lexical_overlap", lexical * 0.4, ["associated_with", "same_as"])
                 if _looks_like_supersession(left.content, right.content):
                     add_pair(left.id, right.id, "same_failure_pattern", 0.48, ["supersedes", "contradicts"])
 
-        return sorted(
+        candidates = sorted(
             [candidate for candidate in pairs.values() if candidate.score >= self.min_score and candidate.evidence_ids],
             key=lambda candidate: (-candidate.score, candidate.source_memory_id, candidate.target_memory_id),
         )
+        if bulk_import_context:
+            return _bounded_bulk_import_candidates(candidates, memory_count=len(memories))
+        return candidates
 
 
 class DeterministicRelationProposer:
@@ -342,6 +356,34 @@ def _min_confidence(relation: str) -> float:
     return 0.6
 
 
+def _is_bulk_import_context(context: GraphBuildContext) -> bool:
+    operation = str(context.mutation_trace.get("operation") or "").lower()
+    return operation in {"dashboard_bulk_import", "bulk_import"}
+
+
+def _candidate_evidence(source: str, left: MemoryItem, right: MemoryItem, context: GraphBuildContext, evidence: list[str] | None) -> list[str]:
+    values = [*(evidence or []), *left.evidence, *right.evidence]
+    if source in {"co_use_outcome", "same_query_retrieval", "same_sleep_cluster"}:
+        values.extend(context.evidence_ids[:6])
+    return list(dict.fromkeys(str(value) for value in values if value))[:12]
+
+
+def _bounded_bulk_import_candidates(candidates: list[GraphRelationCandidate], *, memory_count: int) -> list[GraphRelationCandidate]:
+    max_total = max(1, min(80, memory_count - 1))
+    max_degree = 3
+    degrees: dict[str, int] = {}
+    selected: list[GraphRelationCandidate] = []
+    for candidate in candidates:
+        if len(selected) >= max_total:
+            break
+        if degrees.get(candidate.source_memory_id, 0) >= max_degree or degrees.get(candidate.target_memory_id, 0) >= max_degree:
+            continue
+        selected.append(candidate)
+        degrees[candidate.source_memory_id] = degrees.get(candidate.source_memory_id, 0) + 1
+        degrees[candidate.target_memory_id] = degrees.get(candidate.target_memory_id, 0) + 1
+    return selected
+
+
 def _has_shared_basis(source: MemoryItem, target: MemoryItem, proposal: GraphDeltaProposal) -> bool:
     if set(source.evidence) & set(target.evidence):
         return True
@@ -358,11 +400,104 @@ def _canonical_fact_key(item: MemoryItem) -> str:
 
 
 def _jaccard(left: str, right: str) -> float:
-    left_terms = {term.lower().strip(".,:;()[]`'\"?") for term in left.split() if term.strip()}
-    right_terms = {term.lower().strip(".,:;()[]`'\"?") for term in right.split() if term.strip()}
+    left_terms = _content_terms(left)
+    right_terms = _content_terms(right)
     if not left_terms or not right_terms:
         return 0.0
     return len(left_terms & right_terms) / len(left_terms | right_terms)
+
+
+_LOW_INFORMATION_TERMS = {
+    "a",
+    "an",
+    "and",
+    "andy",
+    "as",
+    "at",
+    "but",
+    "by",
+    "did",
+    "does",
+    "for",
+    "from",
+    "he",
+    "his",
+    "in",
+    "is",
+    "it",
+    "near",
+    "not",
+    "number",
+    "of",
+    "on",
+    "once",
+    "one",
+    "or",
+    "saw",
+    "the",
+    "to",
+    "was",
+    "with",
+}
+
+
+def _content_terms(text: str) -> set[str]:
+    terms: set[str] = set()
+    for raw in text.split():
+        term = raw.lower().strip(".,:;()[]`'\"?")
+        if len(term) < 3 or term.isdigit() or term in _LOW_INFORMATION_TERMS:
+            continue
+        terms.add(term)
+    return terms
+
+
+def _embedding_similarity_scores(context: GraphBuildContext, memories: list[MemoryItem]) -> tuple[dict[tuple[str, str], float], str]:
+    provider = context.embedding_provider
+    if provider is None or not memories:
+        return {}, "unavailable"
+    embed = getattr(provider, "embed", None)
+    if embed is None:
+        return {}, "unavailable"
+    texts = [_embedding_text(memory) for memory in memories]
+    try:
+        vectors = embed(texts)
+    except Exception:
+        return {}, "failed"
+    if not isinstance(vectors, list) or len(vectors) != len(memories):
+        return {}, "failed"
+    normalized: list[list[float]] = []
+    for vector in vectors:
+        if not isinstance(vector, list) or not vector:
+            return {}, "failed"
+        normalized.append(_normalize_vector(vector))
+    scores: dict[tuple[str, str], float] = {}
+    for index, left in enumerate(memories):
+        for right_index in range(index + 1, len(memories)):
+            right = memories[right_index]
+            score = _cosine(normalized[index], normalized[right_index])
+            if score > 0:
+                scores[(left.id, right.id)] = score
+    return scores, "usable" if scores else "empty"
+
+
+def _embedding_text(memory: MemoryItem) -> str:
+    parts = [memory.summary or memory.content]
+    if memory.entities:
+        parts.append(" ".join(memory.entities))
+    if memory.keywords:
+        parts.append(" ".join(memory.keywords))
+    if memory.tags:
+        parts.append(" ".join(memory.tags))
+    return " ".join(part for part in parts if part).strip()
+
+
+def _normalize_vector(vector: list[float]) -> list[float]:
+    norm = sum(value * value for value in vector) ** 0.5 or 1.0
+    return [float(value) / norm for value in vector]
+
+
+def _cosine(left: list[float], right: list[float]) -> float:
+    return sum(l * r for l, r in zip(left, right, strict=False))
 
 
 def _looks_like_supersession(left: str, right: str) -> bool:

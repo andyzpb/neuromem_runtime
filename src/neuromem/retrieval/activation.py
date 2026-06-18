@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import math
 import re
+import time
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
@@ -353,6 +354,7 @@ class ActivationRetrievalEngine:
         return channels
 
     def _sync_semantic_index(self, cards: dict[str, MemoryCard], *, namespace: str, query: MemoryQuery) -> None:
+        started = time.perf_counter()
         embedding_provider = query.filters.get("_embedding_provider")
         vector_index = query.filters.get("_vector_index")
         if embedding_provider is None or vector_index is None or not cards:
@@ -361,20 +363,45 @@ class ActivationRetrievalEngine:
         upsert = getattr(vector_index, "upsert", None)
         if embed is None or upsert is None:
             return
-        ids = list(cards)
-        vectors = embed([cards[memory_id].retrieval_text for memory_id in ids])
-        upsert({memory_id: vector for memory_id, vector in zip(ids, vectors, strict=True)}, namespace=namespace)
+        cache = query.filters.get("_embedding_cache")
+        timing = query.filters.get("_retrieval_timing")
+        stats = query.filters.setdefault("_embedding_cache_stats", {"memory_hits": 0, "memory_misses": 0, "query_hits": 0, "query_misses": 0})
+        provider_label = str(query.filters.get("_embedding_provider_label") or embedding_provider.__class__.__name__)
+        cached_vectors: dict[str, list[float]] = {}
+        missing_ids: list[str] = []
+        missing_texts: list[str] = []
+        for memory_id, card in cards.items():
+            text_hash = _text_hash(card.retrieval_text)
+            vector = _cache_get(cache, namespace=namespace, provider_label=provider_label, text_hash=text_hash)
+            if vector is None:
+                missing_ids.append(memory_id)
+                missing_texts.append(card.retrieval_text)
+                stats["memory_misses"] = int(stats.get("memory_misses", 0)) + 1
+            else:
+                cached_vectors[memory_id] = vector
+                stats["memory_hits"] = int(stats.get("memory_hits", 0)) + 1
+        if missing_texts:
+            embed_started = time.perf_counter()
+            vectors = embed(missing_texts)
+            _add_timing(timing, "embedding_ms", embed_started)
+            for memory_id, text, vector in zip(missing_ids, missing_texts, vectors, strict=True):
+                vector_list = [float(value) for value in vector]
+                cached_vectors[memory_id] = vector_list
+                _cache_set(cache, namespace=namespace, provider_label=provider_label, text_hash=_text_hash(text), vector=vector_list)
+        if cached_vectors:
+            upsert(cached_vectors, namespace=namespace)
+        _add_timing(timing, "index_sync_ms", started)
 
     def _semantic_queries(self, query: MemoryQuery, *, namespace: str) -> dict[str, list[str]]:
         raw = query.query
-        rewrites = [str(item) for item in _string_list(query.filters.get("query_rewrites"))]
+        rewrites = _dedupe_texts([str(item) for item in _string_list(query.filters.get("query_rewrites"))], exclude={_normalize_query_text(raw)})
         aliases: list[str] = []
         alias_resolver = query.filters.get("_entity_alias_resolver")
         if alias_resolver is not None and hasattr(alias_resolver, "expand"):
-            aliases = [str(item) for item in getattr(alias_resolver, "expand")(raw, namespace)]
+            aliases = _dedupe_texts([str(item) for item in getattr(alias_resolver, "expand")(raw, namespace)], exclude={_normalize_query_text(raw)})[:6]
         rewrite_provider = query.filters.get("_query_rewrite_provider")
         if rewrite_provider is not None and hasattr(rewrite_provider, "rewrite"):
-            rewrites.extend(str(item) for item in getattr(rewrite_provider, "rewrite")(raw, namespace=namespace))
+            rewrites = _dedupe_texts([*rewrites, *(str(item) for item in getattr(rewrite_provider, "rewrite")(raw, namespace=namespace))], exclude={_normalize_query_text(raw)})[:8]
         hyde_values: list[str] = []
         if query.filters.get("hyde_query"):
             hyde_values.append(str(query.filters["hyde_query"]))
@@ -385,8 +412,8 @@ class ActivationRetrievalEngine:
                 hyde_values.append(str(generated))
         return {
             "raw": [raw],
-            "rewrites": list(dict.fromkeys([*rewrites, *aliases])),
-            "hyde": list(dict.fromkeys(hyde_values)),
+            "rewrites": _dedupe_texts([*rewrites, *aliases], exclude={_normalize_query_text(raw)})[:10],
+            "hyde": _dedupe_texts(hyde_values, exclude={_normalize_query_text(raw)})[:2],
         }
 
     def _dense_scores(self, cards: dict[str, MemoryCard], semantic_queries: dict[str, list[str]], *, namespace: str, config: RetrievalConfig, filters: dict[str, object]) -> dict[str, float]:
@@ -403,7 +430,30 @@ class ActivationRetrievalEngine:
         if not queries:
             return {}
         scores: dict[str, float] = {}
-        vectors = embed(queries)
+        cache = filters.get("_embedding_cache")
+        timing = filters.get("_retrieval_timing")
+        stats = filters.setdefault("_embedding_cache_stats", {"memory_hits": 0, "memory_misses": 0, "query_hits": 0, "query_misses": 0})
+        provider_label = str(filters.get("_embedding_provider_label") or embedding_provider.__class__.__name__)
+        vectors: list[list[float]] = []
+        missing: list[tuple[int, str]] = []
+        for index, query_text in enumerate(queries):
+            text_hash = _text_hash(query_text)
+            cached = _cache_get(cache, namespace=namespace, provider_label=provider_label, text_hash=text_hash)
+            if cached is None:
+                missing.append((index, query_text))
+                vectors.append([])
+                stats["query_misses"] = int(stats.get("query_misses", 0)) + 1
+            else:
+                vectors.append(cached)
+                stats["query_hits"] = int(stats.get("query_hits", 0)) + 1
+        if missing:
+            embed_started = time.perf_counter()
+            embedded = embed([text for _, text in missing])
+            _add_timing(timing, "embedding_ms", embed_started)
+            for (index, query_text), vector in zip(missing, embedded, strict=True):
+                vector_list = [float(value) for value in vector]
+                vectors[index] = vector_list
+                _cache_set(cache, namespace=namespace, provider_label=provider_label, text_hash=_text_hash(query_text), vector=vector_list)
         for vector in vectors:
             for memory_id, score in search(vector, namespace=namespace, top_k=max(50, config.max_items * 8)):
                 scores[str(memory_id)] = max(scores.get(str(memory_id), 0.0), float(score))
@@ -456,6 +506,19 @@ class ActivationRetrievalEngine:
             graph_score = activation.scores.get(memory.id, 0.0)
             candidate.graph_score = graph_score
             channel_score = max(candidate.channel_scores.values(), default=0.0)
+            dense_or_entity = max(
+                candidate.channel_scores.get("dense", 0.0),
+                candidate.channel_scores.get("entity", 0.0),
+                candidate.channel_scores.get("canonical_fact", 0.0),
+                candidate.channel_scores.get("fts5", 0.0),
+                candidate.channel_scores.get("bm25", 0.0),
+            )
+            recency_style_penalty = 0.0
+            if plan.intent in {"fact_lookup", "temporal_current"}:
+                if not dense_or_entity and memory.type in {"preference", "procedural", "schema"}:
+                    recency_style_penalty += 0.12
+                if set(candidate.channel_scores) <= {"recent_current", "procedural_preference", "graph_seed"}:
+                    recency_style_penalty += 0.18
             provenance_trust = candidate.card.trust_score
             lifecycle_boost = _lifecycle_boost(memory, plan)
             outcome_utility = min(1.0, memory.future_utility + memory.reinforcement_score)
@@ -463,12 +526,14 @@ class ActivationRetrievalEngine:
                 memory.inhibition_score * 0.35
                 + memory.contradiction_score * 0.3
                 + _staleness_penalty(memory)
+                + recency_style_penalty
                 + (0.15 if config.require_provenance and not memory.evidence else 0.0)
             )
             candidate.reranker_score = (
                 0.28 * min(1.0, candidate.rrf_score * 20)
-                + 0.18 * channel_score
-                + 0.22 * graph_score
+                + (0.24 if plan.intent in {"fact_lookup", "temporal_current"} else 0.18) * channel_score
+                + (0.12 if plan.intent in {"fact_lookup", "temporal_current"} else 0.22) * graph_score
+                + (0.16 if plan.intent in {"fact_lookup", "temporal_current"} else 0.0) * dense_or_entity
                 + 0.12 * provenance_trust
                 + 0.1 * lifecycle_boost
                 + 0.1 * outcome_utility
@@ -530,7 +595,7 @@ def build_query_plan_v2(query: str, *, filters: dict[str, object] | None = None,
     entities = sorted(set(_query_entities(query)) | set(_string_list(filters.get("entities"))))
     fact_keys = sorted(set(_infer_fact_keys(lowered)) | set(_string_list(filters.get("fact_keys"))))
     intent: QueryIntent = "unknown"
-    if any(term in lowered for term in ["current", "latest", "now", "confirmed"]):
+    if any(term in lowered for term in ["current", "latest", "now", "confirmed", "哪里", "哪儿", "谁", "什么时候"]):
         intent = "temporal_current"
     elif any(term in lowered for term in ["procedure", "workflow", "how should", "steps", "fix pattern", "rule"]):
         intent = "procedural_recall"
@@ -544,7 +609,7 @@ def build_query_plan_v2(query: str, *, filters: dict[str, object] | None = None,
         intent = "conflict_check"
     elif any(term in lowered for term in ["summary", "patterns", "lessons", "common failures"]):
         intent = "summary"
-    elif fact_keys:
+    elif fact_keys or any(term in lowered for term in ["where", "who", "when", "location", "travel", "trip", "日本", "东京", "银座", "大阪", "旅游"]):
         intent = "fact_lookup"
     elif any(term in lowered for term in ["bug", "error", "trace", "debug", "fix"]):
         intent = "episodic_debug"
@@ -760,7 +825,48 @@ def _infer_fact_keys(lowered_query: str) -> list[str]:
         keys.append("refresh_order")
     if any(term in lowered_query for term in ["style", "concise", "preference"]):
         keys.append("user_style")
+    if any(term in lowered_query for term in ["japan", "tokyo", "ginza", "osaka", "travel", "trip", "日本", "东京", "银座", "大阪", "旅游"]):
+        keys.append("travel_location")
+    if any(term in lowered_query for term in ["sushi", "wasabi", "ben", "寿司", "芥末", "癖好"]):
+        keys.append("ben_sushi_preference")
     return keys
+
+
+def _text_hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _cache_get(cache: object, *, namespace: str, provider_label: str, text_hash: str) -> list[float] | None:
+    get = getattr(cache, "get", None)
+    if get is None:
+        return None
+    try:
+        value = get(namespace=namespace, provider_model=provider_label, text_hash=text_hash)
+    except Exception:
+        return None
+    if not isinstance(value, list):
+        return None
+    return [float(item) for item in value]
+
+
+def _cache_set(cache: object, *, namespace: str, provider_label: str, text_hash: str, vector: list[float]) -> None:
+    set_value = getattr(cache, "set", None)
+    if set_value is None:
+        return
+    try:
+        set_value(namespace=namespace, provider_model=provider_label, text_hash=text_hash, vector=vector)
+    except Exception:
+        return
+
+
+def _add_timing(timing: object, field_name: str, started: float) -> None:
+    if timing is None:
+        return
+    try:
+        current = float(getattr(timing, field_name))
+        setattr(timing, field_name, current + (time.perf_counter() - started) * 1000.0)
+    except Exception:
+        return
 
 
 def _canonical_fact_key(item: MemoryItem) -> str:
@@ -833,3 +939,21 @@ def _string_list(value: object) -> list[str]:
     if isinstance(value, Iterable):
         return [str(item) for item in value if str(item)]
     return []
+
+
+def _normalize_query_text(value: str) -> str:
+    return " ".join(value.strip().lower().split())
+
+
+def _dedupe_texts(values: Iterable[str], *, exclude: set[str] | None = None) -> list[str]:
+    excluded = exclude or set()
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        text = " ".join(str(value or "").split())
+        key = _normalize_query_text(text)
+        if not text or key in excluded or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+    return result

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 import tomllib
+from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
@@ -22,6 +25,7 @@ from neuromem_runtime.executor import PolicyExecutionContext, PolicyExecutor
 from neuromem_runtime.ledger import ExperienceEvent, LedgerEvent, MemoryLedger
 from neuromem_runtime.policy_v2 import EvidenceRef, LogicEdgeProposal, MemoryPolicyV2
 from neuromem_runtime.providers import DeterministicPolicyProvider, PolicyProvider
+from neuromem_runtime.performance import BackgroundJobQueue, EmbeddingCache, RetrievalCache, RuntimeTiming, TimingSpan, stable_hash
 from neuromem_runtime.retrieval import (
     EmbeddingProvider,
     EntityAliasResolver,
@@ -88,6 +92,10 @@ class MemoryRuntime:
         self._relation_proposer = relation_proposer or DeterministicRelationProposer()
         self._frame_extractor = DeterministicFrameExtractor()
         self._crystallization_planner = DeterministicCrystallizationPlanner()
+        self._retrieval_cache = RetrievalCache(ttl_seconds=config.retrieval_cache_ttl_seconds)
+        self._retrieval_cache_fingerprints: dict[str, tuple[str, str]] = {}
+        self._embedding_cache = EmbeddingCache(config.db_path) if config.embedding_cache_enabled and embedding_provider is not None else None
+        self._background_jobs = BackgroundJobQueue()
 
     @classmethod
     async def local(
@@ -125,6 +133,11 @@ class MemoryRuntime:
             graph_mode=graph_mode,
             crystallization_mode=crystallization_mode,
             graph_storage=graph_storage,
+            embedding_cache_enabled=_bool_env("NEUROMEM_EMBEDDING_CACHE", True),
+            retrieval_cache_ttl_seconds=_int_env("NEUROMEM_RETRIEVAL_CACHE_TTL_SECONDS", 20),
+            retrieval_graph_commit=_graph_commit_env(),
+            retrieval_mode="full_debug" if os.environ.get("NEUROMEM_CHAT_RETRIEVAL_MODE", "").strip().lower() == "full" else "auto",
+            ollama_keep_alive=os.environ.get("NEUROMEM_OLLAMA_KEEP_ALIVE", "30m"),
         )
         _write_config(root / "config.toml", config)
         runtime = NeuroMemRuntime(
@@ -264,6 +277,7 @@ class MemoryRuntime:
             ),
         )
         self._persist_trace(result.trace.trace_id, result.trace.to_dict())
+        self._invalidate_retrieval_cache()
         memory_id = result.created_memory_ids[0] if result.created_memory_ids else None
         stored_item = self._runtime.store.get_memory(memory_id) if self._runtime.store is not None and memory_id else None
         if self._graph_mode != "off" and memory_id is not None:
@@ -296,16 +310,43 @@ class MemoryRuntime:
         namespace: str | None = None,
         top_k: int | None = None,
     ) -> MemoryContext:
+        timing = RuntimeTiming()
         query_obj = query if isinstance(query, MemoryQuery) else MemoryQuery(query=query, budget_tokens=budget_tokens, filters=filters or {})
         resolved_lens = self._resolve_lens(query_obj.query, lens)
         query_obj.filters["retrieval_lens"] = resolved_lens
         if top_k is not None:
             query_obj.filters["top_k"] = top_k
         query_obj.filters.update(self._semantic_filters(query_obj.query))
+        query_obj.filters["_retrieval_timing"] = timing
         if namespace is not None:
             query_obj.filters["namespace"] = namespace
+        namespace_value = str(query_obj.filters.get("namespace") or self.config.namespace)
+        store_version = self._store_version(namespace_value)
+        filter_hash = self._retrieval_filter_hash(query_obj, resolved_lens=resolved_lens)
+        cache_key = self._retrieval_cache_key(query_obj, resolved_lens=resolved_lens, store_version=store_version, filter_hash=filter_hash)
+        cache_probe_key = self._retrieval_cache_probe_key(query_obj, resolved_lens=resolved_lens)
+        diagnostic_miss_reason = self._retrieval_miss_reason(
+            cache_probe_key,
+            semantic_version=store_version,
+            filter_hash=filter_hash,
+        )
+        cached = self._retrieval_cache.get(cache_key)
+        if isinstance(cached, MemoryContext):
+            self._retrieval_cache_fingerprints[cache_probe_key] = (store_version, filter_hash)
+            cached_context = _copy_memory_context(cached)
+            cached_context.cache = {
+                **cached.cache,
+                "retrieval_cache": "hit",
+                "retrieval_cache_stats": self._retrieval_cache.stats(),
+                "cache_key_version": store_version[:12],
+                "semantic_version_short": store_version[:12],
+                "filter_hash": filter_hash[:12],
+                "miss_reason": None,
+            }
+            return cached_context
         before_states = self._memory_states()
-        results, trace = self._runtime.retrieve_with_trace(query_obj.query, filters=query_obj.filters, budget_tokens=query_obj.budget_tokens, task_id=query_obj.query)
+        with TimingSpan(timing, "retrieval_ms"):
+            results, trace = self._runtime.retrieve_with_trace(query_obj.query, filters=query_obj.filters, budget_tokens=query_obj.budget_tokens, task_id=query_obj.query)
         results = self._apply_retrieval_lens(results, resolved_lens)
         if top_k is not None:
             results = results[:top_k]
@@ -318,6 +359,7 @@ class MemoryRuntime:
         candidate_details = trace.query_plan.get("candidate_details", {}) if isinstance(trace.query_plan.get("candidate_details", {}), dict) else {}
         retrieval_ledger = trace.query_plan.get("retrieval_ledger", {}) if isinstance(trace.query_plan.get("retrieval_ledger", {}), dict) else {}
         query_plan_v2 = trace.query_plan.get("query_plan_v2", {}) if isinstance(trace.query_plan.get("query_plan_v2", {}), dict) else {}
+        embedding_cache_stats = trace.query_plan.get("embedding_cache_stats", {}) if isinstance(trace.query_plan.get("embedding_cache_stats", {}), dict) else {}
         source_channels = list(retrieval_ledger.get("channel_candidates", {}).keys()) if isinstance(retrieval_ledger.get("channel_candidates", {}), dict) else list(trace.source_channels)
         embedding_mode = "enabled" if self._embedding_provider is not None else "disabled"
         trace.query_plan.update(
@@ -362,12 +404,23 @@ class MemoryRuntime:
                 audit=trace_dict,
             )
         )
-        retrieval_graph = self._commit_retrieval_graph(trace)
+        retrieval_graph = self._handle_retrieval_graph_commit(trace, timing)
         if retrieval_graph is not None:
             trace.query_plan["semantic_graph_builder"] = retrieval_graph
         transactions = self._ledger.events_for_trace(trace.trace_id, namespace=self.config.namespace) or [transaction.to_dict() for transaction in trace.to_transactions()]
         self._persist_trace(trace_id, trace.to_dict())
-        return MemoryContext(
+        cache_info = {
+            "retrieval_cache": "miss",
+            "retrieval_cache_stats": self._retrieval_cache.stats(),
+            "embedding_cache": dict(embedding_cache_stats),
+            "cache_key_version": store_version[:12],
+            "semantic_version_short": store_version[:12],
+            "filter_hash": filter_hash[:12],
+            "miss_reason": diagnostic_miss_reason or self._retrieval_cache.last_miss_reason,
+        }
+        retrieval_metadata = dict(trace.query_plan.get("retrieval_metadata", {})) if isinstance(trace.query_plan.get("retrieval_metadata", {}), dict) else {}
+        retrieval_metadata["retrieval_lens"] = resolved_lens
+        context = MemoryContext(
             query=query_obj.query,
             text=text,
             selected_memory_ids=[result.memory.id for result in results],
@@ -389,7 +442,13 @@ class MemoryRuntime:
                 for result in results
             ],
             transactions=transactions,
+            timing=timing.to_dict(),
+            cache=cache_info,
+            retrieval_metadata=retrieval_metadata,
         )
+        self._retrieval_cache.set(cache_key, context, semantic_version=store_version, filter_hash=filter_hash)
+        self._retrieval_cache_fingerprints[cache_probe_key] = (store_version, filter_hash)
+        return context
 
     async def propose(self, value: str | dict[str, object]) -> MemoryPolicy | MemoryPolicyV2:
         data = {"query": value} if isinstance(value, str) else dict(value)
@@ -412,6 +471,8 @@ class MemoryRuntime:
             ),
         )
         self._persist_trace(result.trace.trace_id, result.trace.to_dict())
+        if phase == "after_step":
+            self._invalidate_retrieval_cache()
         value = result.trace.to_dict()
         value["mutation_execution_result"] = result.to_dict()
         return value
@@ -426,6 +487,8 @@ class MemoryRuntime:
         trace_id = self._runtime.last_trace.trace_id if self._runtime.last_trace is not None else None
         replay_trace_ids = [trace_id] if trace_id is not None else []
         plan = self._sleep_planner.plan(policy="manual", replay_trace_ids=replay_trace_ids)
+        sleep_graph: dict[str, object] = {}
+        sleep_crystallization: dict[str, object] = {}
         with self._runtime.store.transaction() as conn:  # type: ignore[attr-defined]
             self._ledger.append(
                 LedgerEvent(
@@ -459,24 +522,9 @@ class MemoryRuntime:
             )
             consolidation_report = self._runtime.neuro_sleep().to_dict()
             sleep_clusters = [[str(memory_id) for memory_id in cluster] for cluster in consolidation_report.get("replay_clusters", []) if isinstance(cluster, list)]
-            sleep_graph = self._commit_auto_graph(
-                selected_memory_ids=[memory_id for cluster in sleep_clusters for memory_id in cluster],
-                target_memory_ids=[str(memory_id) for memory_id in consolidation_report.get("compressed_memory_ids", [])],
-                evidence_ids=[f"sleep:{transaction_id}"],
-                outcome="success",
-                sleep_clusters=sleep_clusters,
-                mutation_trace={"operation": "sleep_graph_compiler"},
-            ) or {}
-            sleep_crystallization = self._commit_sleep_crystallization(
-                sleep_clusters=sleep_clusters,
-                evidence_ids=[f"sleep:{transaction_id}"],
-                transaction_id=transaction_id,
-            )
             memories_after = self._memory_states()
             deltas = _memory_deltas_for_fields(memories_before, memories_after, fields=None, reason="governed sleep")
-            graph_deltas = list(((sleep_graph.get("result") or {}).get("graph_deltas", []))) if isinstance(sleep_graph.get("result"), dict) else []
-            if isinstance(sleep_crystallization.get("result"), dict):
-                graph_deltas.extend(list(sleep_crystallization["result"].get("graph_deltas", [])))
+            graph_deltas: list[object] = []
             targets = sorted({str(delta["memory_id"]) for delta in deltas if delta.get("memory_id")})
             lifecycle_deltas = [delta for delta in deltas if delta.get("field") in {"maturity", "type", "summary", "tags", "supersedes", "derived_from"}]
             memory_delta_objs = [_memory_delta_from_dict(delta) for delta in deltas]
@@ -511,8 +559,8 @@ class MemoryRuntime:
                     targets=targets,
                     memory_delta=deltas,
                     lifecycle_delta=lifecycle_deltas,
-                    graph_delta=graph_deltas,
-                    audit={"consolidation_report": consolidation_report, "sleep_graph": sleep_graph, "sleep_crystallization": sleep_crystallization},
+                    graph_delta=[],
+                    audit={"consolidation_report": consolidation_report},
                 ),
                 conn=conn,
             )
@@ -547,8 +595,8 @@ class MemoryRuntime:
                     validator_decision="approved",
                     targets=[str(item) for item in consolidation_report.get("compressed_memory_ids", [])],
                     memory_delta=[delta for delta in deltas if delta.get("field") in {"type", "summary", "tags", "consolidation_count"}],
-                    graph_delta=graph_deltas,
-                    audit={"compressed_memory_ids": consolidation_report.get("compressed_memory_ids", []), "sleep_graph": sleep_graph, "sleep_crystallization": sleep_crystallization},
+                    graph_delta=[],
+                    audit={"compressed_memory_ids": consolidation_report.get("compressed_memory_ids", [])},
                 ),
                 conn=conn,
             )
@@ -566,8 +614,8 @@ class MemoryRuntime:
                     targets=targets,
                     memory_delta=deltas,
                     lifecycle_delta=lifecycle_deltas,
-                    graph_delta=graph_deltas,
-                    audit={"consolidation_report": consolidation_report, "sleep_graph": sleep_graph, "sleep_crystallization": sleep_crystallization},
+                    graph_delta=[],
+                    audit={"consolidation_report": consolidation_report},
                 ),
                 conn=conn,
             )
@@ -575,9 +623,27 @@ class MemoryRuntime:
                 state = memories_after.get(memory_id)
                 if state is not None:
                     self._ledger.record_memory_version(memory_id, transaction_id, state, conn=conn)
+        sleep_graph = self._commit_auto_graph(
+            selected_memory_ids=[memory_id for cluster in sleep_clusters for memory_id in cluster],
+            target_memory_ids=[str(memory_id) for memory_id in consolidation_report.get("compressed_memory_ids", [])],
+            evidence_ids=[f"sleep:{transaction_id}"],
+            outcome="success",
+            sleep_clusters=sleep_clusters,
+            mutation_trace={"operation": "sleep_graph_compiler"},
+            invalidate_retrieval_cache=False,
+        ) or {}
+        sleep_crystallization = self._commit_sleep_crystallization(
+            sleep_clusters=sleep_clusters,
+            evidence_ids=[f"sleep:{transaction_id}"],
+            transaction_id=transaction_id,
+        )
+        graph_deltas = list(((sleep_graph.get("result") or {}).get("graph_deltas", []))) if isinstance(sleep_graph.get("result"), dict) else []
+        if isinstance(sleep_crystallization.get("result"), dict):
+            graph_deltas.extend(list(sleep_crystallization["result"].get("graph_deltas", [])))
         trace = self._runtime.last_trace
         if trace is not None:
             self._persist_trace(trace.trace_id, trace.to_dict())
+        self._invalidate_retrieval_cache()
         sleep_report = SleepReport(
             plan=plan,
             replay=ReplayBatch(trace_ids=replay_trace_ids),
@@ -716,6 +782,8 @@ class MemoryRuntime:
         if self._embedding_provider is not None and self._vector_index is not None:
             filters["_embedding_provider"] = self._embedding_provider
             filters["_vector_index"] = self._vector_index
+            filters["_embedding_provider_label"] = self._embedding_provider_label()
+            filters["_embedding_cache"] = self._embedding_cache
             filters.setdefault("retrieval_channels", ("fts5", "bm25", "dense", "rewrite", "hyde", "lexical", "entity", "recent_current", "procedural_preference", "canonical_fact", "graph_seed"))
         if self._query_rewrite_provider is not None:
             filters["_query_rewrite_provider"] = self._query_rewrite_provider
@@ -729,6 +797,140 @@ class MemoryRuntime:
                 filters["entities"] = aliases
         return filters
 
+    def _handle_retrieval_graph_commit(self, trace: object, timing: RuntimeTiming) -> dict[str, object] | None:
+        mode = self.config.retrieval_graph_commit
+        if mode == "off":
+            return {"status": "off"}
+        if mode == "async":
+            selected = [str(memory_id) for memory_id in getattr(trace, "selected_memory_ids", [])]
+            if len(selected) < 2:
+                return None
+            trace_id = str(getattr(trace, "trace_id", ""))
+            query_plan = dict(getattr(trace, "query_plan", {}) or {})
+
+            def run() -> object:
+                return self._commit_auto_graph(
+                    selected_memory_ids=selected,
+                    target_memory_ids=selected,
+                    evidence_ids=[f"trace:{trace_id}"],
+                    outcome="success",
+                    retrieval_trace=query_plan,
+                    invalidate_retrieval_cache=False,
+                )
+
+            job = self._background_jobs.submit("retrieval_graph_commit", run)
+            return {"status": "queued", "job": job}
+        with TimingSpan(timing, "graph_commit_ms"):
+            return self._commit_retrieval_graph(trace)
+
+    def _retrieval_cache_key(self, query: MemoryQuery, *, resolved_lens: str, store_version: str, filter_hash: str) -> str:
+        filters = {
+            key: value
+            for key, value in query.filters.items()
+            if not str(key).startswith("_") and key not in {"retrieval_lens"}
+        }
+        return stable_hash(
+            {
+                "namespace": filters.get("namespace", self.config.namespace),
+                "query": query.query.strip().lower(),
+                "budget_tokens": query.budget_tokens,
+                "lens": resolved_lens,
+                "top_k": filters.get("top_k"),
+                "filter_hash": filter_hash,
+                "store_version": store_version,
+                "embedding_provider": self._embedding_provider_label(),
+            }
+        )
+
+    def _retrieval_cache_probe_key(self, query: MemoryQuery, *, resolved_lens: str) -> str:
+        filters = {
+            key: value
+            for key, value in query.filters.items()
+            if not str(key).startswith("_") and key not in {"retrieval_lens"}
+        }
+        return stable_hash(
+            {
+                "namespace": filters.get("namespace", self.config.namespace),
+                "query": query.query.strip().lower(),
+                "budget_tokens": query.budget_tokens,
+                "lens": resolved_lens,
+                "top_k": filters.get("top_k"),
+                "embedding_provider": self._embedding_provider_label(),
+            }
+        )
+
+    def _retrieval_miss_reason(self, probe_key: str, *, semantic_version: str, filter_hash: str) -> str | None:
+        previous = self._retrieval_cache_fingerprints.get(probe_key)
+        if previous is None:
+            return None
+        previous_semantic_version, previous_filter_hash = previous
+        if previous_semantic_version != semantic_version:
+            return "semantic_version_changed"
+        if previous_filter_hash != filter_hash:
+            return "filter_changed"
+        return None
+
+    def _retrieval_filter_hash(self, query: MemoryQuery, *, resolved_lens: str) -> str:
+        filters = {
+            key: value
+            for key, value in query.filters.items()
+            if not str(key).startswith("_") and key not in {"retrieval_lens"}
+        }
+        return stable_hash({"lens": resolved_lens, "budget_tokens": query.budget_tokens, "filters": filters})
+
+    def _store_version(self, namespace: str) -> str:
+        if self._runtime.store is None:
+            return "empty"
+        memories = self._runtime.store.list_memories(namespace=namespace)
+        semantic_records: list[dict[str, object]] = []
+        for memory in memories:
+            semantic_records.append(
+                {
+                    "id": memory.id,
+                    "namespace": memory.namespace,
+                    "type": memory.type,
+                    "content": memory.content,
+                    "summary": memory.summary,
+                    "evidence": sorted(memory.evidence),
+                    "entities": sorted(memory.entities),
+                    "keywords": sorted(memory.keywords),
+                    "tags": sorted(memory.tags),
+                    "maturity": memory.maturity,
+                    "valid_from": memory.valid_from.isoformat() if memory.valid_from else None,
+                    "valid_to": memory.valid_to.isoformat() if memory.valid_to else None,
+                    "privacy_level": memory.privacy_level,
+                    "acl": sorted(memory.acl),
+                    "deletion_policy": memory.deletion_policy,
+                }
+            )
+        return stable_hash({"namespace": namespace, "memories": semantic_records})[:16]
+
+    def _invalidate_retrieval_cache(self, reason: str = "invalidated_by_mutation") -> None:
+        self._retrieval_cache.invalidate(reason)
+
+    def _embedding_provider_label(self) -> str:
+        provider = self._embedding_provider
+        if provider is None:
+            return "disabled"
+        config = getattr(provider, "config", None)
+        model = getattr(config, "model", None)
+        if model:
+            return f"{provider.__class__.__name__}:{model}"
+        return provider.__class__.__name__
+
+    def performance_stats(self) -> dict[str, object]:
+        provider_stats = getattr(self._embedding_provider, "stats", None)
+        embedding_stats = provider_stats() if callable(provider_stats) else {}
+        return {
+            "retrieval_cache": self._retrieval_cache.stats(),
+            "embedding_cache_enabled": self._embedding_cache is not None,
+            "embedding_provider": self._embedding_provider_label(),
+            "embedding_provider_stats": embedding_stats,
+            "background_jobs": self._background_jobs.recent(),
+            "retrieval_graph_commit": self.config.retrieval_graph_commit,
+            "retrieval_mode": self.config.retrieval_mode,
+        }
+
     def _commit_retrieval_graph(self, trace: object) -> dict[str, object] | None:
         selected = [str(memory_id) for memory_id in getattr(trace, "selected_memory_ids", [])]
         if len(selected) < 2:
@@ -739,6 +941,7 @@ class MemoryRuntime:
             evidence_ids=[f"trace:{getattr(trace, 'trace_id', '')}"],
             outcome="success",
             retrieval_trace=getattr(trace, "query_plan", {}),
+            invalidate_retrieval_cache=False,
         )
 
     def _commit_auto_graph(
@@ -751,6 +954,7 @@ class MemoryRuntime:
         retrieval_trace: dict[str, object] | None = None,
         mutation_trace: dict[str, object] | None = None,
         sleep_clusters: list[list[str]] | None = None,
+        invalidate_retrieval_cache: bool = True,
     ) -> dict[str, object] | None:
         if self._graph_mode == "off" or self._runtime.store is None:
             return None
@@ -766,6 +970,7 @@ class MemoryRuntime:
             sleep_clusters=sleep_clusters or [],
             outcome=outcome,
             proposer="deterministic",
+            embedding_provider=self._embedding_provider,
         )
         candidates = self._graph_candidate_generator.generate(context)
         if not candidates:
@@ -793,6 +998,8 @@ class MemoryRuntime:
                 agent_id=self.config.agent_id,
             ),
         )
+        if invalidate_retrieval_cache:
+            self._invalidate_retrieval_cache()
         self._persist_trace(result.trace.trace_id, result.trace.to_dict())
         return {
             "candidates": [candidate.to_dict() for candidate in candidates],
@@ -817,6 +1024,7 @@ class MemoryRuntime:
             sleep_clusters=sleep_clusters,
             outcome="success",
             proposer="deterministic",
+            embedding_provider=self._embedding_provider,
         )
         compiled_frames = self._crystallization_planner.plan_sleep_frames(context)
         if not compiled_frames:
@@ -905,6 +1113,39 @@ def _write_config(path: Path, config: RuntimeConfig) -> None:
         lines.append(f'{key} = "{values[key]}"')
     lines.append(f"model_policy_enabled = {str(config.model_policy_enabled).lower()}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _copy_memory_context(context: MemoryContext) -> MemoryContext:
+    return replace(
+        context,
+        selected_memory_ids=list(context.selected_memory_ids),
+        results=[dict(item) for item in context.results],
+        transactions=[dict(item) for item in context.transactions],
+        timing=dict(context.timing),
+        cache=dict(context.cache),
+        retrieval_metadata=dict(context.retrieval_metadata),
+    )
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off", "disabled"}
+
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+
+
+def _graph_commit_env() -> str:
+    value = os.environ.get("NEUROMEM_RETRIEVAL_GRAPH_COMMIT", "async").strip().lower()
+    if value in {"async", "off", "sync"}:
+        return value
+    return "async"
 
 
 __all__ = ["MemoryRuntime"]

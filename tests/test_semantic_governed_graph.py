@@ -22,6 +22,20 @@ class FakeMultilingualEmbedding:
         return vectors
 
 
+class TopicEmbedding:
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for text in texts:
+            lowered = text.lower()
+            if any(term in lowered for term in ["espresso", "cafe", "coffee"]):
+                vectors.append([1.0, 0.0, 0.0, 0.0])
+            elif any(term in lowered for term in ["bicycle", "train", "commute"]):
+                vectors.append([0.0, 1.0, 0.0, 0.0])
+            else:
+                vectors.append([0.0, 0.0, 1.0, 0.0])
+        return vectors
+
+
 class FakeHyDE:
     def generate(self, query: str, *, namespace: str = "default") -> str | None:
         del query, namespace
@@ -70,6 +84,64 @@ def test_graph_candidate_generator_outputs_candidates_not_edges() -> None:
     assert candidates[0].source_memory_id in {left.id, right.id}
     assert candidates[0].target_memory_id in {left.id, right.id}
     assert candidates[0].evidence_ids
+
+
+def test_graph_candidate_generator_does_not_fully_connect_bulk_import_noise() -> None:
+    memories = [
+        MemoryItem(id=f"mem-{index}", namespace="demo", content=content, evidence=[f"evt-{index}"])
+        for index, content in enumerate(
+            [
+                "espresso beans roast profile",
+                "bicycle derailleur tuning",
+                "coffee grinder burr size",
+                "train timetable platform change",
+                "garden soil moisture check",
+                "route planner commute shortcut",
+                "menu layout cafe breakfast",
+                "repair kit bike tire patch",
+            ]
+        )
+    ]
+    context = nmem.GraphBuildContext(
+        namespace="demo",
+        memories=memories,
+        selected_memory_ids=[memory.id for memory in memories],
+        target_memory_ids=[memory.id for memory in memories],
+        evidence_ids=[f"evt-{index}" for index in range(8)],
+        mutation_trace={"operation": "dashboard_bulk_import"},
+        outcome="success",
+    )
+
+    candidates = nmem.GraphCandidateGenerator().generate(context)
+
+    assert len(candidates) < 8
+
+
+def test_graph_candidate_generator_uses_embedding_similarity_when_available() -> None:
+    left = MemoryItem(id="mem-left", namespace="demo", content="Coffee shop notes about espresso beans and cafe flow.", evidence=["evt-1"])
+    right = MemoryItem(id="mem-right", namespace="demo", content="Cafe workflow for espresso service and tasting.", evidence=["evt-2"])
+    noise = MemoryItem(id="mem-noise", namespace="demo", content="Bicycle repair checklist for commute setup.", evidence=["evt-3"])
+    context = nmem.GraphBuildContext(
+        namespace="demo",
+        memories=[left, right, noise],
+        selected_memory_ids=[left.id],
+        target_memory_ids=[right.id],
+        evidence_ids=["evt-1", "evt-2", "evt-3"],
+        outcome="success",
+        embedding_provider=TopicEmbedding(),
+    )
+
+    candidates = nmem.GraphCandidateGenerator().generate(context)
+
+    assert any(
+        "embedding_similarity" in candidate.candidate_sources
+        and {candidate.source_memory_id, candidate.target_memory_id} == {left.id, right.id}
+        for candidate in candidates
+    )
+    assert all(
+        {candidate.source_memory_id, candidate.target_memory_id} != {left.id, noise.id}
+        for candidate in candidates
+    )
 
 
 def test_graph_delta_policy_commits_edge_and_rejects_missing_evidence(tmp_path) -> None:
@@ -124,7 +196,9 @@ def test_graph_delta_policy_commits_edge_and_rejects_missing_evidence(tmp_path) 
     asyncio.run(run())
 
 
-def test_automatic_retrieval_graph_builder_uses_bounded_candidates(tmp_path) -> None:
+def test_automatic_retrieval_graph_builder_uses_bounded_candidates(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("NEUROMEM_RETRIEVAL_GRAPH_COMMIT", "sync")
+
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
         first = await memory.observe_and_commit({"content": "Login redirect bug fixed by session refresh.", "keywords": ["login", "redirect"], "evidence": "evt-a"})
@@ -134,8 +208,29 @@ def test_automatic_retrieval_graph_builder_uses_bounded_candidates(tmp_path) -> 
         replay = await memory.replay_trace(context.trace_id)
         assert replay is not None
         assert "semantic_graph_builder" in replay["query_plan"]
-        edges = memory.unsafe_internal_runtime.store.list_edges()  # type: ignore[union-attr]
+        store = memory.unsafe_internal_runtime.store
+        edges = store.list_edges()  # type: ignore[union-attr]
         assert any({edge.source_id, edge.target_id} == {first.memory_id, second.memory_id} for edge in edges)
+        associative_edges = store.list_associative_edges(namespace="demo")  # type: ignore[union-attr]
+        assert any({edge.source_id, edge.target_id} == {first.memory_id, second.memory_id} for edge in associative_edges)
+
+    asyncio.run(run())
+
+
+def test_default_retrieval_graph_commit_is_queued(tmp_path, monkeypatch) -> None:
+    monkeypatch.delenv("NEUROMEM_RETRIEVAL_GRAPH_COMMIT", raising=False)
+
+    async def run() -> None:
+        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
+        await memory.observe_and_commit({"content": "Login redirect bug fixed by session refresh.", "keywords": ["login", "redirect"], "evidence": "evt-a"})
+        await memory.observe_and_commit({"content": "Session refresh depends on redirect validation.", "keywords": ["session", "redirect"], "evidence": "evt-b"})
+
+        context = await memory.query("login redirect session")
+        replay = await memory.replay_trace(context.trace_id)
+
+        assert replay is not None
+        builder = replay["query_plan"]["semantic_graph_builder"]
+        assert builder["status"] == "queued"
 
     asyncio.run(run())
 

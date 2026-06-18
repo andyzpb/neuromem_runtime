@@ -28,7 +28,7 @@ from neuromem_runtime.crystallization import (
 from neuromem_runtime.deltas import GraphDelta, IndexDelta, LifecycleDelta, MemoryDelta, MutationExecutionResult
 from neuromem_runtime.ledger import LedgerEvent, MemoryLedger
 from neuromem_runtime.lifecycle import LifecycleStateMachine
-from neuromem_runtime.policy_v2 import AssociativeEdgeProposal, FrameDeltaProposal, GraphDeltaProposal, LogicEdgeProposal, MemoryPolicyV2, ValidatedMutation, ValidationStep
+from neuromem_runtime.policy_v2 import AssociativeEdgeProposal, FrameDeltaProposal, GraphDeltaProposal, LogicEdgeProposal, MemoryPolicyV2, ProposedDelta, ValidatedMutation, ValidationStep
 from neuromem_runtime.semantic_graph import (
     GraphBuildContext,
     GraphDeltaValidator,
@@ -77,6 +77,7 @@ class PolicyExecutor:
         legacy_policy = self._coerce_policy(policy)
         graph_proposals = self._graph_proposals(policy)
         frame_proposals, associative_proposals, logic_proposals = self._structural_proposals(policy, graph_proposals, context)
+        legacy_policies = self._coerce_memory_write_policies(policy)
         if isinstance(policy, MemoryPolicyV2):
             unsupported = self._unsupported_v2_reason(policy)
             if unsupported:
@@ -85,13 +86,18 @@ class PolicyExecutor:
 
         before_memories = self._snapshot_memories(context.namespace)
         before_edges = self._snapshot_edges()
-        pre_validation = self.validator_stack.validate(legacy_policy, self._validation_context(context))
+        validation_context = self._validation_context(context)
+        pre_validations = [self.validator_stack.validate(item, validation_context) for item in legacy_policies]
+        pre_validation = self._merge_validations(pre_validations)
         if not pre_validation.approved:
             return self._record_rejection(legacy_policy, context, pre_validation)
 
         transaction_id = f"txn_{uuid4().hex}"
         try:
             with self.runtime.store.transaction() as conn:  # type: ignore[attr-defined]
+                proposal_audit = {"policy": self._policy_dict(legacy_policy)}
+                if isinstance(policy, MemoryPolicyV2):
+                    proposal_audit["policy_v2"] = policy.model_dump(mode="json")
                 self._append_stage(
                     transaction_id,
                     None,
@@ -101,12 +107,12 @@ class PolicyExecutor:
                     pre_validation,
                     context=context,
                     conn=conn,
-                    audit={"policy": self._policy_dict(legacy_policy)},
+                    audit=proposal_audit,
                 )
                 approved = ValidatedPolicy(
                     policy=legacy_policy,
                     approved=True,
-                    approved_actions=self._approved_actions(legacy_policy),
+                    approved_actions=self._approved_actions_for_policies(legacy_policies),
                     rejected_reasons=[],
                 )
                 self._append_stage(
@@ -120,15 +126,22 @@ class PolicyExecutor:
                     conn=conn,
                     audit=pre_validation.model_dump(),
                 )
-                self.runtime._execute_validated_policy(  # noqa: SLF001 - executor wraps core primitive in validation, transaction, and audit.
-                    legacy_policy,
-                    approved,
-                    phase=context.phase,
-                    task=context.task,
-                    query=context.query,
-                    state=context.state,
-                    retrieved_memory_ids=context.retrieved_memory_ids,
-                )
+                for item in legacy_policies:
+                    item_approved = ValidatedPolicy(
+                        policy=item,
+                        approved=True,
+                        approved_actions=self._approved_actions(item),
+                        rejected_reasons=[],
+                    )
+                    self.runtime._execute_validated_policy(  # noqa: SLF001 - executor wraps core primitive in validation, transaction, and audit.
+                        item,
+                        item_approved,
+                        phase=context.phase,
+                        task=context.task,
+                        query=context.query,
+                        state=context.state,
+                        retrieved_memory_ids=context.retrieved_memory_ids,
+                    )
                 frame_validation = self._validate_frame_proposals(frame_proposals, context)
                 if frame_validation and not frame_validation.approved:
                     reason = "; ".join(step.reason for step in frame_validation.validator_trace if not step.passed) or "frame delta validation failed"
@@ -143,6 +156,10 @@ class PolicyExecutor:
                 if trace is None:
                     raise RuntimeError("policy execution did not produce a trace")
                 trace.query_plan["governed_transaction_id"] = transaction_id
+                if isinstance(policy, MemoryPolicyV2) and policy.proposed_deltas:
+                    trace.query_plan["memory_delta_proposals"] = [delta.model_dump(mode="json") for delta in policy.proposed_deltas]
+                    if policy.write_gate is not None:
+                        trace.query_plan["write_gate"] = policy.write_gate.model_dump(mode="json")
                 if graph_proposals:
                     trace.query_plan["graph_delta_proposals"] = [proposal.model_dump(mode="json") for proposal in graph_proposals]
                 if frame_proposals:
@@ -164,10 +181,8 @@ class PolicyExecutor:
                 affected_ids = sorted({delta.memory_id for delta in memory_deltas})
                 index_delta_objs = [IndexDelta(index="sqlite_memory_cards", status="updated", memory_id=memory_id) for memory_id in affected_ids]
                 index_deltas = [delta.to_dict() for delta in index_delta_objs]
-                post_validation = self.validator_stack.validate(
-                    legacy_policy,
-                    self._validation_context(context, post_commit=True, affected_memory_ids=affected_ids),
-                )
+                post_context = self._validation_context(context, post_commit=True, affected_memory_ids=affected_ids)
+                post_validation = self._merge_validations([self.validator_stack.validate(item, post_context) for item in legacy_policies])
                 if not post_validation.approved:
                     reason = "; ".join(step.reason for step in post_validation.validator_trace if not step.passed) or "post-commit assertion failed"
                     raise _PostCommitValidationError(reason, post_validation)
@@ -320,7 +335,7 @@ class PolicyExecutor:
         if isinstance(policy, MemoryPolicy):
             return policy
         if (policy.graph_deltas or policy.frame_deltas or policy.associative_deltas or policy.logic_deltas) and not policy.proposed_deltas:
-            return MemoryPolicy(
+            legacy = MemoryPolicy(
                 retrieval=RetrievalPlan(enabled=False, query=policy.target_selector.query or ""),
                 write=WritePlan(operation="NOOP"),
                 forget=ForgetPlan(operation="NOOP"),
@@ -328,8 +343,14 @@ class PolicyExecutor:
                 reason=policy.rollback_plan or "governed graph mutation",
                 source="small_llm" if policy.proposal_source == "small_llm" else "deterministic",
             )
-        evidence_ids = [evidence.event_id for evidence in policy.evidence_chain]
+            self._attach_write_gate(legacy, policy)
+            return legacy
         first_delta = policy.proposed_deltas[0] if policy.proposed_deltas else None
+        return self._coerce_policy_from_delta(policy, first_delta)
+
+    def _coerce_policy_from_delta(self, policy: MemoryPolicyV2, delta: ProposedDelta | None) -> MemoryPolicy:
+        evidence_ids = [evidence.event_id for evidence in policy.evidence_chain]
+        first_delta = delta
         operation = (first_delta.operation if first_delta is not None else policy.intent).upper()
         if policy.intent == "suppress" or operation == "SUPPRESS":
             operation = "INHIBIT"
@@ -338,7 +359,7 @@ class PolicyExecutor:
         target_id = first_delta.target_memory_id if first_delta else (policy.target_selector.memory_ids[0] if policy.target_selector.memory_ids else None)
         reason = first_delta.reason if first_delta else (policy.rollback_plan or policy.intent)
         if operation in {"INHIBIT", "INVALIDATE", "ARCHIVE", "DELETE_REQUEST", "DECAY"}:
-            return MemoryPolicy(
+            legacy = MemoryPolicy(
                 retrieval=RetrievalPlan(enabled=False, query=policy.target_selector.query or ""),
                 write=WritePlan(operation="NOOP"),
                 forget=ForgetPlan(operation=operation, target_memory_id=target_id, reason=reason),
@@ -346,11 +367,14 @@ class PolicyExecutor:
                 reason=reason,
                 source="small_llm" if policy.proposal_source == "small_llm" else "deterministic",
             )
+            self._attach_write_gate(legacy, policy)
+            return legacy
         value = first_delta.value if first_delta is not None else None
-        memory_type = str(value.get("memory_type")) if isinstance(value, dict) and value.get("memory_type") else None
+        memory_type = _normalize_memory_type(str(value.get("memory_type"))) if isinstance(value, dict) and value.get("memory_type") else None
         content = str(value if not isinstance(value, dict) else value.get("content", "")) if value is not None else None
-        write_operation = "ADD" if policy.intent == "add" else "UPDATE" if policy.intent in {"update", "supersede"} else "LINK" if policy.intent == "link" else "NOOP"
-        return MemoryPolicy(
+        delta_operation = operation.upper()
+        write_operation = "ADD" if delta_operation == "ADD" or policy.intent == "add" else "UPDATE" if delta_operation == "UPDATE" or policy.intent in {"update", "supersede"} else "LINK" if delta_operation == "LINK" or policy.intent == "link" else "NOOP"
+        legacy = MemoryPolicy(
             retrieval=RetrievalPlan(enabled=False, query=policy.target_selector.query or ""),
             write=WritePlan(
                 operation=write_operation,
@@ -365,11 +389,29 @@ class PolicyExecutor:
             reason=reason,
             source="small_llm" if policy.proposal_source == "small_llm" else "deterministic",
         )
+        self._attach_write_gate(legacy, policy)
+        return legacy
+
+    def _coerce_memory_write_policies(self, policy: MemoryPolicy | MemoryPolicyV2) -> list[MemoryPolicy]:
+        if isinstance(policy, MemoryPolicy):
+            return [policy]
+        if not self._is_multi_add_policy(policy):
+            return [self._coerce_policy(policy)]
+        return [self._coerce_policy_from_delta(policy, delta) for delta in policy.proposed_deltas]
+
+    def _attach_write_gate(self, legacy: MemoryPolicy, policy: MemoryPolicyV2) -> None:
+        if not policy.proposed_deltas and "write_gate" not in policy.safety_annotations:
+            return
+        gate = policy.write_gate.model_dump(mode="json") if policy.write_gate is not None else policy.safety_annotations.get("write_gate")
+        if isinstance(gate, dict):
+            legacy.write_gate = dict(gate)
 
     def _unsupported_v2_reason(self, policy: MemoryPolicyV2) -> str | None:
         if policy.intent == "supersede" and not (policy.graph_deltas or policy.logic_deltas):
             return "MemoryPolicyV2 supersede requires multi-delta graph or lifecycle execution; legacy one-delta supersede is not supported"
         if len(policy.proposed_deltas) <= 1:
+            return None
+        if self._is_multi_add_policy(policy):
             return None
         operations = {(delta.operation or policy.intent).lower() for delta in policy.proposed_deltas}
         if len(operations) == 1 and operations <= {"link", "update"}:
@@ -377,6 +419,13 @@ class PolicyExecutor:
         if policy.graph_deltas or policy.frame_deltas or policy.associative_deltas or policy.logic_deltas:
             return None
         return "multi-delta MemoryPolicyV2 transactions are not yet supported by this executor"
+
+    def _is_multi_add_policy(self, policy: MemoryPolicyV2) -> bool:
+        if len(policy.proposed_deltas) <= 1:
+            return False
+        if policy.intent != "add":
+            return False
+        return all((delta.operation or policy.intent).upper() == "ADD" and delta.target_memory_id is None for delta in policy.proposed_deltas)
 
     def _graph_proposals(self, policy: MemoryPolicy | MemoryPolicyV2) -> list[GraphDeltaProposal]:
         if isinstance(policy, MemoryPolicyV2):
@@ -416,6 +465,7 @@ class PolicyExecutor:
             evidence_ids=[],
             outcome=str(context.state.get("status", "unknown")),
             proposer="small_llm",
+            embedding_provider=getattr(self.runtime, "_embedding_provider", None),
         )
 
     def _target_ids_from_context(self, context: PolicyExecutionContext) -> list[str]:
@@ -800,6 +850,34 @@ class PolicyExecutor:
             actions.append("CONSOLIDATE")
         return actions
 
+    def _approved_actions_for_policies(self, policies: list[MemoryPolicy]) -> list[str]:
+        actions: list[str] = []
+        for policy in policies:
+            for action in self._approved_actions(policy):
+                if action not in actions:
+                    actions.append(action)
+        return actions
+
+    def _merge_validations(self, validations: list[ValidatedMutation]) -> ValidatedMutation:
+        if not validations:
+            return ValidatedMutation(approved=True)
+        trace: list[ValidationStep] = []
+        approved_deltas: list[ProposedDelta] = []
+        rejected_deltas: list[ProposedDelta] = []
+        for validation in validations:
+            trace.extend(validation.validator_trace)
+            approved_deltas.extend(validation.approved_deltas)
+            rejected_deltas.extend(validation.rejected_deltas)
+        approved = all(validation.approved for validation in validations)
+        return ValidatedMutation(
+            approved=approved,
+            approved_deltas=approved_deltas if approved else [],
+            rejected_deltas=[] if approved else [*rejected_deltas, *approved_deltas],
+            required_human_review=any(validation.required_human_review for validation in validations),
+            risk_score=max((validation.risk_score for validation in validations), default=0.0),
+            validator_trace=trace,
+        )
+
     def _operation(self, policy: MemoryPolicy) -> str:
         if policy.write.operation != "NOOP":
             return policy.write.operation
@@ -823,6 +901,7 @@ class PolicyExecutor:
             "consolidation": asdict(policy.consolidation),
             "reason": policy.reason,
             "source": policy.source,
+            "write_gate": dict(policy.write_gate),
         }
 
     def _edge_id(self, record: dict[str, Any]) -> str:
@@ -830,3 +909,22 @@ class PolicyExecutor:
 
 
 __all__ = ["PolicyExecutionContext", "PolicyExecutor"]
+
+
+def _normalize_memory_type(value: str) -> str:
+    lowered = value.strip().lower()
+    aliases = {
+        "fact": "semantic",
+        "semantic_fact": "semantic",
+        "user_preference": "preference",
+        "preference": "preference",
+        "rule": "procedural",
+        "procedure": "procedural",
+        "procedural": "procedural",
+        "task_result": "episodic",
+        "episode": "episodic",
+        "episodic": "episodic",
+        "schema": "schema",
+        "constraint": "constraint",
+    }
+    return aliases.get(lowered, lowered or "episodic")

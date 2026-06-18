@@ -149,6 +149,38 @@ class PoisoningRiskValidator(MutationValidator):
         return ValidationStep(name=self.name, passed=True)
 
 
+class WriteGateConsistencyValidator(MutationValidator):
+    name = "WriteGateConsistencyValidator"
+
+    def validate(self, policy: MemoryPolicy, context: ValidationContext) -> ValidationStep:
+        gate = _write_gate(policy)
+        if not gate:
+            if context.phase == "after_step" and policy.source == "small_llm" and policy.write.operation == "NOOP" and policy.forget.operation == "NOOP" and not policy.consolidation.enabled:
+                return ValidationStep(name=self.name, passed=False, reason="after_step small_llm NOOP requires write_gate")
+            return ValidationStep(name=self.name, passed=True)
+        decision = str(gate.get("decision") or "").lower()
+        rationale = str(gate.get("rationale") or policy.reason or "").lower()
+        writes = policy.write.operation in {"ADD", "UPDATE", "LINK"}
+        has_content = bool((policy.write.content or "").strip() or policy.write.target_memory_id)
+        has_evidence = bool(policy.write.evidence_ids)
+        if decision in {"noop", "defer"} and not rationale.strip():
+            return ValidationStep(name=self.name, passed=False, reason="write_gate noop/defer requires rationale")
+        if str(gate.get("policy_schema_failure") or "").strip():
+            return ValidationStep(name=self.name, passed=False, reason=str(gate["policy_schema_failure"]))
+        if decision == "commit":
+            if not writes:
+                return ValidationStep(name=self.name, passed=False, reason="write_gate commit requires ADD, UPDATE, or LINK")
+            if not has_content:
+                return ValidationStep(name=self.name, passed=False, reason="write_gate commit requires canonical content or target memory")
+            if not has_evidence:
+                return ValidationStep(name=self.name, passed=False, reason="write_gate commit requires evidence ids")
+        if decision in {"noop", "defer"} and writes:
+            return ValidationStep(name=self.name, passed=False, reason="write_gate noop/defer conflicts with durable write mutation")
+        if not writes and _claims_durable_value(rationale):
+            return ValidationStep(name=self.name, passed=False, reason="write rationale claims durable value but policy is NOOP")
+        return ValidationStep(name=self.name, passed=True)
+
+
 class LifecycleTransitionValidator(MutationValidator):
     name = "LifecycleTransitionValidator"
 
@@ -204,6 +236,7 @@ class ValidatorStack:
             PrivacyAclValidator(),
             DeletionGuardValidator(),
             PoisoningRiskValidator(),
+            WriteGateConsistencyValidator(),
             LifecycleTransitionValidator(),
             IndexConsistencyValidator(),
         ]
@@ -243,4 +276,35 @@ __all__ = [
     "TemporalValidator",
     "ValidationContext",
     "ValidatorStack",
+    "WriteGateConsistencyValidator",
 ]
+
+
+def _write_gate(policy: MemoryPolicy) -> dict[str, object]:
+    value = policy.write_gate
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _claims_durable_value(rationale: str) -> bool:
+    lowered = rationale.lower()
+    negated = [
+        "no durable",
+        "not durable",
+        "not a durable",
+        "not new durable",
+        "no long-term",
+        "not long-term",
+        "no future",
+        "low future",
+        "not useful",
+        "no reusable",
+        "not reusable",
+        "没有长期",
+        "不需要长期",
+        "不值得记住",
+        "不用记住",
+    ]
+    if any(phrase in lowered for phrase in negated):
+        return False
+    durable_words = ["durable", "useful", "future", "reuse", "should be remembered", "long-term", "长期", "记住", "复用", "有用"]
+    return any(word in lowered for word in durable_words)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from neuromem.core.policy import MemoryPolicy, MemoryTrace, MemoryTransactionRecord
 from neuromem_runtime.ledger import ExperienceEvent
@@ -22,6 +23,11 @@ class RuntimeConfig:
     graph_mode: str = "governed_hybrid"
     crystallization_mode: str = "governed_progressive"
     graph_storage: str = "split"
+    embedding_cache_enabled: bool = True
+    retrieval_cache_ttl_seconds: int = 20
+    retrieval_graph_commit: Literal["async", "off", "sync"] = "async"
+    retrieval_mode: Literal["auto", "full_debug"] = "auto"
+    ollama_keep_alive: str = "30m"
     version: str = "0.2.0"
 
     def to_dict(self) -> dict[str, object]:
@@ -36,6 +42,11 @@ class RuntimeConfig:
             "graph_mode": self.graph_mode,
             "crystallization_mode": self.crystallization_mode,
             "graph_storage": self.graph_storage,
+            "embedding_cache_enabled": self.embedding_cache_enabled,
+            "retrieval_cache_ttl_seconds": self.retrieval_cache_ttl_seconds,
+            "retrieval_graph_commit": self.retrieval_graph_commit,
+            "retrieval_mode": self.retrieval_mode,
+            "ollama_keep_alive": self.ollama_keep_alive,
             "version": self.version,
         }
 
@@ -101,6 +112,9 @@ class MemoryContext:
     trace_id: str | None = None
     results: list[dict[str, object]] = field(default_factory=list)
     transactions: list[dict[str, object]] = field(default_factory=list)
+    timing: dict[str, object] = field(default_factory=dict)
+    cache: dict[str, object] = field(default_factory=dict)
+    retrieval_metadata: dict[str, object] = field(default_factory=dict)
 
     def to_prompt(self) -> str:
         return self.text

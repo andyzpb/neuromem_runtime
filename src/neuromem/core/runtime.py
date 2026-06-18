@@ -202,9 +202,16 @@ class NeuroMemRuntime:
             outcome = state or {}
             item: MemoryItem | None = None
             if policy.write.operation == "ADD":
+                event_type = "task_result"
+                if policy.write.memory_type in {"semantic", "fact"}:
+                    event_type = "fact"
+                elif policy.write.memory_type in {"preference", "user_preference"}:
+                    event_type = "user_preference"
+                elif policy.write.memory_type in {"procedural", "rule", "procedure"}:
+                    event_type = "rule"
                 item = self.observe(
                     {
-                        "type": "rule" if policy.write.memory_type == "procedural" else "fact" if policy.write.memory_type == "semantic" else "task_result",
+                        "type": event_type,
                         "content": policy.write.content or task,
                         "task": task,
                         "outcome": outcome.get("status", "unknown"),
@@ -495,7 +502,7 @@ class NeuroMemRuntime:
             invalidation_state=str(recall_trace.get("invalidation_state", "valid")),
             recall_config_hash=str(recall_trace.get("recall_config_hash", "")),
         )
-        for key in ["query_plan_v2", "query_plan_v2_hash", "retrieval_ledger", "activation", "candidate_details"]:
+        for key in ["query_plan_v2", "query_plan_v2_hash", "retrieval_ledger", "activation", "candidate_details", "embedding_cache_stats"]:
             if key in recall_trace:
                 self.last_trace.query_plan[key] = recall_trace[key]
         self.memory_tap.attach(self.last_trace)

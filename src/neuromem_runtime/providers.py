@@ -135,6 +135,7 @@ def extract_policy_payload(value: object) -> dict[str, Any]:
 
 
 def memory_policy_from_payload(payload: Mapping[str, Any], *, source: str = "small_llm") -> MemoryPolicy | MemoryPolicyV2:
+    payload = normalize_policy_payload(payload, source=source)
     if "policy_id" in payload or "proposed_deltas" in payload:
         return MemoryPolicyV2.model_validate(dict(payload))
     return MemoryPolicy(
@@ -147,6 +148,145 @@ def memory_policy_from_payload(payload: Mapping[str, Any], *, source: str = "sma
     )
 
 
+def normalize_policy_payload(payload: Mapping[str, Any], *, source: str = "small_llm") -> dict[str, Any]:
+    value = dict(payload)
+    if set(value) == {"after_step"} and isinstance(value.get("after_step"), Mapping):
+        value = dict(value["after_step"])
+    elif isinstance(value.get("after_step"), Mapping) and not ({"policy_id", "proposed_deltas"} & set(value)):
+        value = dict(value["after_step"])
+    if "policy_id" not in value and "proposed_deltas" not in value:
+        return value
+
+    value.setdefault("policy_id", f"policy_{abs(hash(json.dumps(value, sort_keys=True, default=str)))}")
+    value.setdefault("proposer", "small_llm")
+    proposal_source = str(value.get("proposal_source") or source).lower()
+    if proposal_source not in {"deterministic", "small_llm", "user", "system", "tool", "admin"}:
+        proposal_source = "small_llm" if source == "small_llm" else "deterministic"
+    value["proposal_source"] = proposal_source
+    value.setdefault("risk_level", "low")
+    value["temporal_scope"] = _normalize_temporal_scope(value.get("temporal_scope"))
+    value.setdefault("retention_policy", "keep_for_audit")
+    value["target_selector"] = _normalize_target_selector(value.get("target_selector"))
+    value["evidence_chain"] = _normalize_evidence_chain(value.get("evidence_chain"))
+    value["proposed_deltas"] = _normalize_proposed_deltas(value.get("proposed_deltas"))
+    value["safety_annotations"] = dict(value.get("safety_annotations")) if isinstance(value.get("safety_annotations"), Mapping) else {}
+    gate = _normalize_write_gate(value.get("write_gate"))
+    if gate:
+        value["write_gate"] = gate
+        value["safety_annotations"]["write_gate"] = dict(gate)
+    return value
+
+
+def _normalize_target_selector(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    allowed = {"memory_ids", "query", "namespace"}
+    normalized = {key: item for key, item in dict(value).items() if key in allowed}
+    memory_ids = normalized.get("memory_ids")
+    if isinstance(memory_ids, list):
+        normalized["memory_ids"] = [str(item) for item in memory_ids if item]
+    elif memory_ids:
+        normalized["memory_ids"] = [str(memory_ids)]
+    return normalized
+
+
+def _normalize_temporal_scope(value: object) -> str:
+    if value is None or value == "":
+        return "all_valid"
+    if isinstance(value, str):
+        return value or "all_valid"
+    if isinstance(value, Mapping):
+        start = value.get("from") or value.get("start") or value.get("valid_from")
+        end = value.get("to") or value.get("end") or value.get("valid_to")
+        if start or end:
+            return f"{start or '*'}..{end or '*'}"
+        return "all_valid"
+    if isinstance(value, list):
+        parts = [str(item) for item in value if item]
+        return ",".join(parts) if parts else "all_valid"
+    return str(value)
+
+
+def _normalize_evidence_chain(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    refs: list[dict[str, object]] = []
+    for item in value:
+        if isinstance(item, Mapping):
+            event_id = item.get("event_id") or item.get("id")
+            if event_id:
+                refs.append({"event_id": str(event_id), "source": str(item.get("source") or "unknown")})
+        elif item:
+            refs.append({"event_id": str(item), "source": "unknown"})
+    return refs
+
+
+def _normalize_proposed_deltas(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    deltas: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        delta = dict(item)
+        operation = str(delta.get("operation") or "ADD").upper()
+        normalized: dict[str, object] = {
+            "operation": operation,
+            "target_memory_id": delta.get("target_memory_id"),
+            "field": delta.get("field"),
+            "reason": str(delta.get("reason") or delta.get("rationale") or ""),
+        }
+        value_obj = delta.get("value")
+        if not isinstance(value_obj, Mapping):
+            content = delta.get("content")
+            if content is not None:
+                value_obj = {
+                    "content": str(content),
+                    "memory_type": str(delta.get("memory_type") or delta.get("type") or "episodic"),
+                }
+        normalized["value"] = dict(value_obj) if isinstance(value_obj, Mapping) else value_obj
+        deltas.append(normalized)
+    return deltas
+
+
+def _normalize_write_gate(value: object) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        return {}
+    gate = dict(value)
+    decision = str(gate.get("decision") or "noop").lower()
+    if decision not in {"commit", "defer", "noop"}:
+        decision = "noop"
+    horizon = str(gate.get("durability_horizon") or "none").lower()
+    if horizon in {"permanent", "durable"}:
+        horizon = "long_term"
+    if horizon not in {"none", "thread", "cross_thread", "long_term"}:
+        horizon = "none"
+    level = str(gate.get("commitment_level") or "raw_experience").lower()
+    if level in {"high", "medium", "low", "memory"}:
+        level = "durable_memory" if decision == "commit" else "raw_experience"
+    if level not in {"raw_experience", "durable_memory", "associative_link", "candidate_frame", "validated_logic", "compiled_schema"}:
+        level = "raw_experience"
+    basis = str(gate.get("basis") or "current_user_message").lower()
+    basis_map = {
+        "explicit user fact": "current_user_message",
+        "user_message": "current_user_message",
+        "conversation": "short_term_context",
+        "retrieved": "retrieved_memory",
+    }
+    basis = basis_map.get(basis, basis)
+    if basis not in {"current_user_message", "short_term_context", "retrieved_memory", "tool_result", "system"}:
+        basis = "current_user_message"
+    signals = gate.get("signals")
+    return {
+        "decision": decision,
+        "durability_horizon": horizon,
+        "commitment_level": level,
+        "basis": basis,
+        "signals": [str(item) for item in signals] if isinstance(signals, list) else [],
+        "rationale": str(gate.get("rationale") or ""),
+    }
+
+
 __all__ = [
     "PolicyProvider",
     "DeterministicPolicyProvider",
@@ -154,4 +294,5 @@ __all__ = [
     "DeepSeekPolicyProvider",
     "extract_policy_payload",
     "memory_policy_from_payload",
+    "normalize_policy_payload",
 ]

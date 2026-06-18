@@ -78,6 +78,7 @@ class MemoryPolicy:
     consolidation: ConsolidationPlan = field(default_factory=ConsolidationPlan)
     reason: str = ""
     source: Literal["deterministic", "small_llm"] = "deterministic"
+    write_gate: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

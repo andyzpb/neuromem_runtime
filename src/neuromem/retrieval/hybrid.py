@@ -76,6 +76,7 @@ def hybrid_retrieve_with_trace(
                 "activation": activation.activation.to_dict(),
                 "candidate_details": {candidate.memory.id: candidate.to_dict() for candidate in activation.ranked},
                 "source_channels": sorted(set(activation.ledger_record.channel_candidates)),
+                "embedding_cache_stats": dict(query.filters.get("_embedding_cache_stats", {})) if isinstance(query.filters.get("_embedding_cache_stats", {}), dict) else {},
             },
         )
     activation_by_id = {candidate.memory.id: candidate for candidate in activation.ranked}

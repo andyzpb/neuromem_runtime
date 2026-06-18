@@ -5,7 +5,7 @@ import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from threading import RLock
+from threading import RLock, local
 
 from neuromem.core.models import AssociativeEdge, LogicEdge, MemoryEdge, MemoryFrame, MemoryItem
 from neuromem.retrieval.activation import build_memory_card
@@ -20,28 +20,29 @@ class SQLiteMemoryStore(MemoryStore):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
-        self._transaction_conn: sqlite3.Connection | None = None
-        self._transaction_depth = 0
+        self._transaction_state = local()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(self.path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            if self._transaction_conn is not None:
-                self._transaction_depth += 1
+            transaction_conn = self._current_transaction_conn()
+            if transaction_conn is not None:
+                self._set_transaction_depth(self._current_transaction_depth() + 1)
                 try:
-                    yield self._transaction_conn
+                    yield transaction_conn
                 finally:
-                    self._transaction_depth -= 1
+                    self._set_transaction_depth(self._current_transaction_depth() - 1)
                 return
             conn = self._connect()
-            self._transaction_conn = conn
-            self._transaction_depth = 1
+            self._set_transaction_conn(conn)
+            self._set_transaction_depth(1)
             try:
                 conn.execute("BEGIN")
                 yield conn
@@ -51,20 +52,35 @@ class SQLiteMemoryStore(MemoryStore):
             else:
                 conn.commit()
             finally:
-                self._transaction_conn = None
-                self._transaction_depth = 0
+                self._set_transaction_conn(None)
+                self._set_transaction_depth(0)
                 conn.close()
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
-        if self._transaction_conn is not None:
-            yield self._transaction_conn
+        transaction_conn = self._current_transaction_conn()
+        if transaction_conn is not None:
+            yield transaction_conn
             return
         with self._connect() as conn:
             yield conn
 
+    def _current_transaction_conn(self) -> sqlite3.Connection | None:
+        return getattr(self._transaction_state, "conn", None)
+
+    def _set_transaction_conn(self, conn: sqlite3.Connection | None) -> None:
+        self._transaction_state.conn = conn
+
+    def _current_transaction_depth(self) -> int:
+        return int(getattr(self._transaction_state, "depth", 0) or 0)
+
+    def _set_transaction_depth(self, depth: int) -> None:
+        self._transaction_state.depth = depth
+
     def _init_db(self) -> None:
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS memories (
@@ -234,6 +250,7 @@ class SQLiteMemoryStore(MemoryStore):
                     "capture_conditions": "TEXT NOT NULL DEFAULT '[]'",
                 },
             )
+            conn.execute("PRAGMA optimize")
 
     def _init_fts(self, conn: sqlite3.Connection) -> None:
         try:

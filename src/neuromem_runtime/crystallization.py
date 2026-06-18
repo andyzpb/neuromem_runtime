@@ -158,19 +158,7 @@ def graph_delta_to_structural(proposal: GraphDeltaProposal, *, context: GraphBui
         return (
             [],
             [
-                AssociativeEdgeProposal(
-                    operation=proposal.operation,
-                    source_memory_id=proposal.source_memory_id,
-                    target_memory_id=proposal.target_memory_id,
-                    relation=proposal.relation,
-                    weight=min(proposal.weight, 0.45),
-                    confidence=min(proposal.confidence, 0.62),
-                    evidence_ids=list(proposal.evidence_ids),
-                    candidate_sources=list(proposal.candidate_sources),
-                    reason=proposal.reason,
-                    proposer=proposal.proposer,
-                    lifecycle_state=proposal.lifecycle_state if proposal.lifecycle_state in {"captured", "reinforced", "mature", "inhibited", "expired"} else "captured",
-                )
+                _associative_proposal_from_graph_delta(proposal, relation=proposal.relation),
             ],
             [],
         )
@@ -198,7 +186,47 @@ def graph_delta_to_structural(proposal: GraphDeltaProposal, *, context: GraphBui
         proposer=proposal.proposer,
         lifecycle_state="inhibited" if proposal.relation in {"contradicts", "inhibits"} else proposal.lifecycle_state,
     )
-    return [source_frame, target_frame], [], [logic]
+    associative = _activation_associative_for_logic(proposal)
+    return [source_frame, target_frame], associative, [logic]
+
+
+def _activation_associative_for_logic(proposal: GraphDeltaProposal) -> list[AssociativeEdgeProposal]:
+    sources = set(proposal.candidate_sources)
+    if not sources & {"same_query_retrieval", "co_use_outcome", "same_sleep_cluster", "same_evidence_chain"}:
+        return []
+    if proposal.relation in {"contradicts", "supersedes", "inhibits"}:
+        relation = "associated_with"
+    elif "same_sleep_cluster" in sources:
+        relation = "same_episode"
+    elif "same_evidence_chain" in sources:
+        relation = "same_trace"
+    elif "same_query_retrieval" in sources:
+        relation = "retrieved_with"
+    else:
+        relation = "coactivated_with"
+    return [
+        _associative_proposal_from_graph_delta(
+            proposal,
+            relation=relation,
+            reason=f"low-commitment activation edge derived alongside {proposal.relation} logic relation",
+        )
+    ]
+
+
+def _associative_proposal_from_graph_delta(proposal: GraphDeltaProposal, *, relation: str, reason: str | None = None) -> AssociativeEdgeProposal:
+    return AssociativeEdgeProposal(
+        operation=proposal.operation,
+        source_memory_id=proposal.source_memory_id,
+        target_memory_id=proposal.target_memory_id,
+        relation=relation,
+        weight=min(proposal.weight, 0.45),
+        confidence=min(proposal.confidence, 0.62),
+        evidence_ids=list(proposal.evidence_ids),
+        candidate_sources=list(proposal.candidate_sources),
+        reason=reason or proposal.reason,
+        proposer=proposal.proposer,
+        lifecycle_state=proposal.lifecycle_state if proposal.lifecycle_state in {"captured", "reinforced", "mature", "inhibited", "expired"} else "captured",
+    )
 
 
 def frame_from_proposal(proposal: FrameDeltaProposal, *, namespace: str) -> MemoryFrame:

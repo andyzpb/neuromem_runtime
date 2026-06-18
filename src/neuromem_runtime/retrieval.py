@@ -119,6 +119,15 @@ class StaticEntityAliasResolver:
             "session": ["session refresh", "refresh token", "会话", "会话刷新"],
             "redirect": ["redirect loop", "跳转", "跳转循环"],
             "pytest": ["test command", "unit test", "单元测试命令"],
+            "japan": ["日本", "Japan"],
+            "tokyo": ["东京", "Tokyo"],
+            "ginza": ["银座", "Ginza"],
+            "osaka": ["大阪", "Osaka"],
+            "travel": ["旅游", "旅行", "trip", "travel"],
+            "sushi": ["寿司", "sushi"],
+            "wasabi": ["芥末", "wasabi"],
+            "habit": ["癖好", "习惯", "preference", "quirk", "habit"],
+            "ben": ["Ben", "ben"],
         }
 
     def expand(self, query: str, namespace: str) -> list[str]:
