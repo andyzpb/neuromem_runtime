@@ -75,6 +75,8 @@ def update_edges_after_use(
                 old_weight=old_weight,
                 new_weight=edge.weight,
                 delta=edge.weight - old_weight,
+                operation="update_edge",
+                relation_family="activation",
                 eligibility=edge.eligibility_trace,
                 salience=salience,
                 outcome_reward=outcome_reward(outcome),
@@ -82,6 +84,7 @@ def update_edges_after_use(
                 inhibition_penalty=edge.inhibition_score,
                 contradiction_penalty=edge.contradiction_penalty,
                 provenance=list(edge.provenance),
+                evidence_ids=list(edge.provenance),
                 reason="coactivation plasticity after governed policy execution",
             )
         )

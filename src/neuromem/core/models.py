@@ -33,6 +33,8 @@ MemoryRelation = Literal[
     "contradicts",
     "same_as",
     "part_of",
+    "derived_from",
+    "compresses_to",
     "supersedes",
     "generalizes",
     "specializes",
@@ -40,6 +42,7 @@ MemoryRelation = Literal[
     "procedure_for",
     "preference_of",
     "retrieved_with",
+    "inhibits",
 ]
 
 
@@ -219,6 +222,7 @@ class MemoryEdge:
     valid_to: datetime | None = None
     observed_at: datetime | None = None
     recorded_at: datetime | None = None
+    lifecycle_state: Literal["candidate", "provisional", "captured", "reinforced", "mature", "inhibited", "expired", "superseded"] = "captured"
     inhibition_score: float = 0.0
     contradiction_penalty: float = 0.0
     provenance: list[str] = field(default_factory=list)
@@ -240,6 +244,7 @@ class MemoryEdge:
             "valid_to": datetime_to_text(self.valid_to),
             "observed_at": datetime_to_text(self.observed_at),
             "recorded_at": datetime_to_text(self.recorded_at),
+            "lifecycle_state": self.lifecycle_state,
             "inhibition_score": self.inhibition_score,
             "contradiction_penalty": self.contradiction_penalty,
             "provenance": self.provenance,
@@ -263,6 +268,7 @@ class MemoryEdge:
             valid_to=datetime_from_text(record.get("valid_to")),
             observed_at=datetime_from_text(record.get("observed_at")),
             recorded_at=datetime_from_text(record.get("recorded_at")),
+            lifecycle_state=record.get("lifecycle_state", "captured"),
             inhibition_score=float(record.get("inhibition_score", 0.0)),
             contradiction_penalty=float(record.get("contradiction_penalty", 0.0)),
             provenance=list(record.get("provenance", [])),

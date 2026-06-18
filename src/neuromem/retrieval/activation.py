@@ -48,6 +48,9 @@ class RetrievalConfig:
     retrieval_channels: tuple[str, ...] = (
         "fts5",
         "bm25",
+        "dense",
+        "rewrite",
+        "hyde",
         "lexical",
         "entity",
         "recent_current",
@@ -239,6 +242,8 @@ class ActivationRetrievalEngine:
         memory_items = [item for item in memories if item.maturity != "deleted"]
         cards = {item.id: build_memory_card(item) for item in memory_items}
         plan = build_query_plan_v2(query.query, filters=query.filters, config=config)
+        namespace = memory_items[0].namespace if memory_items else str(query.filters.get("namespace", "default"))
+        self._sync_semantic_index(cards, namespace=namespace, query=query)
         channel_rankings = self._candidate_channels(memory_items, cards, plan, query, config)
         candidates = self._fuse(memory_items, cards, channel_rankings, config)
         activation = ActivationResult()
@@ -290,10 +295,21 @@ class ActivationRetrievalEngine:
     ) -> dict[str, list[tuple[str, float]]]:
         channels: dict[str, list[tuple[str, float]]] = {}
         query_terms = _terms(query.query)
+        namespace = memories[0].namespace if memories else str(query.filters.get("namespace", "default"))
         if "fts5" in config.retrieval_channels:
-            fts = _store_card_search(self.store, query.query, namespace=memories[0].namespace if memories else None, limit=max(50, config.max_items * 8))
+            fts = _store_card_search(self.store, query.query, namespace=namespace if memories else None, limit=max(50, config.max_items * 8))
             if fts:
                 channels["fts5"] = fts
+        semantic_queries = self._semantic_queries(query, namespace=namespace)
+        dense_scores = self._dense_scores(cards, semantic_queries, namespace=namespace, config=config, filters=query.filters)
+        if dense_scores and "dense" in config.retrieval_channels:
+            channels["dense"] = sorted(dense_scores.items(), key=lambda value: (-value[1], value[0]))
+        rewrite_scores = self._lexical_expansion_scores(cards, semantic_queries.get("rewrites", []))
+        if rewrite_scores and "rewrite" in config.retrieval_channels:
+            channels["rewrite"] = sorted(rewrite_scores.items(), key=lambda value: (-value[1], value[0]))
+        hyde_scores = self._lexical_expansion_scores(cards, semantic_queries.get("hyde", []))
+        if hyde_scores and "hyde" in config.retrieval_channels:
+            channels["hyde"] = sorted(hyde_scores.items(), key=lambda value: (-value[1], value[0]))
         lexical_scores = []
         entity_scores = []
         procedural_scores = []
@@ -335,6 +351,78 @@ class ActivationRetrievalEngine:
         if graph_seed_scores and "graph_seed" in config.retrieval_channels:
             channels["graph_seed"] = sorted(graph_seed_scores, key=lambda value: (-value[1], value[0]))
         return channels
+
+    def _sync_semantic_index(self, cards: dict[str, MemoryCard], *, namespace: str, query: MemoryQuery) -> None:
+        embedding_provider = query.filters.get("_embedding_provider")
+        vector_index = query.filters.get("_vector_index")
+        if embedding_provider is None or vector_index is None or not cards:
+            return
+        embed = getattr(embedding_provider, "embed", None)
+        upsert = getattr(vector_index, "upsert", None)
+        if embed is None or upsert is None:
+            return
+        ids = list(cards)
+        vectors = embed([cards[memory_id].retrieval_text for memory_id in ids])
+        upsert({memory_id: vector for memory_id, vector in zip(ids, vectors, strict=True)}, namespace=namespace)
+
+    def _semantic_queries(self, query: MemoryQuery, *, namespace: str) -> dict[str, list[str]]:
+        raw = query.query
+        rewrites = [str(item) for item in _string_list(query.filters.get("query_rewrites"))]
+        aliases: list[str] = []
+        alias_resolver = query.filters.get("_entity_alias_resolver")
+        if alias_resolver is not None and hasattr(alias_resolver, "expand"):
+            aliases = [str(item) for item in getattr(alias_resolver, "expand")(raw, namespace)]
+        rewrite_provider = query.filters.get("_query_rewrite_provider")
+        if rewrite_provider is not None and hasattr(rewrite_provider, "rewrite"):
+            rewrites.extend(str(item) for item in getattr(rewrite_provider, "rewrite")(raw, namespace=namespace))
+        hyde_values: list[str] = []
+        if query.filters.get("hyde_query"):
+            hyde_values.append(str(query.filters["hyde_query"]))
+        hyde_provider = query.filters.get("_hyde_provider")
+        if hyde_provider is not None and hasattr(hyde_provider, "generate"):
+            generated = getattr(hyde_provider, "generate")(raw, namespace=namespace)
+            if generated:
+                hyde_values.append(str(generated))
+        return {
+            "raw": [raw],
+            "rewrites": list(dict.fromkeys([*rewrites, *aliases])),
+            "hyde": list(dict.fromkeys(hyde_values)),
+        }
+
+    def _dense_scores(self, cards: dict[str, MemoryCard], semantic_queries: dict[str, list[str]], *, namespace: str, config: RetrievalConfig, filters: dict[str, object]) -> dict[str, float]:
+        del cards
+        embedding_provider = filters.get("_embedding_provider")
+        vector_index = filters.get("_vector_index")
+        if embedding_provider is None or vector_index is None:
+            return {}
+        embed = getattr(embedding_provider, "embed", None)
+        search = getattr(vector_index, "search", None)
+        if embed is None or search is None:
+            return {}
+        queries = [*semantic_queries.get("raw", []), *semantic_queries.get("rewrites", []), *semantic_queries.get("hyde", [])]
+        if not queries:
+            return {}
+        scores: dict[str, float] = {}
+        vectors = embed(queries)
+        for vector in vectors:
+            for memory_id, score in search(vector, namespace=namespace, top_k=max(50, config.max_items * 8)):
+                scores[str(memory_id)] = max(scores.get(str(memory_id), 0.0), float(score))
+        return scores
+
+    def _lexical_expansion_scores(self, cards: dict[str, MemoryCard], expansions: list[str]) -> dict[str, float]:
+        if not expansions:
+            return {}
+        scores: dict[str, float] = {}
+        expansion_terms = [term for expansion in expansions for term in _terms(expansion)]
+        if not expansion_terms:
+            return {}
+        expansion_set = set(expansion_terms)
+        for memory_id, card in cards.items():
+            terms = _terms(card.retrieval_text)
+            overlap = terms & expansion_set
+            if overlap:
+                scores[memory_id] = len(overlap) / max(1, len(expansion_set))
+        return scores
 
     def _fuse(
         self,

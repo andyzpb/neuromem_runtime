@@ -6,20 +6,34 @@ from neuromem_runtime.runtime import MemoryRuntime
 from neuromem_runtime.deltas import ExecutionDeltaPlan, GraphDelta, IndexDelta, LifecycleDelta, MemoryDelta, MemorySnapshot, MutationExecutionResult
 from neuromem_runtime.ledger import ExperienceEvent, LedgerEvent, MemoryLedger
 from neuromem_runtime.lifecycle import LifecycleStateMachine
-from neuromem_runtime.policy_v2 import MemoryPolicyV2, ValidatedMutation
+from neuromem_runtime.policy_v2 import GraphDeltaProposal, MemoryPolicyV2, ValidatedMutation
 from neuromem_runtime.plasticity import PlasticityEngine
 from neuromem_runtime.retrieval import (
     ActivationResult,
     DeterministicEmbeddingProvider,
     EmbeddingProvider,
+    EntityAliasResolver,
+    HyDEProvider,
+    LocalVectorIndex,
     MemoryCard,
     QueryPlanV2,
+    QueryRewriteProvider,
     RerankProvider,
     RetrievalCandidate,
     RetrievalConfig,
     RetrievalLedgerRecord,
     RetrievalTraceMetadata,
+    StaticEntityAliasResolver,
     VectorIndex,
+)
+from neuromem_runtime.semantic_graph import (
+    DeterministicRelationProposer,
+    GraphBuildContext,
+    GraphCandidateGenerator,
+    GraphDeltaValidator,
+    GraphMutationCommitter,
+    GraphProposalProvider,
+    GraphRelationCandidate,
 )
 from neuromem_runtime.sleep import SleepPlanner, SleepReport
 from neuromem_runtime.types import EvidenceBundle, MemoryContext, MemoryEvent, MemoryQuery, MemoryTransaction, RuntimeConfig
@@ -40,6 +54,7 @@ __all__ = [
     "MemoryTrace",
     "ExperienceEvent",
     "MemoryPolicyV2",
+    "GraphDeltaProposal",
     "ValidatedMutation",
     "ExecutionDeltaPlan",
     "MemoryDelta",
@@ -53,7 +68,12 @@ __all__ = [
     "LifecycleStateMachine",
     "ValidatorStack",
     "EmbeddingProvider",
+    "EntityAliasResolver",
+    "HyDEProvider",
+    "LocalVectorIndex",
     "VectorIndex",
+    "QueryRewriteProvider",
+    "StaticEntityAliasResolver",
     "RetrievalConfig",
     "QueryPlanV2",
     "MemoryCard",
@@ -63,6 +83,13 @@ __all__ = [
     "RerankProvider",
     "RetrievalTraceMetadata",
     "DeterministicEmbeddingProvider",
+    "GraphBuildContext",
+    "GraphCandidateGenerator",
+    "GraphRelationCandidate",
+    "GraphProposalProvider",
+    "DeterministicRelationProposer",
+    "GraphDeltaValidator",
+    "GraphMutationCommitter",
     "PlasticityEngine",
     "SleepPlanner",
     "SleepReport",

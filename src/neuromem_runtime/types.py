@@ -16,6 +16,7 @@ class RuntimeConfig:
     agent_id: str = "local-agent"
     mode: str = "lite"
     model_policy_enabled: bool = False
+    graph_mode: str = "governed_hybrid"
     version: str = "0.2.0"
 
     def to_dict(self) -> dict[str, object]:
@@ -27,6 +28,7 @@ class RuntimeConfig:
             "agent_id": self.agent_id,
             "mode": self.mode,
             "model_policy_enabled": self.model_policy_enabled,
+            "graph_mode": self.graph_mode,
             "version": self.version,
         }
 

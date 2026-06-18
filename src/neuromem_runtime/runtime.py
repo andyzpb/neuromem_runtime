@@ -12,9 +12,26 @@ from neuromem.stores.sqlite_store import SQLiteMemoryStore
 from neuromem_runtime.deltas import LifecycleDelta, MemoryDelta
 from neuromem_runtime.executor import PolicyExecutionContext, PolicyExecutor
 from neuromem_runtime.ledger import ExperienceEvent, LedgerEvent, MemoryLedger
-from neuromem_runtime.policy_v2 import MemoryPolicyV2
+from neuromem_runtime.policy_v2 import EvidenceRef, MemoryPolicyV2
 from neuromem_runtime.providers import DeterministicPolicyProvider, PolicyProvider
-from neuromem_runtime.retrieval import RetrievalTraceMetadata
+from neuromem_runtime.retrieval import (
+    EmbeddingProvider,
+    EntityAliasResolver,
+    HyDEProvider,
+    LocalVectorIndex,
+    QueryRewriteProvider,
+    RerankProvider,
+    RetrievalTraceMetadata,
+    StaticEntityAliasResolver,
+    VectorIndex,
+)
+from neuromem_runtime.semantic_graph import (
+    DeterministicRelationProposer,
+    GraphBuildContext,
+    GraphCandidateGenerator,
+    GraphMode,
+    GraphProposalProvider,
+)
 from neuromem_runtime.sleep import CompilationDelta, ConsolidationDelta, LedgerReport, ReplayBatch, SleepPlanner, SleepReport, SuppressionDelta
 from neuromem_runtime.types import EvidenceBundle, MemoryContext, MemoryEvent, MemoryQuery, RuntimeConfig, event_to_dict
 from neuromem_runtime.validators import ValidatorStack
@@ -30,8 +47,17 @@ class MemoryRuntime:
         policy_provider: PolicyProvider | None = None,
         *,
         allow_unsafe_internal: bool = False,
+        graph_mode: GraphMode = "governed_hybrid",
+        embedding_provider: EmbeddingProvider | None = None,
+        vector_index: VectorIndex | None = None,
+        rerank_provider: RerankProvider | None = None,
+        query_rewrite_provider: QueryRewriteProvider | None = None,
+        hyde_provider: HyDEProvider | None = None,
+        relation_proposer: GraphProposalProvider | None = None,
+        entity_alias_resolver: EntityAliasResolver | None = None,
     ) -> None:
         self.config = config
+        self.config.graph_mode = graph_mode
         self._runtime = runtime
         self._allow_unsafe_internal = allow_unsafe_internal
         self._validator_stack = ValidatorStack()
@@ -39,6 +65,15 @@ class MemoryRuntime:
         self._ledger = MemoryLedger(config.db_path)
         self._executor = PolicyExecutor(runtime, self._ledger, self._validator_stack)
         self._sleep_planner = SleepPlanner()
+        self._graph_mode = graph_mode
+        self._embedding_provider = embedding_provider
+        self._vector_index = vector_index or (LocalVectorIndex() if embedding_provider is not None else None)
+        self._rerank_provider = rerank_provider
+        self._query_rewrite_provider = query_rewrite_provider
+        self._hyde_provider = hyde_provider
+        self._entity_alias_resolver = entity_alias_resolver or StaticEntityAliasResolver()
+        self._graph_candidate_generator = GraphCandidateGenerator()
+        self._relation_proposer = relation_proposer or DeterministicRelationProposer()
 
     @classmethod
     async def local(
@@ -49,6 +84,14 @@ class MemoryRuntime:
         mode: str = "lite",
         policy_provider: PolicyProvider | None = None,
         allow_unsafe_internal: bool = False,
+        graph_mode: GraphMode = "governed_hybrid",
+        embedding_provider: EmbeddingProvider | None = None,
+        vector_index: VectorIndex | None = None,
+        rerank_provider: RerankProvider | None = None,
+        query_rewrite_provider: QueryRewriteProvider | None = None,
+        hyde_provider: HyDEProvider | None = None,
+        relation_proposer: GraphProposalProvider | None = None,
+        entity_alias_resolver: EntityAliasResolver | None = None,
     ) -> "MemoryRuntime":
         root = Path(path)
         root.mkdir(parents=True, exist_ok=True)
@@ -63,6 +106,7 @@ class MemoryRuntime:
             agent_id=agent_id,
             mode=mode,
             model_policy_enabled=policy_provider is not None,
+            graph_mode=graph_mode,
         )
         _write_config(root / "config.toml", config)
         runtime = NeuroMemRuntime(
@@ -71,7 +115,20 @@ class MemoryRuntime:
             store=SQLiteMemoryStore(db_path),
             db_path=db_path,
         )
-        return cls(config=config, runtime=runtime, policy_provider=policy_provider, allow_unsafe_internal=allow_unsafe_internal)
+        return cls(
+            config=config,
+            runtime=runtime,
+            policy_provider=policy_provider,
+            allow_unsafe_internal=allow_unsafe_internal,
+            graph_mode=graph_mode,
+            embedding_provider=embedding_provider,
+            vector_index=vector_index,
+            rerank_provider=rerank_provider,
+            query_rewrite_provider=query_rewrite_provider,
+            hyde_provider=hyde_provider,
+            relation_proposer=relation_proposer,
+            entity_alias_resolver=entity_alias_resolver,
+        )
 
     @classmethod
     async def from_config(cls, path: str | Path = ".neuromem") -> "MemoryRuntime":
@@ -85,6 +142,7 @@ class MemoryRuntime:
             path=root,
             agent_id=str(data.get("agent_id", "local-agent")),
             mode=str(data.get("mode", "lite")),
+            graph_mode=str(data.get("graph_mode", "governed_hybrid")),  # type: ignore[arg-type]
         )
 
     @property
@@ -186,6 +244,17 @@ class MemoryRuntime:
         self._persist_trace(result.trace.trace_id, result.trace.to_dict())
         memory_id = result.created_memory_ids[0] if result.created_memory_ids else None
         stored_item = self._runtime.store.get_memory(memory_id) if self._runtime.store is not None and memory_id else None
+        if self._graph_mode != "off" and memory_id is not None:
+            graph_result = self._commit_auto_graph(
+                selected_memory_ids=[],
+                target_memory_ids=[memory_id],
+                evidence_ids=[experience.event_id],
+                outcome=str(payload.get("outcome", "success")),
+                mutation_trace={"operation": "observe_and_commit", "memory_id": memory_id},
+            )
+            if graph_result is not None:
+                result.trace.query_plan["semantic_graph_builder"] = graph_result
+            self._persist_trace(result.trace.trace_id, result.trace.to_dict())
         return EvidenceBundle(
             memory_id=memory_id,
             content=stored_item.content if stored_item is not None else content,
@@ -202,6 +271,7 @@ class MemoryRuntime:
         filters: dict[str, object] | None = None,
     ) -> MemoryContext:
         query_obj = query if isinstance(query, MemoryQuery) else MemoryQuery(query=query, budget_tokens=budget_tokens, filters=filters or {})
+        query_obj.filters.update(self._semantic_filters(query_obj.query))
         before_states = self._memory_states()
         results, trace = self._runtime.retrieve_with_trace(query_obj.query, filters=query_obj.filters, budget_tokens=query_obj.budget_tokens, task_id=query_obj.query)
         after_states = self._memory_states()
@@ -214,10 +284,12 @@ class MemoryRuntime:
         retrieval_ledger = trace.query_plan.get("retrieval_ledger", {}) if isinstance(trace.query_plan.get("retrieval_ledger", {}), dict) else {}
         query_plan_v2 = trace.query_plan.get("query_plan_v2", {}) if isinstance(trace.query_plan.get("query_plan_v2", {}), dict) else {}
         source_channels = list(retrieval_ledger.get("channel_candidates", {}).keys()) if isinstance(retrieval_ledger.get("channel_candidates", {}), dict) else list(trace.source_channels)
+        embedding_mode = "enabled" if self._embedding_provider is not None else "disabled"
         trace.query_plan.update(
             {
                 "retrieval_metadata": RetrievalTraceMetadata(
                     retrieval_mode=str(retrieval_ledger.get("retrieval_mode") or query_plan_v2.get("mode") or "local_activation"),
+                    embedding_mode=embedding_mode,
                     candidate_sources=[str(item) for item in source_channels],
                     fusion_strategy="rrf+ppr+lite_rerank",
                     rank_before_fusion=[result.memory.id for result in results],
@@ -254,8 +326,11 @@ class MemoryRuntime:
                 audit=trace_dict,
             )
         )
+        retrieval_graph = self._commit_retrieval_graph(trace)
+        if retrieval_graph is not None:
+            trace.query_plan["semantic_graph_builder"] = retrieval_graph
         transactions = self._ledger.events_for_trace(trace.trace_id, namespace=self.config.namespace) or [transaction.to_dict() for transaction in trace.to_transactions()]
-        self._persist_trace(trace_id, trace_dict)
+        self._persist_trace(trace_id, trace.to_dict())
         return MemoryContext(
             query=query_obj.query,
             text=text,
@@ -346,8 +421,18 @@ class MemoryRuntime:
                 conn=conn,
             )
             consolidation_report = self._runtime.neuro_sleep().to_dict()
+            sleep_clusters = [[str(memory_id) for memory_id in cluster] for cluster in consolidation_report.get("replay_clusters", []) if isinstance(cluster, list)]
+            sleep_graph = self._commit_auto_graph(
+                selected_memory_ids=[memory_id for cluster in sleep_clusters for memory_id in cluster],
+                target_memory_ids=[str(memory_id) for memory_id in consolidation_report.get("compressed_memory_ids", [])],
+                evidence_ids=[f"sleep:{transaction_id}"],
+                outcome="success",
+                sleep_clusters=sleep_clusters,
+                mutation_trace={"operation": "sleep_graph_compiler"},
+            ) or {}
             memories_after = self._memory_states()
             deltas = _memory_deltas_for_fields(memories_before, memories_after, fields=None, reason="governed sleep")
+            graph_deltas = list(((sleep_graph.get("result") or {}).get("graph_deltas", []))) if isinstance(sleep_graph.get("result"), dict) else []
             targets = sorted({str(delta["memory_id"]) for delta in deltas if delta.get("memory_id")})
             lifecycle_deltas = [delta for delta in deltas if delta.get("field") in {"maturity", "type", "summary", "tags", "supersedes", "derived_from"}]
             memory_delta_objs = [_memory_delta_from_dict(delta) for delta in deltas]
@@ -382,7 +467,8 @@ class MemoryRuntime:
                     targets=targets,
                     memory_delta=deltas,
                     lifecycle_delta=lifecycle_deltas,
-                    audit={"consolidation_report": consolidation_report},
+                    graph_delta=graph_deltas,
+                    audit={"consolidation_report": consolidation_report, "sleep_graph": sleep_graph},
                 ),
                 conn=conn,
             )
@@ -417,7 +503,8 @@ class MemoryRuntime:
                     validator_decision="approved",
                     targets=[str(item) for item in consolidation_report.get("compressed_memory_ids", [])],
                     memory_delta=[delta for delta in deltas if delta.get("field") in {"type", "summary", "tags", "consolidation_count"}],
-                    audit={"compressed_memory_ids": consolidation_report.get("compressed_memory_ids", [])},
+                    graph_delta=graph_deltas,
+                    audit={"compressed_memory_ids": consolidation_report.get("compressed_memory_ids", []), "sleep_graph": sleep_graph},
                 ),
                 conn=conn,
             )
@@ -435,7 +522,8 @@ class MemoryRuntime:
                     targets=targets,
                     memory_delta=deltas,
                     lifecycle_delta=lifecycle_deltas,
-                    audit={"consolidation_report": consolidation_report},
+                    graph_delta=graph_deltas,
+                    audit={"consolidation_report": consolidation_report, "sleep_graph": sleep_graph},
                 ),
                 conn=conn,
             )
@@ -462,6 +550,17 @@ class MemoryRuntime:
             memory_deltas=memory_delta_objs,
             ledger=LedgerReport(transaction_ids=[transaction_id]),
         ).to_dict()
+        compiled_nodes = [str(item) for item in consolidation_report.get("compressed_memory_ids", [])]
+        if not compiled_nodes:
+            compiled_nodes = sorted({str(delta.get("target_id")) for delta in graph_deltas if delta.get("target_id")})
+        sleep_report["graph"] = {
+            "candidates": sleep_graph.get("candidates", []),
+            "proposed_deltas": sleep_graph.get("proposals", []),
+            "approved_deltas": graph_deltas,
+            "rejected_deltas": [],
+            "compiled_nodes": compiled_nodes,
+            "suppressed_stale_paths": [str(item) for item in consolidation_report.get("archived_memory_ids", [])],
+        }
         return {**consolidation_report, "sleep": sleep_report, "ledger_transaction_id": transaction_id}
 
     async def forget(
@@ -523,6 +622,95 @@ class MemoryRuntime:
         if self._runtime.store is None:
             return {}
         return {item.id: item.to_record() for item in self._runtime.store.list_memories(namespace=self.config.namespace)}
+
+    def _semantic_filters(self, query: str) -> dict[str, object]:
+        filters: dict[str, object] = {"namespace": self.config.namespace}
+        if self._embedding_provider is not None and self._vector_index is not None:
+            filters["_embedding_provider"] = self._embedding_provider
+            filters["_vector_index"] = self._vector_index
+            filters.setdefault("retrieval_channels", ("fts5", "bm25", "dense", "rewrite", "hyde", "lexical", "entity", "recent_current", "procedural_preference", "canonical_fact", "graph_seed"))
+        if self._query_rewrite_provider is not None:
+            filters["_query_rewrite_provider"] = self._query_rewrite_provider
+        if self._hyde_provider is not None:
+            filters["_hyde_provider"] = self._hyde_provider
+        if self._entity_alias_resolver is not None:
+            filters["_entity_alias_resolver"] = self._entity_alias_resolver
+            aliases = self._entity_alias_resolver.expand(query, self.config.namespace)
+            if aliases:
+                filters["query_rewrites"] = aliases
+                filters["entities"] = aliases
+        return filters
+
+    def _commit_retrieval_graph(self, trace: object) -> dict[str, object] | None:
+        selected = [str(memory_id) for memory_id in getattr(trace, "selected_memory_ids", [])]
+        if len(selected) < 2:
+            return None
+        return self._commit_auto_graph(
+            selected_memory_ids=selected,
+            target_memory_ids=selected,
+            evidence_ids=[f"trace:{getattr(trace, 'trace_id', '')}"],
+            outcome="success",
+            retrieval_trace=getattr(trace, "query_plan", {}),
+        )
+
+    def _commit_auto_graph(
+        self,
+        *,
+        selected_memory_ids: list[str],
+        target_memory_ids: list[str],
+        evidence_ids: list[str],
+        outcome: str,
+        retrieval_trace: dict[str, object] | None = None,
+        mutation_trace: dict[str, object] | None = None,
+        sleep_clusters: list[list[str]] | None = None,
+    ) -> dict[str, object] | None:
+        if self._graph_mode == "off" or self._runtime.store is None:
+            return None
+        memories = self._runtime.store.list_memories(namespace=self.config.namespace)
+        context = GraphBuildContext(
+            namespace=self.config.namespace,
+            memories=memories,
+            selected_memory_ids=selected_memory_ids,
+            target_memory_ids=target_memory_ids,
+            evidence_ids=evidence_ids,
+            retrieval_trace=retrieval_trace or {},
+            mutation_trace=mutation_trace or {},
+            sleep_clusters=sleep_clusters or [],
+            outcome=outcome,
+            proposer="deterministic",
+        )
+        candidates = self._graph_candidate_generator.generate(context)
+        if not candidates:
+            return None
+        proposals = self._relation_proposer.propose_graph_deltas(context, candidates)
+        if not proposals:
+            return {"candidates": [candidate.to_dict() for candidate in candidates], "proposals": []}
+        policy = MemoryPolicyV2(
+            intent="link",
+            proposer="GraphBuilder",
+            proposal_source="deterministic",
+            evidence_chain=[EvidenceRef(event_id=evidence_id, source="graph_builder") for evidence_id in evidence_ids],
+            target_selector={"memory_ids": list(dict.fromkeys([*selected_memory_ids, *target_memory_ids])), "namespace": self.config.namespace},
+            graph_deltas=proposals,
+            rollback_plan="rollback graph deltas with memory transaction",
+        )
+        result = self._executor.execute(
+            policy,
+            PolicyExecutionContext(
+                phase="graph_builder",
+                task="governed graph construction",
+                query=str((retrieval_trace or {}).get("raw_query") or (mutation_trace or {}).get("operation") or "graph_builder"),
+                state={"status": outcome, "target_memory_ids": list(dict.fromkeys([*selected_memory_ids, *target_memory_ids]))},
+                namespace=self.config.namespace,
+                agent_id=self.config.agent_id,
+            ),
+        )
+        self._persist_trace(result.trace.trace_id, result.trace.to_dict())
+        return {
+            "candidates": [candidate.to_dict() for candidate in candidates],
+            "proposals": [proposal.model_dump(mode="json") for proposal in proposals],
+            "result": result.to_dict(),
+        }
 
 
 def _policy_forget_operation(action: str) -> str:

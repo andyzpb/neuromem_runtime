@@ -130,6 +130,7 @@ class SQLiteMemoryStore(MemoryStore):
                     valid_to TEXT,
                     observed_at TEXT,
                     recorded_at TEXT,
+                    lifecycle_state TEXT NOT NULL DEFAULT 'captured',
                     inhibition_score REAL NOT NULL DEFAULT 0.0,
                     contradiction_penalty REAL NOT NULL DEFAULT 0.0,
                     provenance TEXT NOT NULL,
@@ -188,6 +189,7 @@ class SQLiteMemoryStore(MemoryStore):
                     "eligibility_trace": "REAL NOT NULL DEFAULT 1.0",
                     "observed_at": "TEXT",
                     "recorded_at": "TEXT",
+                    "lifecycle_state": "TEXT NOT NULL DEFAULT 'captured'",
                     "inhibition_score": "REAL NOT NULL DEFAULT 0.0",
                     "contradiction_penalty": "REAL NOT NULL DEFAULT 0.0",
                 },
@@ -464,9 +466,9 @@ class SQLiteMemoryStore(MemoryStore):
                 INSERT INTO edges (
                     source_id, target_id, relation, weight, confidence, coactivation_count,
                     success_count, failure_count, last_activated_at, eligibility_trace, created_at,
-                    valid_from, valid_to, observed_at, recorded_at, inhibition_score,
+                    valid_from, valid_to, observed_at, recorded_at, lifecycle_state, inhibition_score,
                     contradiction_penalty, provenance
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source_id, target_id, relation) DO UPDATE SET
                     weight=excluded.weight,
                     confidence=excluded.confidence,
@@ -479,6 +481,7 @@ class SQLiteMemoryStore(MemoryStore):
                     valid_to=excluded.valid_to,
                     observed_at=excluded.observed_at,
                     recorded_at=excluded.recorded_at,
+                    lifecycle_state=excluded.lifecycle_state,
                     inhibition_score=excluded.inhibition_score,
                     contradiction_penalty=excluded.contradiction_penalty,
                     provenance=excluded.provenance
@@ -499,6 +502,7 @@ class SQLiteMemoryStore(MemoryStore):
                     record["valid_to"],
                     record["observed_at"],
                     record["recorded_at"],
+                    record["lifecycle_state"],
                     record["inhibition_score"],
                     record["contradiction_penalty"],
                     self._dump(record["provenance"]),

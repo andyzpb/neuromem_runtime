@@ -161,6 +161,7 @@ Base retrieval is local and deterministic:
 ```text
 QueryPlanV2 -> Contextual Memory Cards
             -> FTS5/BM25 + lexical/entity/current/procedural/canonical candidates
+            -> optional dense/rewrite/HyDE semantic candidates
             -> RRF fusion
             -> PPR-style graph activation
             -> lifecycle/provenance gate
@@ -176,6 +177,8 @@ Optional query filters:
 - `retrieval_mode`
 - `retrieval_channels`
 - `rerank_mode`
+- `query_rewrites`
+- `hyde_query`
 - `graph_activation`
 - `historical`
 - `require_provenance`
@@ -192,7 +195,29 @@ Optional query filters:
 
 Retrieval access effects, such as `access_count`, `activation_count`, and `last_accessed_at`, are ledgered as memory deltas.
 
-Dense embeddings, late-interaction retrieval, cross-encoder reranking, and LLM listwise reranking are reserved adapter surfaces in `v0.2.0`. The base package ships deterministic local activation retrieval; installed ranking adapters may rank candidates, but they must not mutate memory.
+Dense embeddings, query rewrite, HyDE, alias expansion, and rerankers are opt-in provider surfaces. Pass providers to `MemoryRuntime.local(...)`; generated rewrites and HyDE text only participate in retrieval and are never written as memory or evidence.
+
+```python
+memory = await nmem.MemoryRuntime.local(
+    embedding_provider=my_embedding_provider,
+    query_rewrite_provider=my_rewriter,
+    hyde_provider=my_hyde,
+)
+```
+
+## Governed Semantic Graph
+
+Graph construction is a governed mutation path:
+
+```text
+GraphCandidateGenerator
+  -> RelationProposer
+  -> GraphDeltaValidator
+  -> PolicyExecutor transaction
+  -> MemoryLedger
+```
+
+`MemoryPolicyV2.graph_deltas` is the first-class graph mutation channel. Graph deltas support `add_edge`, `update_edge`, `inhibit_edge`, and `expire_edge`, and every proposal must bind endpoints, relation, confidence, evidence ids, and reason. Safe relations such as `evidence_for`, `retrieved_with`, `coactivated_with`, `precedes`, `derived_from`, and `compresses_to` can be committed directly when validated. Semantic relations such as `supports`, `same_as`, `procedure_for`, `generalizes`, and `specializes` start provisional. High-risk relations such as `causes`, `contradicts`, `supersedes`, and `inhibits` are conservative and route through validation/suppression rather than deletion.
 
 ## Forgetting
 
@@ -215,6 +240,7 @@ Deletion is rejected unless `authorize_delete=True`. Normal forgetting keeps aud
 - replay clusters
 - promoted/compressed/archived memory ids
 - memory/lifecycle deltas
+- graph candidates, proposed graph deltas, approved graph deltas, compiled nodes, and suppressed stale paths
 - ledger transaction ids
 
 ## Policy Providers
@@ -261,6 +287,7 @@ The package exports:
 - `ExperienceEvent`
 - `MemoryPolicy`
 - `MemoryPolicyV2`
+- `GraphDeltaProposal`
 - `ValidatedMutation`
 - `MemoryDelta`
 - `GraphDelta`
@@ -282,7 +309,18 @@ The package exports:
 - `RetrievalLedgerRecord`
 - `RerankProvider`
 - `EmbeddingProvider`
+- `LocalVectorIndex`
+- `QueryRewriteProvider`
+- `HyDEProvider`
+- `EntityAliasResolver`
+- `StaticEntityAliasResolver`
 - `VectorIndex`
+- `GraphBuildContext`
+- `GraphCandidateGenerator`
+- `GraphRelationCandidate`
+- `GraphProposalProvider`
+- `GraphDeltaValidator`
+- `GraphMutationCommitter`
 - `PlasticityEngine`
 - `SleepPlanner`
 

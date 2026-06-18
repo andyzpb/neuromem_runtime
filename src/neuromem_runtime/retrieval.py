@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -20,10 +21,10 @@ class EmbeddingProvider(Protocol):
 
 
 class VectorIndex(Protocol):
-    def upsert(self, items: dict[str, list[float]]) -> None:
+    def upsert(self, items: dict[str, list[float]], *, namespace: str = "default") -> None:
         raise NotImplementedError
 
-    def search(self, vector: list[float], *, top_k: int = 8) -> list[tuple[str, float]]:
+    def search(self, vector: list[float], *, namespace: str | None = None, top_k: int = 8) -> list[tuple[str, float]]:
         raise NotImplementedError
 
     def delete(self, ids: list[str]) -> None:
@@ -69,16 +70,87 @@ class DeterministicEmbeddingProvider:
         return vectors
 
 
+class LocalVectorIndex:
+    """Small in-memory vector index for local-first tests and demos."""
+
+    def __init__(self) -> None:
+        self._vectors: dict[str, tuple[str, list[float]]] = {}
+
+    def upsert(self, items: dict[str, list[float]], *, namespace: str = "default") -> None:
+        for memory_id, vector in items.items():
+            self._vectors[memory_id] = (namespace, _normalize(vector))
+
+    def search(self, vector: list[float], *, namespace: str | None = None, top_k: int = 8) -> list[tuple[str, float]]:
+        query = _normalize(vector)
+        scored: list[tuple[str, float]] = []
+        for memory_id, (item_namespace, item_vector) in self._vectors.items():
+            if namespace is not None and item_namespace != namespace:
+                continue
+            score = sum(left * right for left, right in zip(query, item_vector, strict=False))
+            if score > 0:
+                scored.append((memory_id, score))
+        return sorted(scored, key=lambda item: (-item[1], item[0]))[:top_k]
+
+    def delete(self, ids: list[str]) -> None:
+        for memory_id in ids:
+            self._vectors.pop(memory_id, None)
+
+
+class QueryRewriteProvider(Protocol):
+    def rewrite(self, query: str, *, namespace: str = "default") -> list[str]:
+        raise NotImplementedError
+
+
+class HyDEProvider(Protocol):
+    def generate(self, query: str, *, namespace: str = "default") -> str | None:
+        raise NotImplementedError
+
+
+class EntityAliasResolver(Protocol):
+    def expand(self, query: str, namespace: str) -> list[str]:
+        raise NotImplementedError
+
+
+class StaticEntityAliasResolver:
+    def __init__(self, aliases: dict[str, list[str]] | None = None) -> None:
+        self.aliases = aliases or {
+            "auth": ["authentication", "login", "登录认证", "认证"],
+            "login": ["auth", "authentication", "登录", "登录跳转"],
+            "session": ["session refresh", "refresh token", "会话", "会话刷新"],
+            "redirect": ["redirect loop", "跳转", "跳转循环"],
+            "pytest": ["test command", "unit test", "单元测试命令"],
+        }
+
+    def expand(self, query: str, namespace: str) -> list[str]:
+        del namespace
+        lowered = query.lower()
+        expanded: list[str] = []
+        for key, values in self.aliases.items():
+            if key in lowered or any(value.lower() in lowered for value in values):
+                expanded.extend([key, *values])
+        return list(dict.fromkeys(value for value in expanded if value))
+
+
+def _normalize(vector: list[float]) -> list[float]:
+    norm = math.sqrt(sum(value * value for value in vector)) or 1.0
+    return [value / norm for value in vector]
+
+
 __all__ = [
     "ActivationResult",
     "DeterministicEmbeddingProvider",
     "EmbeddingProvider",
+    "EntityAliasResolver",
+    "HyDEProvider",
+    "LocalVectorIndex",
     "MemoryCard",
     "QueryPlanV2",
+    "QueryRewriteProvider",
     "RerankProvider",
     "RetrievalCandidate",
     "RetrievalConfig",
     "RetrievalLedgerRecord",
     "RetrievalTraceMetadata",
+    "StaticEntityAliasResolver",
     "VectorIndex",
 ]

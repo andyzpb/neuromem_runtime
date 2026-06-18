@@ -404,7 +404,11 @@ class NeuroMemRuntime:
                 self._execute_validated_policy(policy, validated, phase="before_step", task=task, query=query, state=state)
                 return ""
         retrieval = policy.retrieval
-        filters: dict[str, object] = {}
+        filters: dict[str, object] = {
+            key: value
+            for key, value in state.items()
+            if str(key).startswith("_") or key in {"retrieval_channels", "query_rewrites", "hyde_query", "namespace"}
+        }
         if retrieval.memory_types:
             filters["type"] = retrieval.memory_types
         filters["temporal_scope"] = retrieval.temporal_scope

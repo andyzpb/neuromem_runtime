@@ -18,7 +18,13 @@ from neuromem.core.runtime import NeuroMemRuntime
 from neuromem_runtime.deltas import GraphDelta, IndexDelta, LifecycleDelta, MemoryDelta, MutationExecutionResult
 from neuromem_runtime.ledger import LedgerEvent, MemoryLedger
 from neuromem_runtime.lifecycle import LifecycleStateMachine
-from neuromem_runtime.policy_v2 import MemoryPolicyV2, ValidatedMutation, ValidationStep
+from neuromem_runtime.policy_v2 import GraphDeltaProposal, MemoryPolicyV2, ValidatedMutation, ValidationStep
+from neuromem_runtime.semantic_graph import (
+    GraphBuildContext,
+    GraphDeltaValidator,
+    GraphMutationCommitter,
+    graph_delta_from_edge,
+)
 from neuromem_runtime.validators import ValidationContext, ValidatorStack
 
 
@@ -50,10 +56,13 @@ class PolicyExecutor:
         self.ledger = ledger
         self.validator_stack = validator_stack or ValidatorStack()
         self.lifecycle = LifecycleStateMachine()
+        self.graph_validator = GraphDeltaValidator()
+        self.graph_committer = GraphMutationCommitter()
 
     def execute(self, policy: MemoryPolicy | MemoryPolicyV2, context: PolicyExecutionContext) -> MutationExecutionResult:
         assert self.runtime.store is not None
         legacy_policy = self._coerce_policy(policy)
+        graph_proposals = self._graph_proposals(policy)
         if isinstance(policy, MemoryPolicyV2):
             unsupported = self._unsupported_v2_reason(policy)
             if unsupported:
@@ -106,16 +115,25 @@ class PolicyExecutor:
                     state=context.state,
                     retrieved_memory_ids=context.retrieved_memory_ids,
                 )
+                proposal_validation = self._validate_graph_proposals(graph_proposals, context)
+                if proposal_validation and not proposal_validation.approved:
+                    reason = "; ".join(step.reason for step in proposal_validation.validator_trace if not step.passed) or "graph delta validation failed"
+                    raise _PostCommitValidationError(reason, proposal_validation)
+                explicit_graph_deltas = self._commit_graph_proposals(graph_proposals, context)
                 trace = self.runtime.last_trace
                 if trace is None:
                     raise RuntimeError("policy execution did not produce a trace")
                 trace.query_plan["governed_transaction_id"] = transaction_id
+                if graph_proposals:
+                    trace.query_plan["graph_delta_proposals"] = [proposal.model_dump(mode="json") for proposal in graph_proposals]
+                if explicit_graph_deltas:
+                    trace.query_plan["governed_graph_deltas"] = [delta.to_dict() for delta in explicit_graph_deltas]
 
                 after_memories = self._snapshot_memories(context.namespace)
                 after_edges = self._snapshot_edges()
                 memory_deltas = self._memory_deltas(before_memories, after_memories)
                 lifecycle_deltas = self._lifecycle_deltas(before_memories, after_memories)
-                graph_deltas = self._policy_graph_deltas(trace, before_edges, after_edges)
+                graph_deltas = [*self._policy_graph_deltas(trace, before_edges, after_edges), *explicit_graph_deltas]
                 affected_ids = sorted({delta.memory_id for delta in memory_deltas})
                 index_delta_objs = [IndexDelta(index="sqlite_memory_cards", status="updated", memory_id=memory_id) for memory_id in affected_ids]
                 index_deltas = [delta.to_dict() for delta in index_delta_objs]
@@ -274,6 +292,15 @@ class PolicyExecutor:
     def _coerce_policy(self, policy: MemoryPolicy | MemoryPolicyV2) -> MemoryPolicy:
         if isinstance(policy, MemoryPolicy):
             return policy
+        if policy.graph_deltas and not policy.proposed_deltas:
+            return MemoryPolicy(
+                retrieval=RetrievalPlan(enabled=False, query=policy.target_selector.query or ""),
+                write=WritePlan(operation="NOOP"),
+                forget=ForgetPlan(operation="NOOP"),
+                consolidation=ConsolidationPlan(enabled=False),
+                reason=policy.rollback_plan or "governed graph mutation",
+                source="small_llm" if policy.proposal_source == "small_llm" else "deterministic",
+            )
         evidence_ids = [evidence.event_id for evidence in policy.evidence_chain]
         first_delta = policy.proposed_deltas[0] if policy.proposed_deltas else None
         operation = (first_delta.operation if first_delta is not None else policy.intent).upper()
@@ -313,14 +340,81 @@ class PolicyExecutor:
         )
 
     def _unsupported_v2_reason(self, policy: MemoryPolicyV2) -> str | None:
-        if policy.intent == "supersede":
-            return "MemoryPolicyV2 supersede requires multi-delta lifecycle execution and is not yet supported"
+        if policy.intent == "supersede" and not policy.graph_deltas:
+            return "MemoryPolicyV2 supersede requires multi-delta graph or lifecycle execution; legacy one-delta supersede is not supported"
         if len(policy.proposed_deltas) <= 1:
             return None
         operations = {(delta.operation or policy.intent).lower() for delta in policy.proposed_deltas}
-        if len(operations) == 1 and operations <= {"link"}:
+        if len(operations) == 1 and operations <= {"link", "update"}:
+            return None
+        if policy.graph_deltas:
             return None
         return "multi-delta MemoryPolicyV2 transactions are not yet supported by this executor"
+
+    def _graph_proposals(self, policy: MemoryPolicy | MemoryPolicyV2) -> list[GraphDeltaProposal]:
+        if isinstance(policy, MemoryPolicyV2):
+            return list(policy.graph_deltas)
+        return []
+
+    def _graph_context(self, context: PolicyExecutionContext) -> GraphBuildContext:
+        assert self.runtime.store is not None
+        return GraphBuildContext(
+            namespace=context.namespace,
+            memories=self.runtime.store.list_memories(namespace=context.namespace),
+            selected_memory_ids=context.retrieved_memory_ids or [],
+            target_memory_ids=self._target_ids_from_context(context),
+            evidence_ids=[],
+            outcome=str(context.state.get("status", "unknown")),
+            proposer="small_llm",
+        )
+
+    def _target_ids_from_context(self, context: PolicyExecutionContext) -> list[str]:
+        ids: list[str] = []
+        for value in context.state.get("target_memory_ids", []) if isinstance(context.state.get("target_memory_ids", []), list) else []:
+            ids.append(str(value))
+        return list(dict.fromkeys(ids))
+
+    def _validate_graph_proposals(self, proposals: list[GraphDeltaProposal], context: PolicyExecutionContext) -> ValidatedMutation | None:
+        if not proposals:
+            return None
+        graph_context = self._graph_context(context)
+        steps = [self.graph_validator.validate(proposal, context=graph_context, store=self.runtime.store) for proposal in proposals]
+        approved = all(step.passed for step in steps)
+        return ValidatedMutation(
+            approved=approved,
+            approved_deltas=[],
+            rejected_deltas=[],
+            required_human_review=any(not step.passed and "high-risk" in step.reason for step in steps),
+            risk_score=0.25 if approved else 0.85,
+            validator_trace=steps,
+        )
+
+    def _commit_graph_proposals(self, proposals: list[GraphDeltaProposal], context: PolicyExecutionContext) -> list[GraphDelta]:
+        assert self.runtime.store is not None
+        deltas: list[GraphDelta] = []
+        for proposal in proposals:
+            before = self._edge_for_proposal(proposal)
+            old_weight = before.weight if before is not None else 0.0
+            edge = self.graph_committer.commit(proposal, store=self.runtime.store)
+            deltas.append(
+                GraphDelta(
+                    **graph_delta_from_edge(
+                        edge,
+                        old_weight=old_weight,
+                        operation=proposal.operation,
+                        proposer=proposal.proposer,
+                        reason=proposal.reason or "governed graph delta committed",
+                    )
+                )
+            )
+        return deltas
+
+    def _edge_for_proposal(self, proposal: GraphDeltaProposal) -> object | None:
+        assert self.runtime.store is not None
+        for edge in self.runtime.store.list_edges():
+            if edge.relation == proposal.relation and {edge.source_id, edge.target_id} == {proposal.source_memory_id, proposal.target_memory_id}:
+                return edge
+        return None
 
     def _manual_rejection(self, policy: MemoryPolicy, context: PolicyExecutionContext, reason: str) -> ValidatedMutation:
         del context

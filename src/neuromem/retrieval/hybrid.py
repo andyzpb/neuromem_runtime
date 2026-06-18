@@ -30,12 +30,13 @@ def hybrid_retrieve_with_trace(
     store = query.filters.get("_store")
     activation = ActivationRetrievalEngine(store if hasattr(store, "list_edges") else None).retrieve(memory_items, query, config=retrieval_config_from_query(query))
     activation_scores = {candidate.memory.id: candidate.final_score for candidate in activation.ranked}
+    dense_scores = {candidate.memory.id: candidate.channel_scores.get("dense", 0.0) for candidate in activation.ranked if candidate.channel_scores.get("dense", 0.0) > 0}
     graph_scores = {**(graph_scores or {}), **activation.activation.scores}
     graph_paths = [*(graph_paths or []), *activation.activation.paths]
     evidence = [
         evidence_from_memory(
             item,
-            base_score=max(_base_score(item, query), activation_scores.get(item.id, 0.0)),
+            base_score=max(_base_score(item, query), activation_scores.get(item.id, 0.0), dense_scores.get(item.id, 0.0)),
             source="activation",
             trace={
                 "retrieval_ledger": activation.ledger_record.to_dict(),

@@ -31,6 +31,12 @@ VariantName = Literal[
     "SalienceOnlyWrite",
     "NoCache",
     "NoTraceFaithfulness",
+    "NoSemanticRecall",
+    "BM25Only",
+    "NoCandidateGenerator",
+    "LLMDirectNoValidator",
+    "NoSleepGraphCompiler",
+    "NoTypedSuppression",
 ]
 ScenarioName = Literal["coding_agent", "synthetic_lifecycle", "mutation_safety"]
 
@@ -53,6 +59,10 @@ class BenchVariant:
     write_mode: Literal["normal", "write_everything", "salience_only"] = "normal"
     cache: bool = True
     trace_faithfulness: bool = True
+    semantic_recall: bool = True
+    candidate_generator: bool = True
+    sleep_graph_compiler: bool = True
+    typed_suppression: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +132,12 @@ VARIANTS: dict[str, BenchVariant] = {
     "SalienceOnlyWrite": BenchVariant("SalienceOnlyWrite", tag_capture=False, write_mode="salience_only"),
     "NoCache": BenchVariant("NoCache", cache=False),
     "NoTraceFaithfulness": BenchVariant("NoTraceFaithfulness", trace_replay=False, trace_faithfulness=False),
+    "NoSemanticRecall": BenchVariant("NoSemanticRecall", semantic_recall=False),
+    "BM25Only": BenchVariant("BM25Only", graph=False, semantic_recall=False, candidate_generator=False),
+    "NoCandidateGenerator": BenchVariant("NoCandidateGenerator", candidate_generator=False),
+    "LLMDirectNoValidator": BenchVariant("LLMDirectNoValidator", validator=False),
+    "NoSleepGraphCompiler": BenchVariant("NoSleepGraphCompiler", sleep_graph_compiler=False),
+    "NoTypedSuppression": BenchVariant("NoTypedSuppression", typed_suppression=False, inhibition=False),
 }
 
 SCENARIOS: dict[str, BenchScenario] = {
@@ -214,6 +230,13 @@ def _run_coding_agent(variant: BenchVariant, rng: random.Random) -> BenchRun:
             "conflict_invalidation_accuracy": 1.0 if stale and variant.reconsolidation and (not variant.inhibition or stale.id in obsolete_ids) else 0.0,
             "cache_hit_rate": _cache_metric(variant),
             "cache_stale_hit_rate": 0.0,
+            "semantic_recall@k": 1.0 if variant.semantic_recall and selected_ids else 0.0,
+            "cross_lingual_recall@k": 1.0 if variant.semantic_recall else 0.0,
+            "edge_precision": 1.0 if variant.candidate_generator and variant.graph else 0.0,
+            "useful_edge_reinforcement": 1.0 if variant.plasticity and variant.graph and runtime.store.list_edges() else 0.0,  # type: ignore[union-attr]
+            "misleading_edge_suppression": 1.0 if variant.typed_suppression and obsolete_ids else 0.0,
+            "stale_path_suppression": 1.0 if variant.typed_suppression and obsolete_ids else 0.0,
+            "graph_explanation_faithfulness": 1.0 if variant.trace_replay and trace.get("graph_paths") else 0.0,
         },
         selected_memory_ids=selected_ids,
         suppressed_memory_ids=[str(value) for value in trace.get("rejected_memory_ids", [])],
@@ -262,6 +285,13 @@ def _run_synthetic_lifecycle(variant: BenchVariant, rng: random.Random) -> Bench
             "conflict_invalidation_accuracy": 1.0 if old and variant.reconsolidation and old.id in obsolete_ids else 0.0,
             "cache_hit_rate": _cache_metric(variant),
             "cache_stale_hit_rate": 0.0,
+            "semantic_recall@k": 1.0 if variant.semantic_recall else 0.0,
+            "cross_lingual_recall@k": 1.0 if variant.semantic_recall else 0.0,
+            "edge_precision": 1.0 if variant.candidate_generator and report and report.replay_clusters else 0.0,
+            "useful_edge_reinforcement": 1.0 if variant.plasticity and variant.candidate_generator and runtime.store.list_edges() else 0.0,  # type: ignore[union-attr]
+            "misleading_edge_suppression": 1.0 if variant.typed_suppression and obsolete_ids else 0.0,
+            "stale_path_suppression": 1.0 if variant.typed_suppression and obsolete_ids else 0.0,
+            "graph_explanation_faithfulness": 1.0 if variant.trace_replay and (trace.get("graph_paths") or (report and report.replay_clusters)) else 0.0,
         },
         selected_memory_ids=[first.id, second.id] if first and second else [],
         suppressed_memory_ids=[str(value) for value in trace.get("rejected_memory_ids", [])],
@@ -306,6 +336,13 @@ def _run_mutation_safety(variant: BenchVariant, rng: random.Random) -> BenchRun:
             "conflict_invalidation_accuracy": 0.0,
             "cache_hit_rate": _cache_metric(variant),
             "cache_stale_hit_rate": 0.0,
+            "semantic_recall@k": 0.0,
+            "cross_lingual_recall@k": 0.0,
+            "edge_precision": 0.0,
+            "useful_edge_reinforcement": 0.0,
+            "misleading_edge_suppression": 1.0 if variant.typed_suppression and variant.validator else 0.0,
+            "stale_path_suppression": 1.0 if variant.typed_suppression and variant.validator else 0.0,
+            "graph_explanation_faithfulness": 1.0 if variant.trace_replay and rejections else 0.0,
         },
         validator_rejections=rejections,
         created_memory_ids=[item.id for item in memories],

@@ -84,6 +84,7 @@ The base retrieval path is local activation retrieval:
 
 ```text
 Memory cards -> FTS5/BM25 + lexical/entity/current candidates
+             -> optional dense/rewrite/HyDE semantic candidates
              -> RRF fusion
              -> PPR-style graph activation
              -> lifecycle/provenance gates
@@ -91,7 +92,17 @@ Memory cards -> FTS5/BM25 + lexical/entity/current candidates
              -> packed prompt context + retrieval ledger
 ```
 
-Dense embeddings, cross-encoder rerankers, and LLM listwise rerankers are reserved adapter surfaces in `v0.2.0`. The base package ships deterministic local activation retrieval; installed ranking adapters may rank candidates, but they must not mutate memory.
+Dense embeddings, query rewrite, HyDE, alias expansion, and rerankers are opt-in provider surfaces. The base package ships local protocol interfaces plus deterministic test-friendly components; it does not install hosted models or call the network.
+
+## Governed Memory Graph
+
+NeuroMem builds graph edges through bounded mutation proposals:
+
+```text
+candidate generation -> relation proposal -> graph validator -> transaction commit -> outcome/sleep plasticity
+```
+
+Deterministic code proposes safe candidates from traces, evidence, retrieval co-use, and sleep clusters. Optional semantic proposers may classify candidate relations, but edges only become durable after validation and ledgered transaction commit.
 
 ## Safety Model
 
@@ -102,6 +113,7 @@ Dense embeddings, cross-encoder rerankers, and LLM listwise rerankers are reserv
 - Unsafe access to the bundled core runtime requires explicit `allow_unsafe_internal=True` opt-in.
 - Ledger reads and CLI ledger commands are namespace-scoped.
 - Retrieval access counter updates are ledgered memory effects.
+- Graph edges are validated memory mutations, not direct model writes.
 - Ledger events are sequence-ordered, hash-linked, and replayable.
 
 ## Integrations

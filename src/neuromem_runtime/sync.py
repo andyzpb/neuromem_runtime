@@ -8,7 +8,9 @@ from neuromem.core.policy import MemoryPolicy
 
 from neuromem_runtime.policy_v2 import MemoryPolicyV2
 from neuromem_runtime.providers import PolicyProvider
+from neuromem_runtime.retrieval import EmbeddingProvider, EntityAliasResolver, HyDEProvider, QueryRewriteProvider, RerankProvider, VectorIndex
 from neuromem_runtime.runtime import MemoryRuntime as AsyncMemoryRuntime
+from neuromem_runtime.semantic_graph import GraphMode, GraphProposalProvider
 from neuromem_runtime.types import MemoryEvent, MemoryQuery
 
 
@@ -25,8 +27,35 @@ class MemoryRuntime:
         mode: str = "lite",
         policy_provider: PolicyProvider | None = None,
         allow_unsafe_internal: bool = False,
+        graph_mode: GraphMode = "governed_hybrid",
+        embedding_provider: EmbeddingProvider | None = None,
+        vector_index: VectorIndex | None = None,
+        rerank_provider: RerankProvider | None = None,
+        query_rewrite_provider: QueryRewriteProvider | None = None,
+        hyde_provider: HyDEProvider | None = None,
+        relation_proposer: GraphProposalProvider | None = None,
+        entity_alias_resolver: EntityAliasResolver | None = None,
     ) -> "MemoryRuntime":
-        return cls(_run(AsyncMemoryRuntime.local(namespace=namespace, path=path, agent_id=agent_id, mode=mode, policy_provider=policy_provider, allow_unsafe_internal=allow_unsafe_internal)))
+        return cls(
+            _run(
+                AsyncMemoryRuntime.local(
+                    namespace=namespace,
+                    path=path,
+                    agent_id=agent_id,
+                    mode=mode,
+                    policy_provider=policy_provider,
+                    allow_unsafe_internal=allow_unsafe_internal,
+                    graph_mode=graph_mode,
+                    embedding_provider=embedding_provider,
+                    vector_index=vector_index,
+                    rerank_provider=rerank_provider,
+                    query_rewrite_provider=query_rewrite_provider,
+                    hyde_provider=hyde_provider,
+                    relation_proposer=relation_proposer,
+                    entity_alias_resolver=entity_alias_resolver,
+                )
+            )
+        )
 
     @classmethod
     def from_config(cls, path: str | Path = ".neuromem") -> "MemoryRuntime":
