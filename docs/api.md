@@ -10,7 +10,7 @@ The runtime separates three things:
 - **Memory mutations**: writes, updates, forgetting, consolidation, graph updates, and access effects.
 - **Ledger records**: hash-linked transaction events that explain and replay memory effects.
 
-The product rule is simple: durable memory changes go through `PolicyExecutor`, deterministic validation, delta capture, version snapshots, and ledger events.
+The product rule is simple: durable memory changes go through `PolicyExecutor`, deterministic validation, atomic SQLite commit or rollback, delta capture, version snapshots, and ledger events.
 
 ## Workspace
 
@@ -36,10 +36,10 @@ The SQLite database stores memories, memory cards, graph edges, experience event
 | `observe(event)` | Record only an immutable `ExperienceEvent`; no long-term memory is written. |
 | `observe_and_commit(event)` | Explicitly validate and commit a long-term memory from an event. |
 | `query(query, budget_tokens=800)` | Return a prompt-ready `MemoryContext` through activation retrieval. |
-| `propose(input)` | Produce a structured `MemoryPolicy` with the configured provider. |
+| `propose(input)` | Produce a structured `MemoryPolicy` or `MemoryPolicyV2` with the configured provider. |
 | `commit(policy)` | Validate and apply governed memory changes. |
 | `mutate(policy)` | Alias for `commit(policy)`. |
-| `sleep()` | Run ledgered replay consolidation and lifecycle updates. |
+| `sleep()` | Run governed replay consolidation and lifecycle updates. |
 | `forget(memory_id, action="inhibit")` | Apply governed forgetting. |
 | `replay_trace(trace_id)` | Return trace plus ledger-backed deltas and replay data. |
 
@@ -89,6 +89,7 @@ The returned trace includes `mutation_execution_result`:
 - `index_deltas`
 
 Rejected policies write `validation_rejected` and `audit_finalized` ledger events and do not mutate memory, graph, lifecycle state, or indexes.
+If a post-commit assertion fails inside the transaction, storage changes roll back and the ledger records a `transaction_rolled_back` event with the rollback reason.
 
 ## Validator Stack
 
@@ -99,13 +100,14 @@ The product executor uses `ValidatorStack` before mutation:
 - `ProvenanceValidator`
 - `TemporalValidator`
 - `ConflictValidator`
+- `NamespaceScopeValidator`
 - `PrivacyAclValidator`
 - `DeletionGuardValidator`
 - `PoisoningRiskValidator`
 - `LifecycleTransitionValidator`
 - `IndexConsistencyValidator`
 
-The implemented gates fail closed for unsupported operations, missing evidence, unknown provenance, unsafe deletion, poisoning phrases, unauthorized private-memory mutation, stale target updates without historical intent, invalid lifecycle transitions, and missing post-commit memory-card index rows.
+The implemented gates fail closed for unsupported operations, missing evidence, unknown provenance, cross-namespace targets or evidence, unsafe deletion, poisoning phrases, unauthorized private-memory mutation, stale target updates without historical intent, invalid lifecycle transitions, and missing post-commit memory-card index rows.
 
 ## Ledger
 
@@ -121,14 +123,24 @@ Ledger transactions are split into phase events:
 - `lifecycle_delta_committed`
 - `audit_finalized`
 
+Sleep transactions use explicit sleep phases:
+
+- `sleep_plan_proposed`
+- `sleep_validation_approved`
+- `replay_batch_selected`
+- `consolidation_delta_committed`
+- `suppression_delta_committed`
+- `compilation_delta_committed`
+- `sleep_audit_finalized`
+
 Useful methods:
 
 ```python
 memory.ledger.verify_hash_chain()
-memory.ledger.reconstruct(to_transaction_id=None)
-memory.ledger.replay_trace(trace_id)
-memory.ledger.why_written(memory_id)
-memory.ledger.retrieval_explain(trace_id)
+memory.ledger.reconstruct(to_transaction_id=None, namespace="default")
+memory.ledger.replay_trace(trace_id, namespace="default")
+memory.ledger.why_written(memory_id, namespace="default")
+memory.ledger.retrieval_explain(trace_id, namespace="default")
 ```
 
 CLI commands:
@@ -180,7 +192,7 @@ Optional query filters:
 
 Retrieval access effects, such as `access_count`, `activation_count`, and `last_accessed_at`, are ledgered as memory deltas.
 
-Dense embeddings, late-interaction retrieval, cross-encoder reranking, and LLM listwise reranking are optional adapter paths. They may rank candidates, but they must not mutate memory.
+Dense embeddings, late-interaction retrieval, cross-encoder reranking, and LLM listwise reranking are reserved adapter surfaces in `v0.2.0`. The base package ships deterministic local activation retrieval; installed ranking adapters may rank candidates, but they must not mutate memory.
 
 ## Forgetting
 
@@ -222,6 +234,19 @@ memory = await nmem.MemoryRuntime.local(
 ```
 
 Providers return structured policy proposals. The runtime still validates and commits them.
+
+The OpenAI-compatible providers request `MemoryPolicyV2` first and fall back to the legacy policy schema only for compatibility. Unsupported V2 multi-delta transactions are rejected explicitly rather than silently becoming NOOP.
+
+## Unsafe Debug Access
+
+The bundled `neuromem` implementation is an internal compatibility layer, not the governed public API. Accessing it requires explicit opt-in:
+
+```python
+memory = await MemoryRuntime.local(allow_unsafe_internal=True)
+core = memory.unsafe_internal_runtime
+```
+
+Without that opt-in, `internal_runtime` and `unsafe_internal_runtime` raise `RuntimeError`.
 
 ## Exports
 

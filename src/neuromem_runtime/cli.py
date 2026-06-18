@@ -185,11 +185,11 @@ async def _cmd_trace(args: argparse.Namespace) -> str | None:
 async def _cmd_ledger(args: argparse.Namespace) -> str:
     runtime = await _runtime(args)
     if args.ledger_command == "show":
-        return json.dumps(runtime.ledger.show_transaction(args.transaction_id), indent=2, sort_keys=True)
+        return json.dumps(runtime.ledger.show_transaction(args.transaction_id, namespace=args.namespace), indent=2, sort_keys=True)
     if args.ledger_command == "why-written":
-        return json.dumps(runtime.ledger.why_written(args.memory_id), indent=2, sort_keys=True)
+        return json.dumps(runtime.ledger.why_written(args.memory_id, namespace=args.namespace), indent=2, sort_keys=True)
     if args.ledger_command == "why-retrieved":
-        events = runtime.ledger.events_for_trace(args.trace_id)
+        events = runtime.ledger.events_for_trace(args.trace_id, namespace=args.namespace)
         filtered = [
             event
             for event in events
@@ -198,9 +198,9 @@ async def _cmd_ledger(args: argparse.Namespace) -> str:
         ]
         return json.dumps(filtered, indent=2, sort_keys=True)
     if args.ledger_command == "replay":
-        return json.dumps(runtime.ledger.replay(args.to_txn), indent=2, sort_keys=True)
+        return json.dumps(runtime.ledger.replay(args.to_txn, namespace=args.namespace), indent=2, sort_keys=True)
     if args.ledger_command == "diff":
-        return json.dumps(runtime.ledger.diff(args.left_txn, args.right_txn), indent=2, sort_keys=True)
+        return json.dumps(runtime.ledger.diff(args.left_txn, args.right_txn, namespace=args.namespace), indent=2, sort_keys=True)
     raise ValueError(f"unsupported ledger command: {args.ledger_command}")
 
 
@@ -213,7 +213,7 @@ async def _cmd_retrieval(args: argparse.Namespace) -> str:
         query_plan = trace.get("query_plan", {}) if isinstance(trace, dict) else {}
         if isinstance(query_plan, dict) and isinstance(query_plan.get("retrieval_ledger"), dict):
             return json.dumps(query_plan["retrieval_ledger"], indent=2, sort_keys=True)
-        ledger = runtime.ledger.retrieval_explain(args.trace_id)
+        ledger = runtime.ledger.retrieval_explain(args.trace_id, namespace=args.namespace)
         if ledger is not None:
             return json.dumps(ledger, indent=2, sort_keys=True)
         raise ValueError(f"retrieval ledger not found for trace: {args.trace_id}")

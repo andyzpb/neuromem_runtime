@@ -91,7 +91,7 @@ Memory cards -> FTS5/BM25 + lexical/entity/current candidates
              -> packed prompt context + retrieval ledger
 ```
 
-Dense embeddings, cross-encoder rerankers, and LLM listwise rerankers are optional adapters. They may rank candidates, but they do not mutate memory.
+Dense embeddings, cross-encoder rerankers, and LLM listwise rerankers are reserved adapter surfaces in `v0.2.0`. The base package ships deterministic local activation retrieval; installed ranking adapters may rank candidates, but they must not mutate memory.
 
 ## Safety Model
 
@@ -99,8 +99,10 @@ Dense embeddings, cross-encoder rerankers, and LLM listwise rerankers are option
 - Every product-surface mutation goes through `PolicyExecutor`.
 - Writes require evidence.
 - Deletes require explicit authorization.
+- Unsafe access to the bundled core runtime requires explicit `allow_unsafe_internal=True` opt-in.
+- Ledger reads and CLI ledger commands are namespace-scoped.
 - Retrieval access counter updates are ledgered memory effects.
-- Ledger events are hash-linked and replayable.
+- Ledger events are sequence-ordered, hash-linked, and replayable.
 
 ## Integrations
 

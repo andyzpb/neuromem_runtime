@@ -4,6 +4,7 @@ import asyncio
 import sys
 
 import neuromem_runtime as nmem
+import pytest
 from neuromem.core.models import MemoryEdge
 from neuromem.core.policy import ConsolidationPlan, ForgetPlan, MemoryPolicy, RetrievalPlan, WritePlan
 
@@ -63,6 +64,18 @@ def test_async_local_workflow(tmp_path) -> None:
         assert "processed" in report
         assert report["ledger_transaction_id"]
         assert memory.ledger.verify_hash_chain()
+        sleep_events = memory.ledger.show_transaction(report["ledger_transaction_id"], namespace="demo")
+        assert [event["event_type"] for event in sleep_events] == [
+            "sleep_plan_proposed",
+            "sleep_validation_approved",
+            "replay_batch_selected",
+            "consolidation_delta_committed",
+            "suppression_delta_committed",
+            "compilation_delta_committed",
+            "sleep_audit_finalized",
+        ]
+        assert "memory_deltas" in report["sleep"]
+        assert "lifecycle" in report["sleep"]
 
         trace = await memory.replay_trace(context.trace_id)
         assert trace is not None
@@ -81,14 +94,27 @@ def test_async_local_workflow(tmp_path) -> None:
 
 def test_observe_can_record_experience_without_long_term_mutation(tmp_path) -> None:
     async def run() -> None:
-        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem")
+        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
         bundle = await memory.observe({"content": "Keep as an immutable observation only."})
         assert bundle.event_id is not None
         assert bundle.memory_id is None
-        assert memory.internal_runtime.store is not None
-        assert memory.internal_runtime.store.list_memories(namespace="demo") == []
+        assert memory.unsafe_internal_runtime.store is not None
+        assert memory.unsafe_internal_runtime.store.list_memories(namespace="demo") == []
         replay = memory.ledger.replay()
         assert replay[-1]["event_type"] == "experience_observed"
+
+    asyncio.run(run())
+
+
+def test_internal_runtime_requires_explicit_unsafe_opt_in(tmp_path) -> None:
+    async def run() -> None:
+        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem")
+        with pytest.raises(RuntimeError):
+            _ = memory.internal_runtime
+        with pytest.raises(RuntimeError):
+            _ = memory.unsafe_internal_runtime
+        unsafe = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem-unsafe", allow_unsafe_internal=True)
+        assert unsafe.unsafe_internal_runtime.store is not None
 
     asyncio.run(run())
 
@@ -104,14 +130,14 @@ def test_sync_wrapper(tmp_path) -> None:
 
 def test_delete_requires_authorization(tmp_path) -> None:
     async def run() -> None:
-        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem")
+        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
         bundle = await memory.observe_and_commit({"content": "Temporary secret should be removed.", "evidence": "trace-1"})
         assert bundle.memory_id is not None
         rejected = await memory.forget(bundle.memory_id, action="delete", reason="test delete")
         assert "DELETE_REQUEST requires explicit user authorization" in rejected["validator_decision"]
         assert rejected["rejected_reasons"]
         assert rejected["mutation_execution_result"]["validated_mutation"]["approved"] is False
-        stored = memory.internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[union-attr]
+        stored = memory.unsafe_internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[union-attr]
         assert stored is not None
         assert stored.maturity != "deleted"
 
@@ -120,13 +146,13 @@ def test_delete_requires_authorization(tmp_path) -> None:
 
 def test_forget_decay_applies_once_after_validation(tmp_path) -> None:
     async def run() -> None:
-        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem")
+        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
         bundle = await memory.observe_and_commit({"content": "Temporary command can decay.", "evidence": "trace-1"})
         assert bundle.memory_id is not None
-        before = memory.internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[union-attr]
+        before = memory.unsafe_internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[union-attr]
         assert before is not None
         result = await memory.forget(bundle.memory_id, action="decay", reason="low utility")
-        after = memory.internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[union-attr]
+        after = memory.unsafe_internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[union-attr]
         assert after is not None
         assert round(after.decay_score - before.decay_score, 3) == 0.2
         assert result["mutation_execution_result"]["validated_mutation"]["approved"] is True
@@ -186,12 +212,12 @@ def test_custom_policy_provider_is_used(tmp_path) -> None:
 
 def test_edge_upsert_prevents_duplicate_edges(tmp_path) -> None:
     async def run() -> None:
-        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem")
-        assert memory.internal_runtime.store is not None
+        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
+        assert memory.unsafe_internal_runtime.store is not None
         edge = MemoryEdge(source_id="a", target_id="b", relation="coactivated_with", weight=0.1, confidence=0.5)
-        memory.internal_runtime.store.add_edge(edge)
-        memory.internal_runtime.store.add_edge(MemoryEdge(source_id="a", target_id="b", relation="coactivated_with", weight=0.9, confidence=0.8))
-        edges = memory.internal_runtime.store.list_edges("a")
+        memory.unsafe_internal_runtime.store.add_edge(edge)
+        memory.unsafe_internal_runtime.store.add_edge(MemoryEdge(source_id="a", target_id="b", relation="coactivated_with", weight=0.9, confidence=0.8))
+        edges = memory.unsafe_internal_runtime.store.list_edges("a")
         assert len(edges) == 1
         assert edges[0].weight == 0.9
 

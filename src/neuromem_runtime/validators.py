@@ -19,6 +19,7 @@ class ValidationContext:
     historical: bool = False
     post_commit: bool = False
     affected_memory_ids: list[str] | None = None
+    allow_cross_namespace: bool = False
 
 
 class MutationValidator:
@@ -58,7 +59,7 @@ class ProvenanceValidator(MutationValidator):
         for evidence_id in policy.write.evidence_ids:
             exists = False
             if hasattr(ledger, "get_experience"):
-                exists = getattr(ledger, "get_experience")(evidence_id) is not None
+                exists = getattr(ledger, "get_experience")(evidence_id, namespace=context.namespace) is not None
             if not exists and context.store is not None:
                 exists = context.store.get_memory(evidence_id) is not None
             if not exists:
@@ -105,6 +106,26 @@ class PrivacyAclValidator(MutationValidator):
         if item.privacy_level in {"user", "sensitive"} and item.acl:
             if context.user_id is None or context.user_id not in item.acl:
                 return ValidationStep(name=self.name, passed=False, reason="user is not authorized for private memory")
+        return ValidationStep(name=self.name, passed=True)
+
+
+class NamespaceScopeValidator(MutationValidator):
+    name = "NamespaceScopeValidator"
+
+    def validate(self, policy: MemoryPolicy, context: ValidationContext) -> ValidationStep:
+        if context.allow_cross_namespace or context.store is None:
+            return ValidationStep(name=self.name, passed=True)
+        ids = [value for value in [policy.write.target_memory_id, policy.forget.target_memory_id] if value]
+        for memory_id in ids:
+            item = context.store.get_memory(memory_id)
+            if item is None:
+                return ValidationStep(name=self.name, passed=False, reason="target memory not found")
+            if item.namespace != context.namespace:
+                return ValidationStep(name=self.name, passed=False, reason=f"target memory outside namespace: {memory_id}")
+        for evidence_id in policy.write.evidence_ids:
+            item = context.store.get_memory(evidence_id)
+            if item is not None and item.namespace != context.namespace:
+                return ValidationStep(name=self.name, passed=False, reason=f"evidence memory outside namespace: {evidence_id}")
         return ValidationStep(name=self.name, passed=True)
 
 
@@ -179,6 +200,7 @@ class ValidatorStack:
             ProvenanceValidator(),
             TemporalValidator(),
             ConflictValidator(),
+            NamespaceScopeValidator(),
             PrivacyAclValidator(),
             DeletionGuardValidator(),
             PoisoningRiskValidator(),
@@ -213,6 +235,7 @@ __all__ = [
     "IndexConsistencyValidator",
     "LifecycleTransitionValidator",
     "MutationValidator",
+    "NamespaceScopeValidator",
     "PoisoningRiskValidator",
     "PrivacyAclValidator",
     "ProvenanceValidator",

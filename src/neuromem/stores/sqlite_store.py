@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock
 
@@ -15,12 +17,48 @@ class SQLiteMemoryStore(MemoryStore):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = RLock()
+        self._transaction_conn: sqlite3.Connection | None = None
+        self._transaction_depth = 0
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.path)
         conn.row_factory = sqlite3.Row
         return conn
+
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            if self._transaction_conn is not None:
+                self._transaction_depth += 1
+                try:
+                    yield self._transaction_conn
+                finally:
+                    self._transaction_depth -= 1
+                return
+            conn = self._connect()
+            self._transaction_conn = conn
+            self._transaction_depth = 1
+            try:
+                conn.execute("BEGIN")
+                yield conn
+            except Exception:
+                conn.rollback()
+                raise
+            else:
+                conn.commit()
+            finally:
+                self._transaction_conn = None
+                self._transaction_depth = 0
+                conn.close()
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        if self._transaction_conn is not None:
+            yield self._transaction_conn
+            return
+        with self._connect() as conn:
+            yield conn
 
     def _init_db(self) -> None:
         with self._connect() as conn:
@@ -192,7 +230,7 @@ class SQLiteMemoryStore(MemoryStore):
 
     def upsert_memory(self, item: MemoryItem) -> None:
         record = item.to_record()
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO memories (
@@ -332,7 +370,7 @@ class SQLiteMemoryStore(MemoryStore):
         if not query.strip():
             return []
         fts_query = self._sanitize_fts_query(query)
-        with self._connect() as conn:
+        with self._connection() as conn:
             try:
                 params: list[object] = [fts_query]
                 where = "memory_cards_fts MATCH ?"
@@ -400,7 +438,7 @@ class SQLiteMemoryStore(MemoryStore):
         return MemoryItem.from_record(record)
 
     def get_memory(self, memory_id: str) -> MemoryItem | None:
-        with self._connect() as conn:
+        with self._connection() as conn:
             row = conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,)).fetchone()
         return self._row_to_item(row) if row else None
 
@@ -411,7 +449,7 @@ class SQLiteMemoryStore(MemoryStore):
             query += " WHERE namespace = ?"
             params = (namespace,)
         query += " ORDER BY created_at ASC"
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(query, params).fetchall()
         return [self._row_to_item(row) for row in rows]
 
@@ -420,7 +458,7 @@ class SQLiteMemoryStore(MemoryStore):
 
     def upsert_edge(self, edge: MemoryEdge) -> None:
         record = edge.to_record()
-        with self._lock, self._connect() as conn:
+        with self._lock, self._connection() as conn:
             conn.execute(
                 """
                 INSERT INTO edges (
@@ -473,7 +511,7 @@ class SQLiteMemoryStore(MemoryStore):
         if source_id is not None:
             query += " WHERE source_id = ?"
             params = (source_id,)
-        with self._connect() as conn:
+        with self._connection() as conn:
             rows = conn.execute(query, params).fetchall()
         results: list[MemoryEdge] = []
         for row in rows:

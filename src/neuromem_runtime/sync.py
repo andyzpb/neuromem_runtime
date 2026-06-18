@@ -6,6 +6,7 @@ from typing import Any
 
 from neuromem.core.policy import MemoryPolicy
 
+from neuromem_runtime.policy_v2 import MemoryPolicyV2
 from neuromem_runtime.providers import PolicyProvider
 from neuromem_runtime.runtime import MemoryRuntime as AsyncMemoryRuntime
 from neuromem_runtime.types import MemoryEvent, MemoryQuery
@@ -23,8 +24,9 @@ class MemoryRuntime:
         agent_id: str = "local-agent",
         mode: str = "lite",
         policy_provider: PolicyProvider | None = None,
+        allow_unsafe_internal: bool = False,
     ) -> "MemoryRuntime":
-        return cls(_run(AsyncMemoryRuntime.local(namespace=namespace, path=path, agent_id=agent_id, mode=mode, policy_provider=policy_provider)))
+        return cls(_run(AsyncMemoryRuntime.local(namespace=namespace, path=path, agent_id=agent_id, mode=mode, policy_provider=policy_provider, allow_unsafe_internal=allow_unsafe_internal)))
 
     @classmethod
     def from_config(cls, path: str | Path = ".neuromem") -> "MemoryRuntime":
@@ -43,13 +45,13 @@ class MemoryRuntime:
     def query(self, query: str | MemoryQuery, budget_tokens: int = 800, filters: dict[str, object] | None = None) -> Any:
         return _run(self._async_runtime.query(query, budget_tokens=budget_tokens, filters=filters))
 
-    def propose(self, value: str | dict[str, object]) -> MemoryPolicy:
+    def propose(self, value: str | dict[str, object]) -> MemoryPolicy | MemoryPolicyV2:
         return _run(self._async_runtime.propose(value))
 
-    def commit(self, policy: MemoryPolicy, *, authorize_delete: bool = False) -> dict[str, object]:
+    def commit(self, policy: MemoryPolicy | MemoryPolicyV2, *, authorize_delete: bool = False) -> dict[str, object]:
         return _run(self._async_runtime.commit(policy, authorize_delete=authorize_delete))
 
-    def mutate(self, policy: MemoryPolicy, *, authorize_delete: bool = False) -> dict[str, object]:
+    def mutate(self, policy: MemoryPolicy | MemoryPolicyV2, *, authorize_delete: bool = False) -> dict[str, object]:
         return _run(self._async_runtime.mutate(policy, authorize_delete=authorize_delete))
 
     def sleep(self) -> dict[str, object]:

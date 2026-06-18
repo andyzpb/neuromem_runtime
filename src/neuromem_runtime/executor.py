@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from sqlite3 import Connection
 from typing import Any
 from uuid import uuid4
 
@@ -17,7 +18,7 @@ from neuromem.core.runtime import NeuroMemRuntime
 from neuromem_runtime.deltas import GraphDelta, IndexDelta, LifecycleDelta, MemoryDelta, MutationExecutionResult
 from neuromem_runtime.ledger import LedgerEvent, MemoryLedger
 from neuromem_runtime.lifecycle import LifecycleStateMachine
-from neuromem_runtime.policy_v2 import MemoryPolicyV2, ValidatedMutation
+from neuromem_runtime.policy_v2 import MemoryPolicyV2, ValidatedMutation, ValidationStep
 from neuromem_runtime.validators import ValidationContext, ValidatorStack
 
 
@@ -32,6 +33,15 @@ class PolicyExecutionContext:
     user_id: str | None = None
     namespace: str = "default"
     historical: bool = False
+    agent_id: str | None = None
+    allow_cross_namespace: bool = False
+
+
+class _PostCommitValidationError(RuntimeError):
+    def __init__(self, reason: str, validated: ValidatedMutation) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.validated = validated
 
 
 class PolicyExecutor:
@@ -44,41 +54,198 @@ class PolicyExecutor:
     def execute(self, policy: MemoryPolicy | MemoryPolicyV2, context: PolicyExecutionContext) -> MutationExecutionResult:
         assert self.runtime.store is not None
         legacy_policy = self._coerce_policy(policy)
+        if isinstance(policy, MemoryPolicyV2):
+            unsupported = self._unsupported_v2_reason(policy)
+            if unsupported:
+                rejected = self._manual_rejection(legacy_policy, context, unsupported)
+                return self._record_rejection(legacy_policy, context, rejected)
+
         before_memories = self._snapshot_memories(context.namespace)
         before_edges = self._snapshot_edges()
-        pre_validation = self.validator_stack.validate(
-            legacy_policy,
-            ValidationContext(
-                store=self.runtime.store,
-                ledger=self.ledger,
-                phase=context.phase,
-                authorize_delete=context.authorize_delete,
-                user_id=context.user_id,
-                namespace=context.namespace,
-                historical=context.historical,
-            ),
-        )
-        transaction_id = f"txn_{uuid4().hex}"
-        self._append_stage(
-            transaction_id,
-            None,
-            "PROPOSED",
-            "proposal_recorded",
-            legacy_policy,
-            pre_validation,
-            audit={"policy": self._policy_dict(legacy_policy)},
-        )
+        pre_validation = self.validator_stack.validate(legacy_policy, self._validation_context(context))
         if not pre_validation.approved:
-            trace = self._rejected_trace(legacy_policy, context, pre_validation)
+            return self._record_rejection(legacy_policy, context, pre_validation)
+
+        transaction_id = f"txn_{uuid4().hex}"
+        try:
+            with self.runtime.store.transaction() as conn:  # type: ignore[attr-defined]
+                self._append_stage(
+                    transaction_id,
+                    None,
+                    "PROPOSED",
+                    "proposal_recorded",
+                    legacy_policy,
+                    pre_validation,
+                    context=context,
+                    conn=conn,
+                    audit={"policy": self._policy_dict(legacy_policy)},
+                )
+                approved = ValidatedPolicy(
+                    policy=legacy_policy,
+                    approved=True,
+                    approved_actions=self._approved_actions(legacy_policy),
+                    rejected_reasons=[],
+                )
+                self._append_stage(
+                    transaction_id,
+                    None,
+                    "VALIDATED",
+                    "validation_approved",
+                    legacy_policy,
+                    pre_validation,
+                    context=context,
+                    conn=conn,
+                    audit=pre_validation.model_dump(),
+                )
+                self.runtime._execute_validated_policy(  # noqa: SLF001 - executor wraps core primitive in validation, transaction, and audit.
+                    legacy_policy,
+                    approved,
+                    phase=context.phase,
+                    task=context.task,
+                    query=context.query,
+                    state=context.state,
+                    retrieved_memory_ids=context.retrieved_memory_ids,
+                )
+                trace = self.runtime.last_trace
+                if trace is None:
+                    raise RuntimeError("policy execution did not produce a trace")
+                trace.query_plan["governed_transaction_id"] = transaction_id
+
+                after_memories = self._snapshot_memories(context.namespace)
+                after_edges = self._snapshot_edges()
+                memory_deltas = self._memory_deltas(before_memories, after_memories)
+                lifecycle_deltas = self._lifecycle_deltas(before_memories, after_memories)
+                graph_deltas = self._policy_graph_deltas(trace, before_edges, after_edges)
+                affected_ids = sorted({delta.memory_id for delta in memory_deltas})
+                index_delta_objs = [IndexDelta(index="sqlite_memory_cards", status="updated", memory_id=memory_id) for memory_id in affected_ids]
+                index_deltas = [delta.to_dict() for delta in index_delta_objs]
+                post_validation = self.validator_stack.validate(
+                    legacy_policy,
+                    self._validation_context(context, post_commit=True, affected_memory_ids=affected_ids),
+                )
+                if not post_validation.approved:
+                    reason = "; ".join(step.reason for step in post_validation.validator_trace if not step.passed) or "post-commit assertion failed"
+                    raise _PostCommitValidationError(reason, post_validation)
+
+                created_ids = sorted(set(after_memories) - set(before_memories))
+                deleted_ids = sorted(set(before_memories) - set(after_memories))
+                updated_ids = sorted((set(before_memories) & set(after_memories)) & {delta.memory_id for delta in memory_deltas})
+                trace.query_plan["mutation_execution_result"] = {
+                    "created_memory_ids": created_ids,
+                    "updated_memory_ids": updated_ids,
+                    "deleted_memory_ids": deleted_ids,
+                    "memory_deltas": [delta.to_dict() for delta in memory_deltas],
+                    "graph_deltas": [delta.to_dict() for delta in graph_deltas],
+                    "lifecycle_deltas": [delta.to_dict() for delta in lifecycle_deltas],
+                    "index_deltas": index_deltas,
+                    "validator_trace": [step.model_dump() for step in post_validation.validator_trace],
+                }
+
+                evidence = self._evidence(legacy_policy)
+                targets = created_ids or updated_ids or deleted_ids or self._target_ids(legacy_policy)
+                self._append_stage(
+                    transaction_id,
+                    trace.trace_id,
+                    "COMMITTED",
+                    "memory_delta_committed",
+                    legacy_policy,
+                    post_validation,
+                    context=context,
+                    conn=conn,
+                    evidence=evidence,
+                    targets=targets,
+                    memory_delta=[delta.to_dict() for delta in memory_deltas],
+                    audit=trace.to_dict(),
+                )
+                self._append_stage(
+                    transaction_id,
+                    trace.trace_id,
+                    "COMMITTED",
+                    "index_updated",
+                    legacy_policy,
+                    post_validation,
+                    context=context,
+                    conn=conn,
+                    evidence=evidence,
+                    targets=targets,
+                    index_delta=index_deltas,
+                    audit={"affected_memory_ids": affected_ids},
+                )
+                if graph_deltas:
+                    self._append_stage(
+                        transaction_id,
+                        trace.trace_id,
+                        "COMMITTED",
+                        "graph_delta_committed",
+                        legacy_policy,
+                        post_validation,
+                        context=context,
+                        conn=conn,
+                        evidence=evidence,
+                        targets=targets,
+                        graph_delta=[delta.to_dict() for delta in graph_deltas],
+                        audit={"edge_count": len(graph_deltas)},
+                    )
+                if lifecycle_deltas:
+                    self._append_stage(
+                        transaction_id,
+                        trace.trace_id,
+                        "COMMITTED",
+                        "lifecycle_delta_committed",
+                        legacy_policy,
+                        post_validation,
+                        context=context,
+                        conn=conn,
+                        evidence=evidence,
+                        targets=targets,
+                        lifecycle_delta=[delta.to_dict() for delta in lifecycle_deltas],
+                        audit={"transition_count": len(lifecycle_deltas)},
+                    )
+                self._append_stage(
+                    transaction_id,
+                    trace.trace_id,
+                    "AUDITED",
+                    "audit_finalized",
+                    legacy_policy,
+                    post_validation,
+                    context=context,
+                    conn=conn,
+                    evidence=evidence,
+                    targets=targets,
+                    audit=trace.to_dict(),
+                )
+                for memory_id in targets:
+                    state = after_memories.get(memory_id)
+                    if state is not None:
+                        self.ledger.record_memory_version(memory_id, transaction_id, state, conn=conn)
+                for edge_id, state in after_edges.items():
+                    if before_edges.get(edge_id) != state:
+                        self.ledger.record_edge_version(edge_id, transaction_id, state, conn=conn)
+
+                return MutationExecutionResult(
+                    trace=trace,
+                    validated_mutation=post_validation,
+                    created_memory_ids=created_ids,
+                    updated_memory_ids=updated_ids,
+                    deleted_memory_ids=deleted_ids,
+                    memory_deltas=memory_deltas,
+                    graph_deltas=graph_deltas,
+                    lifecycle_deltas=lifecycle_deltas,
+                    index_deltas=index_delta_objs,
+                )
+        except _PostCommitValidationError as exc:
+            trace = self._rolled_back_trace(legacy_policy, context, exc.validated, exc.reason)
             self.runtime.last_trace = trace
             self.runtime.traces[trace.trace_id] = trace
             self._append_stage(
                 transaction_id,
                 trace.trace_id,
-                "REJECTED",
-                "validation_rejected",
+                "ROLLED_BACK",
+                "transaction_rolled_back",
                 legacy_policy,
-                pre_validation,
+                exc.validated,
+                context=context,
+                rollback_reason=exc.reason,
                 audit=trace.to_dict(),
             )
             self._append_stage(
@@ -87,146 +254,22 @@ class PolicyExecutor:
                 "AUDITED",
                 "audit_finalized",
                 legacy_policy,
-                pre_validation,
+                exc.validated,
+                context=context,
+                rollback_reason=exc.reason,
                 audit=trace.to_dict(),
             )
-            return MutationExecutionResult(trace=trace, validated_mutation=pre_validation)
+            return MutationExecutionResult(trace=trace, validated_mutation=exc.validated)
 
-        approved = ValidatedPolicy(
-            policy=legacy_policy,
-            approved=True,
-            approved_actions=self._approved_actions(legacy_policy),
-            rejected_reasons=[],
-        )
-        self._append_stage(transaction_id, None, "VALIDATED", "validation_approved", legacy_policy, pre_validation, audit=pre_validation.model_dump())
-        self.runtime._execute_validated_policy(  # noqa: SLF001 - product executor owns validation and audit around core mutation primitive.
-            legacy_policy,
-            approved,
-            phase=context.phase,
-            task=context.task,
-            query=context.query,
-            state=context.state,
-            retrieved_memory_ids=context.retrieved_memory_ids,
-        )
-        trace = self.runtime.last_trace
-        if trace is None:
-            raise RuntimeError("policy execution did not produce a trace")
-        trace.query_plan["governed_transaction_id"] = transaction_id
-        after_memories = self._snapshot_memories(context.namespace)
-        after_edges = self._snapshot_edges()
-        memory_deltas = self._memory_deltas(before_memories, after_memories)
-        lifecycle_deltas = self._lifecycle_deltas(before_memories, after_memories)
-        graph_deltas = self._graph_deltas(before_edges, after_edges)
-        affected_ids = sorted({delta.memory_id for delta in memory_deltas})
-        index_deltas = [IndexDelta(index="sqlite_memory_cards", status="updated", memory_id=memory_id).to_dict() for memory_id in affected_ids]
-        post_validation = self.validator_stack.validate(
-            legacy_policy,
-            ValidationContext(
-                store=self.runtime.store,
-                ledger=self.ledger,
-                phase=context.phase,
-                authorize_delete=context.authorize_delete,
-                user_id=context.user_id,
-                namespace=context.namespace,
-                historical=context.historical,
-                post_commit=True,
-                affected_memory_ids=affected_ids,
-            ),
-        )
-        created_ids = sorted(set(after_memories) - set(before_memories))
-        deleted_ids = sorted(set(before_memories) - set(after_memories))
-        updated_ids = sorted((set(before_memories) & set(after_memories)) & {delta.memory_id for delta in memory_deltas})
-        trace.query_plan["mutation_execution_result"] = {
-            "created_memory_ids": created_ids,
-            "updated_memory_ids": updated_ids,
-            "deleted_memory_ids": deleted_ids,
-            "memory_deltas": [delta.to_dict() for delta in memory_deltas],
-            "graph_deltas": [delta.to_dict() for delta in graph_deltas],
-            "lifecycle_deltas": [delta.to_dict() for delta in lifecycle_deltas],
-            "index_deltas": index_deltas,
-            "validator_trace": [step.model_dump() for step in post_validation.validator_trace],
-        }
-        evidence = self._evidence(legacy_policy)
-        targets = created_ids or updated_ids or deleted_ids or self._target_ids(legacy_policy)
-        self._append_stage(
-            transaction_id,
-            trace.trace_id,
-            "COMMITTED",
-            "memory_delta_committed",
-            legacy_policy,
-            post_validation,
-            evidence=evidence,
-            targets=targets,
-            memory_delta=[delta.to_dict() for delta in memory_deltas],
-            audit=trace.to_dict(),
-        )
-        self._append_stage(
-            transaction_id,
-            trace.trace_id,
-            "COMMITTED",
-            "index_updated",
-            legacy_policy,
-            post_validation,
-            evidence=evidence,
-            targets=targets,
-            index_delta=index_deltas,
-            audit={"affected_memory_ids": affected_ids},
-        )
-        if graph_deltas:
-            self._append_stage(
-                transaction_id,
-                trace.trace_id,
-                "COMMITTED",
-                "graph_delta_committed",
-                legacy_policy,
-                post_validation,
-                evidence=evidence,
-                targets=targets,
-                graph_delta=[delta.to_dict() for delta in graph_deltas],
-                audit={"edge_count": len(graph_deltas)},
-            )
-        if lifecycle_deltas:
-            self._append_stage(
-                transaction_id,
-                trace.trace_id,
-                "COMMITTED",
-                "lifecycle_delta_committed",
-                legacy_policy,
-                post_validation,
-                evidence=evidence,
-                targets=targets,
-                lifecycle_delta=[delta.to_dict() for delta in lifecycle_deltas],
-                audit={"transition_count": len(lifecycle_deltas)},
-            )
-        self._append_stage(
-            transaction_id,
-            trace.trace_id,
-            "AUDITED",
-            "audit_finalized",
-            legacy_policy,
-            post_validation,
-            evidence=evidence,
-            targets=targets,
-            audit=trace.to_dict(),
-        )
-        for memory_id in targets:
-            state = after_memories.get(memory_id)
-            if state is not None:
-                self.ledger.record_memory_version(memory_id, transaction_id, state)
-        for edge_id, state in after_edges.items():
-            if before_edges.get(edge_id) != state:
-                self.ledger.record_edge_version(edge_id, transaction_id, state)
-        return MutationExecutionResult(
-            trace=trace,
-            validated_mutation=post_validation,
-            created_memory_ids=created_ids,
-            updated_memory_ids=updated_ids,
-            deleted_memory_ids=deleted_ids,
-            memory_deltas=memory_deltas,
-            graph_deltas=graph_deltas,
-            lifecycle_deltas=lifecycle_deltas,
-            index_deltas=[IndexDelta(index="sqlite_memory_cards", status="updated", memory_id=memory_id) for memory_id in affected_ids],
-        )
+    def _record_rejection(self, policy: MemoryPolicy, context: PolicyExecutionContext, validated: ValidatedMutation) -> MutationExecutionResult:
+        transaction_id = f"txn_{uuid4().hex}"
+        trace = self._rejected_trace(policy, context, validated)
+        self.runtime.last_trace = trace
+        self.runtime.traces[trace.trace_id] = trace
+        self._append_stage(transaction_id, None, "PROPOSED", "proposal_recorded", policy, validated, context=context, audit={"policy": self._policy_dict(policy)})
+        self._append_stage(transaction_id, trace.trace_id, "REJECTED", "validation_rejected", policy, validated, context=context, audit=trace.to_dict())
+        self._append_stage(transaction_id, trace.trace_id, "AUDITED", "audit_finalized", policy, validated, context=context, audit=trace.to_dict())
+        return MutationExecutionResult(trace=trace, validated_mutation=validated)
 
     def _coerce_policy(self, policy: MemoryPolicy | MemoryPolicyV2) -> MemoryPolicy:
         if isinstance(policy, MemoryPolicy):
@@ -234,35 +277,81 @@ class PolicyExecutor:
         evidence_ids = [evidence.event_id for evidence in policy.evidence_chain]
         first_delta = policy.proposed_deltas[0] if policy.proposed_deltas else None
         operation = (first_delta.operation if first_delta is not None else policy.intent).upper()
+        if policy.intent == "suppress" or operation == "SUPPRESS":
+            operation = "INHIBIT"
         if policy.intent == "delete_request":
             operation = "DELETE_REQUEST"
+        target_id = first_delta.target_memory_id if first_delta else (policy.target_selector.memory_ids[0] if policy.target_selector.memory_ids else None)
+        reason = first_delta.reason if first_delta else (policy.rollback_plan or policy.intent)
         if operation in {"INHIBIT", "INVALIDATE", "ARCHIVE", "DELETE_REQUEST", "DECAY"}:
             return MemoryPolicy(
                 retrieval=RetrievalPlan(enabled=False, query=policy.target_selector.query or ""),
                 write=WritePlan(operation="NOOP"),
-                forget=ForgetPlan(operation=operation, target_memory_id=first_delta.target_memory_id if first_delta else (policy.target_selector.memory_ids[0] if policy.target_selector.memory_ids else None), reason=first_delta.reason if first_delta else policy.rollback_plan),
+                forget=ForgetPlan(operation=operation, target_memory_id=target_id, reason=reason),
                 consolidation=ConsolidationPlan(enabled=False),
-                reason=first_delta.reason if first_delta else policy.intent,
+                reason=reason,
                 source="small_llm" if policy.proposal_source == "small_llm" else "deterministic",
             )
-        write_operation = "ADD" if policy.intent == "add" else "UPDATE" if policy.intent in {"update", "supersede"} else "LINK" if policy.intent == "link" else "NOOP"
         value = first_delta.value if first_delta is not None else None
         memory_type = str(value.get("memory_type")) if isinstance(value, dict) and value.get("memory_type") else None
         content = str(value if not isinstance(value, dict) else value.get("content", "")) if value is not None else None
+        write_operation = "ADD" if policy.intent == "add" else "UPDATE" if policy.intent in {"update", "supersede"} else "LINK" if policy.intent == "link" else "NOOP"
         return MemoryPolicy(
             retrieval=RetrievalPlan(enabled=False, query=policy.target_selector.query or ""),
             write=WritePlan(
                 operation=write_operation,
                 memory_type=memory_type,
                 content=content,
-                target_memory_id=first_delta.target_memory_id if first_delta else (policy.target_selector.memory_ids[0] if policy.target_selector.memory_ids else None),
+                target_memory_id=target_id,
                 confidence=0.75,
                 evidence_ids=evidence_ids,
             ),
             forget=ForgetPlan(operation="NOOP"),
             consolidation=ConsolidationPlan(enabled=policy.intent == "consolidate"),
-            reason=first_delta.reason if first_delta else policy.intent,
+            reason=reason,
             source="small_llm" if policy.proposal_source == "small_llm" else "deterministic",
+        )
+
+    def _unsupported_v2_reason(self, policy: MemoryPolicyV2) -> str | None:
+        if policy.intent == "supersede":
+            return "MemoryPolicyV2 supersede requires multi-delta lifecycle execution and is not yet supported"
+        if len(policy.proposed_deltas) <= 1:
+            return None
+        operations = {(delta.operation or policy.intent).lower() for delta in policy.proposed_deltas}
+        if len(operations) == 1 and operations <= {"link"}:
+            return None
+        return "multi-delta MemoryPolicyV2 transactions are not yet supported by this executor"
+
+    def _manual_rejection(self, policy: MemoryPolicy, context: PolicyExecutionContext, reason: str) -> ValidatedMutation:
+        del context
+        delta = self.validator_stack.validate(policy, ValidationContext()).rejected_deltas
+        return ValidatedMutation(
+            approved=False,
+            approved_deltas=[],
+            rejected_deltas=delta,
+            required_human_review=False,
+            risk_score=0.8,
+            validator_trace=[ValidationStep(name="MemoryPolicyV2SupportValidator", passed=False, reason=reason)],
+        )
+
+    def _validation_context(
+        self,
+        context: PolicyExecutionContext,
+        *,
+        post_commit: bool = False,
+        affected_memory_ids: list[str] | None = None,
+    ) -> ValidationContext:
+        return ValidationContext(
+            store=self.runtime.store,
+            ledger=self.ledger,
+            phase=context.phase,
+            authorize_delete=context.authorize_delete,
+            user_id=context.user_id,
+            namespace=context.namespace,
+            historical=context.historical,
+            post_commit=post_commit,
+            affected_memory_ids=affected_memory_ids,
+            allow_cross_namespace=context.allow_cross_namespace,
         )
 
     def _snapshot_memories(self, namespace: str) -> dict[str, dict[str, Any]]:
@@ -303,6 +392,17 @@ class PolicyExecutor:
                 deltas.append(self.lifecycle.transition(memory_id, from_state=from_state, to_state=new, trigger="validated write", evidence=list(after[memory_id].get("evidence", [])), reason="memory created"))
         return deltas
 
+    def _policy_graph_deltas(self, trace: MemoryTrace, before: dict[str, dict[str, Any]], after: dict[str, dict[str, Any]]) -> list[GraphDelta]:
+        captured = trace.query_plan.get("plasticity_graph_deltas", [])
+        if isinstance(captured, list) and captured:
+            deltas: list[GraphDelta] = []
+            for item in captured:
+                if isinstance(item, dict):
+                    deltas.append(GraphDelta(**item))
+            if deltas:
+                return deltas
+        return self._graph_deltas(before, after)
+
     def _graph_deltas(self, before: dict[str, dict[str, Any]], after: dict[str, dict[str, Any]]) -> list[GraphDelta]:
         deltas: list[GraphDelta] = []
         for edge_id in sorted(set(before) | set(after)):
@@ -341,18 +441,24 @@ class PolicyExecutor:
         policy: MemoryPolicy,
         validated: ValidatedMutation,
         *,
+        context: PolicyExecutionContext,
+        conn: Connection | None = None,
         evidence: list[dict[str, object]] | None = None,
         targets: list[str] | None = None,
         memory_delta: list[dict[str, object]] | None = None,
         graph_delta: list[dict[str, object]] | None = None,
         lifecycle_delta: list[dict[str, object]] | None = None,
         index_delta: list[dict[str, object]] | None = None,
+        rollback_reason: str | None = None,
         audit: dict[str, object] | None = None,
     ) -> None:
         self.ledger.append(
             LedgerEvent(
                 transaction_id=transaction_id,
                 trace_id=trace_id,
+                namespace=context.namespace,
+                agent_id=context.agent_id,
+                user_id=context.user_id,
                 phase=phase,
                 event_type=event_type,
                 operation=self._operation(policy),
@@ -364,11 +470,13 @@ class PolicyExecutor:
                 graph_delta=graph_delta or [],
                 lifecycle_delta=lifecycle_delta or [],
                 index_delta=index_delta or [],
+                rollback_reason=rollback_reason,
                 audit={
                     **(audit or {}),
                     "validated_mutation": validated.model_dump(),
                 },
-            )
+            ),
+            conn=conn,
         )
 
     def _rejected_trace(self, policy: MemoryPolicy, context: PolicyExecutionContext, validated: ValidatedMutation) -> MemoryTrace:
@@ -382,6 +490,13 @@ class PolicyExecutor:
             pfc_reason=policy.reason,
             validator_decision="; ".join(reasons),
         )
+
+    def _rolled_back_trace(self, policy: MemoryPolicy, context: PolicyExecutionContext, validated: ValidatedMutation, reason: str) -> MemoryTrace:
+        trace = self._rejected_trace(policy, context, validated)
+        trace.fallback_reason = reason
+        trace.validator_decision = reason
+        trace.query_plan["rollback_reason"] = reason
+        return trace
 
     def _approved_actions(self, policy: MemoryPolicy) -> list[str]:
         actions: list[str] = []

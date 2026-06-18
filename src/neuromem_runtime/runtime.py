@@ -3,17 +3,19 @@ from __future__ import annotations
 import json
 import tomllib
 from pathlib import Path
+from uuid import uuid4
 
 from neuromem.core.policy import ConsolidationPlan, ForgetPlan, MemoryPolicy, RetrievalPlan, WritePlan
 from neuromem.core.runtime import NeuroMemRuntime
 from neuromem.stores.sqlite_store import SQLiteMemoryStore
 
+from neuromem_runtime.deltas import LifecycleDelta, MemoryDelta
 from neuromem_runtime.executor import PolicyExecutionContext, PolicyExecutor
 from neuromem_runtime.ledger import ExperienceEvent, LedgerEvent, MemoryLedger
 from neuromem_runtime.policy_v2 import MemoryPolicyV2
 from neuromem_runtime.providers import DeterministicPolicyProvider, PolicyProvider
 from neuromem_runtime.retrieval import RetrievalTraceMetadata
-from neuromem_runtime.sleep import LedgerReport, ReplayBatch, SleepPlanner, SleepReport
+from neuromem_runtime.sleep import CompilationDelta, ConsolidationDelta, LedgerReport, ReplayBatch, SleepPlanner, SleepReport, SuppressionDelta
 from neuromem_runtime.types import EvidenceBundle, MemoryContext, MemoryEvent, MemoryQuery, RuntimeConfig, event_to_dict
 from neuromem_runtime.validators import ValidatorStack
 
@@ -21,9 +23,17 @@ from neuromem_runtime.validators import ValidatorStack
 class MemoryRuntime:
     """Product facade over the research NeuroMem runtime."""
 
-    def __init__(self, config: RuntimeConfig, runtime: NeuroMemRuntime, policy_provider: PolicyProvider | None = None) -> None:
+    def __init__(
+        self,
+        config: RuntimeConfig,
+        runtime: NeuroMemRuntime,
+        policy_provider: PolicyProvider | None = None,
+        *,
+        allow_unsafe_internal: bool = False,
+    ) -> None:
         self.config = config
         self._runtime = runtime
+        self._allow_unsafe_internal = allow_unsafe_internal
         self._validator_stack = ValidatorStack()
         self._policy_provider = policy_provider or DeterministicPolicyProvider()
         self._ledger = MemoryLedger(config.db_path)
@@ -38,6 +48,7 @@ class MemoryRuntime:
         agent_id: str = "local-agent",
         mode: str = "lite",
         policy_provider: PolicyProvider | None = None,
+        allow_unsafe_internal: bool = False,
     ) -> "MemoryRuntime":
         root = Path(path)
         root.mkdir(parents=True, exist_ok=True)
@@ -60,7 +71,7 @@ class MemoryRuntime:
             store=SQLiteMemoryStore(db_path),
             db_path=db_path,
         )
-        return cls(config=config, runtime=runtime, policy_provider=policy_provider)
+        return cls(config=config, runtime=runtime, policy_provider=policy_provider, allow_unsafe_internal=allow_unsafe_internal)
 
     @classmethod
     async def from_config(cls, path: str | Path = ".neuromem") -> "MemoryRuntime":
@@ -78,6 +89,14 @@ class MemoryRuntime:
 
     @property
     def internal_runtime(self) -> NeuroMemRuntime:
+        if not self._allow_unsafe_internal:
+            raise RuntimeError("internal_runtime is an unsafe debug escape hatch; use MemoryRuntime.local(..., allow_unsafe_internal=True) and unsafe_internal_runtime")
+        return self._runtime
+
+    @property
+    def unsafe_internal_runtime(self) -> NeuroMemRuntime:
+        if not self._allow_unsafe_internal:
+            raise RuntimeError("unsafe_internal_runtime requires MemoryRuntime.local(..., allow_unsafe_internal=True)")
         return self._runtime
 
     @property
@@ -100,6 +119,8 @@ class MemoryRuntime:
         self._ledger.append(
             LedgerEvent(
                 transaction_id=f"txn_{experience.event_id}",
+                namespace=self.config.namespace,
+                agent_id=self.config.agent_id,
                 phase="AUDITED",
                 event_type="experience_observed",
                 operation="NOOP",
@@ -159,6 +180,7 @@ class MemoryRuntime:
                     "future_utility": float(payload.get("future_utility", 0.0) or 0.0),
                 },
                 namespace=self.config.namespace,
+                agent_id=self.config.agent_id,
             ),
         )
         self._persist_trace(result.trace.trace_id, result.trace.to_dict())
@@ -216,6 +238,8 @@ class MemoryRuntime:
             LedgerEvent(
                 transaction_id=txn.transaction_id,
                 trace_id=trace.trace_id,
+                namespace=self.config.namespace,
+                agent_id=self.config.agent_id,
                 phase=txn.phase,
                 event_type="memory_retrieved",
                 operation="RETRIEVE",
@@ -230,7 +254,7 @@ class MemoryRuntime:
                 audit=trace_dict,
             )
         )
-        transactions = self._ledger.events_for_trace(trace.trace_id) or [transaction.to_dict() for transaction in trace.to_transactions()]
+        transactions = self._ledger.events_for_trace(trace.trace_id, namespace=self.config.namespace) or [transaction.to_dict() for transaction in trace.to_transactions()]
         self._persist_trace(trace_id, trace_dict)
         return MemoryContext(
             query=query_obj.query,
@@ -255,7 +279,7 @@ class MemoryRuntime:
             transactions=transactions,
         )
 
-    async def propose(self, value: str | dict[str, object]) -> MemoryPolicy:
+    async def propose(self, value: str | dict[str, object]) -> MemoryPolicy | MemoryPolicyV2:
         data = {"query": value} if isinstance(value, str) else dict(value)
         return self._policy_provider.propose(data)
 
@@ -272,6 +296,7 @@ class MemoryRuntime:
                 state={"status": "success", "confidence": legacy_policy.write.confidence or 0.75},
                 authorize_delete=authorize_delete,
                 namespace=self.config.namespace,
+                agent_id=self.config.agent_id,
             ),
         )
         self._persist_trace(result.trace.trace_id, result.trace.to_dict())
@@ -283,32 +308,158 @@ class MemoryRuntime:
         return await self.commit(policy, authorize_delete=authorize_delete)
 
     async def sleep(self) -> dict[str, object]:
+        assert self._runtime.store is not None
         memories_before = self._memory_states()
-        consolidation_report = self._runtime.neuro_sleep().to_dict()
-        memories_after = self._memory_states()
+        transaction_id = f"txn_sleep_{uuid4().hex}"
+        trace_id = self._runtime.last_trace.trace_id if self._runtime.last_trace is not None else None
+        replay_trace_ids = [trace_id] if trace_id is not None else []
+        plan = self._sleep_planner.plan(policy="manual", replay_trace_ids=replay_trace_ids)
+        with self._runtime.store.transaction() as conn:  # type: ignore[attr-defined]
+            self._ledger.append(
+                LedgerEvent(
+                    transaction_id=transaction_id,
+                    trace_id=trace_id,
+                    namespace=self.config.namespace,
+                    agent_id=self.config.agent_id,
+                    phase="PROPOSED",
+                    event_type="sleep_plan_proposed",
+                    operation="CONSOLIDATE",
+                    proposer="deterministic",
+                    validator_decision="not_applicable",
+                    audit={"plan": plan.to_dict()},
+                ),
+                conn=conn,
+            )
+            self._ledger.append(
+                LedgerEvent(
+                    transaction_id=transaction_id,
+                    trace_id=trace_id,
+                    namespace=self.config.namespace,
+                    agent_id=self.config.agent_id,
+                    phase="VALIDATED",
+                    event_type="sleep_validation_approved",
+                    operation="CONSOLIDATE",
+                    proposer="deterministic",
+                    validator_decision="approved",
+                    audit={"plan": plan.to_dict()},
+                ),
+                conn=conn,
+            )
+            consolidation_report = self._runtime.neuro_sleep().to_dict()
+            memories_after = self._memory_states()
+            deltas = _memory_deltas_for_fields(memories_before, memories_after, fields=None, reason="governed sleep")
+            targets = sorted({str(delta["memory_id"]) for delta in deltas if delta.get("memory_id")})
+            lifecycle_deltas = [delta for delta in deltas if delta.get("field") in {"maturity", "type", "summary", "tags", "supersedes", "derived_from"}]
+            memory_delta_objs = [_memory_delta_from_dict(delta) for delta in deltas]
+            lifecycle_delta_objs = [_lifecycle_delta_from_dict(delta) for delta in lifecycle_deltas if delta.get("field") == "maturity"]
+            self._ledger.append(
+                LedgerEvent(
+                    transaction_id=transaction_id,
+                    trace_id=trace_id,
+                    namespace=self.config.namespace,
+                    agent_id=self.config.agent_id,
+                    phase="VALIDATED",
+                    event_type="replay_batch_selected",
+                    operation="CONSOLIDATE",
+                    proposer="deterministic",
+                    validator_decision="approved",
+                    targets=targets,
+                    audit={"replay_trace_ids": replay_trace_ids, "replay_clusters": consolidation_report.get("replay_clusters", [])},
+                ),
+                conn=conn,
+            )
+            self._ledger.append(
+                LedgerEvent(
+                    transaction_id=transaction_id,
+                    trace_id=trace_id,
+                    namespace=self.config.namespace,
+                    agent_id=self.config.agent_id,
+                    phase="COMMITTED",
+                    event_type="consolidation_delta_committed",
+                    operation="CONSOLIDATE",
+                    proposer="deterministic",
+                    validator_decision="approved",
+                    targets=targets,
+                    memory_delta=deltas,
+                    lifecycle_delta=lifecycle_deltas,
+                    audit={"consolidation_report": consolidation_report},
+                ),
+                conn=conn,
+            )
+            suppression_ids = list(consolidation_report.get("archived_memory_ids", []))
+            self._ledger.append(
+                LedgerEvent(
+                    transaction_id=transaction_id,
+                    trace_id=trace_id,
+                    namespace=self.config.namespace,
+                    agent_id=self.config.agent_id,
+                    phase="COMMITTED",
+                    event_type="suppression_delta_committed",
+                    operation="CONSOLIDATE",
+                    proposer="deterministic",
+                    validator_decision="approved",
+                    targets=[str(item) for item in suppression_ids],
+                    lifecycle_delta=[delta for delta in lifecycle_deltas if delta.get("new") == "archived"],
+                    audit={"archived_memory_ids": suppression_ids},
+                ),
+                conn=conn,
+            )
+            self._ledger.append(
+                LedgerEvent(
+                    transaction_id=transaction_id,
+                    trace_id=trace_id,
+                    namespace=self.config.namespace,
+                    agent_id=self.config.agent_id,
+                    phase="COMMITTED",
+                    event_type="compilation_delta_committed",
+                    operation="CONSOLIDATE",
+                    proposer="deterministic",
+                    validator_decision="approved",
+                    targets=[str(item) for item in consolidation_report.get("compressed_memory_ids", [])],
+                    memory_delta=[delta for delta in deltas if delta.get("field") in {"type", "summary", "tags", "consolidation_count"}],
+                    audit={"compressed_memory_ids": consolidation_report.get("compressed_memory_ids", [])},
+                ),
+                conn=conn,
+            )
+            self._ledger.append(
+                LedgerEvent(
+                    transaction_id=transaction_id,
+                    trace_id=trace_id,
+                    namespace=self.config.namespace,
+                    agent_id=self.config.agent_id,
+                    phase="AUDITED",
+                    event_type="sleep_audit_finalized",
+                    operation="CONSOLIDATE",
+                    proposer="deterministic",
+                    validator_decision="approved",
+                    targets=targets,
+                    memory_delta=deltas,
+                    lifecycle_delta=lifecycle_deltas,
+                    audit={"consolidation_report": consolidation_report},
+                ),
+                conn=conn,
+            )
+            for memory_id in targets:
+                state = memories_after.get(memory_id)
+                if state is not None:
+                    self._ledger.record_memory_version(memory_id, transaction_id, state, conn=conn)
         trace = self._runtime.last_trace
         if trace is not None:
             self._persist_trace(trace.trace_id, trace.to_dict())
-        deltas = _memory_deltas_for_fields(memories_before, memories_after, fields=None, reason="governed sleep")
-        transaction_id = f"txn_sleep_{trace.trace_id if trace is not None else 'manual'}"
-        self._ledger.append(
-            LedgerEvent(
-                transaction_id=transaction_id,
-                trace_id=trace.trace_id if trace is not None else None,
-                phase="COMMITTED",
-                event_type="sleep_committed",
-                operation="CONSOLIDATE",
-                proposer="deterministic",
-                validator_decision="approved",
-                targets=sorted({str(delta["memory_id"]) for delta in deltas if delta.get("memory_id")}),
-                memory_delta=deltas,
-                lifecycle_delta=[delta for delta in deltas if delta.get("field") == "maturity"],
-                audit={"consolidation_report": consolidation_report},
-            )
-        )
         sleep_report = SleepReport(
-            plan=self._sleep_planner.plan(policy="manual", replay_trace_ids=[trace.trace_id] if trace is not None else []),
-            replay=ReplayBatch(trace_ids=[trace.trace_id] if trace is not None else []),
+            plan=plan,
+            replay=ReplayBatch(trace_ids=replay_trace_ids),
+            consolidation=[
+                ConsolidationDelta(source_memory_ids=list(cluster), target_memory_id=str(target), reason="replay consolidation")
+                for target, cluster in dict(consolidation_report.get("consolidation_links", {})).items()
+            ],
+            suppression=[SuppressionDelta(memory_id=str(memory_id), reason="sleep archival") for memory_id in consolidation_report.get("archived_memory_ids", [])],
+            compilation=[
+                CompilationDelta(source_memory_ids=list(dict(consolidation_report.get("consolidation_links", {})).get(str(memory_id), [])), compiled_type="procedural", content=str(memories_after.get(str(memory_id), {}).get("summary") or memories_after.get(str(memory_id), {}).get("content", "")))
+                for memory_id in consolidation_report.get("compressed_memory_ids", [])
+            ],
+            lifecycle=lifecycle_delta_objs,
+            memory_deltas=memory_delta_objs,
             ledger=LedgerReport(transaction_ids=[transaction_id]),
         ).to_dict()
         return {**consolidation_report, "sleep": sleep_report, "ledger_transaction_id": transaction_id}
@@ -349,7 +500,7 @@ class MemoryRuntime:
     async def replay_trace(self, trace_id: str) -> dict[str, object] | None:
         live = self._runtime.replay_trace(trace_id)
         if live is not None:
-            ledger = self._ledger.replay_trace(trace_id)
+            ledger = self._ledger.replay_trace(trace_id, namespace=self.config.namespace)
             if ledger is not None:
                 merged = dict(live)
                 merged.update({key: value for key, value in ledger.items() if key not in merged or key.endswith("_deltas") or key == "ledger_events"})
@@ -357,9 +508,9 @@ class MemoryRuntime:
             return live
         path = self.config.traces_path / f"{trace_id}.json"
         if not path.exists():
-            return self._ledger.replay_trace(trace_id)
+            return self._ledger.replay_trace(trace_id, namespace=self.config.namespace)
         value = json.loads(path.read_text(encoding="utf-8"))
-        ledger = self._ledger.replay_trace(trace_id)
+        ledger = self._ledger.replay_trace(trace_id, namespace=self.config.namespace)
         if ledger is not None:
             value.update({key: item for key, item in ledger.items() if key not in value or key.endswith("_deltas") or key == "ledger_events"})
         return value
@@ -415,3 +566,26 @@ def _memory_deltas_for_fields(
             if old.get(field) != new.get(field):
                 deltas.append({"memory_id": memory_id, "field": field, "old": old.get(field), "new": new.get(field), "reason": reason})
     return deltas
+
+
+def _memory_delta_from_dict(delta: dict[str, object]) -> MemoryDelta:
+    return MemoryDelta(
+        memory_id=str(delta.get("memory_id", "")),
+        field=str(delta.get("field", "")),
+        old=delta.get("old"),
+        new=delta.get("new"),
+        reason=str(delta.get("reason", "")),
+    )
+
+
+def _lifecycle_delta_from_dict(delta: dict[str, object]) -> LifecycleDelta:
+    return LifecycleDelta(
+        memory_id=str(delta.get("memory_id", "")),
+        from_state=str(delta.get("old", "")),
+        to_state=str(delta.get("new", "")),
+        trigger="governed sleep",
+        evidence=[],
+        validator="SleepLifecycleValidator",
+        reason=str(delta.get("reason", "")),
+        rollback_state=str(delta.get("old", "")) if delta.get("old") is not None else None,
+    )

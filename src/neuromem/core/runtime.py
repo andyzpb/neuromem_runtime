@@ -241,13 +241,15 @@ class NeuroMemRuntime:
                 used = [self.store.get_memory(memory_id) for memory_id in (retrieved_memory_ids or [])]
                 used_memories = [memory for memory in used if memory is not None]
                 used_memories.append(item)
-                update_edges_after_use(
+                graph_deltas = update_edges_after_use(
                     self.store,
                     used_memories,
                     outcome=str(outcome.get("status", "unknown")),
                     salience=policy.write.salience_estimate or float(outcome.get("salience", 0.65) or 0.65),
                     confidence=policy.write.confidence or float(outcome.get("confidence", 0.75) or 0.75),
                 )
+                if self.last_trace is not None and graph_deltas:
+                    self.last_trace.query_plan["plasticity_graph_deltas"] = [delta.to_dict() for delta in graph_deltas]
         if policy.forget.operation != "NOOP":
             target_id = policy.forget.target_memory_id
             if target_id:

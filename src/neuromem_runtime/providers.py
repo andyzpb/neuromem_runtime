@@ -13,7 +13,7 @@ from neuromem_runtime.policy_v2 import MemoryPolicyV2
 
 
 class PolicyProvider(Protocol):
-    def propose(self, payload: Mapping[str, object]) -> MemoryPolicy:
+    def propose(self, payload: Mapping[str, object]) -> MemoryPolicy | MemoryPolicyV2:
         raise NotImplementedError
 
 
@@ -57,7 +57,7 @@ class OpenAICompatiblePolicyProvider:
     base_url: str = "https://api.openai.com"
     timeout_seconds: float = 45.0
 
-    def propose(self, payload: Mapping[str, object]) -> MemoryPolicy:
+    def propose(self, payload: Mapping[str, object]) -> MemoryPolicy | MemoryPolicyV2:
         body = {
             "model": self.model,
             "temperature": 0,
@@ -66,10 +66,13 @@ class OpenAICompatiblePolicyProvider:
                 {
                     "role": "system",
                     "content": (
-                        "You are NeuroMem Memory PFC. Return JSON only with keys retrieval, write, forget, "
-                        "consolidation, reason. The JSON must instantiate RetrievalPlan, WritePlan, "
-                        "ForgetPlan, ConsolidationPlan. Never request deletion unless the payload explicitly "
-                        "authorizes deletion."
+                        "You are NeuroMem Memory PFC. Return JSON only. Prefer MemoryPolicyV2 with keys "
+                        "policy_id, proposer, proposal_source, intent, risk_level, evidence_chain, "
+                        "target_selector, proposed_deltas, safety_annotations, temporal_scope, "
+                        "retention_policy, rollback_plan. proposed_deltas must contain operation, "
+                        "target_memory_id, field, value, reason. Use legacy retrieval/write/forget/"
+                        "consolidation/reason only if V2 is impossible. Never request deletion unless "
+                        "the payload explicitly authorizes deletion."
                     ),
                 },
                 {"role": "user", "content": json.dumps(dict(payload), sort_keys=True)},
@@ -124,22 +127,16 @@ def extract_policy_payload(value: object) -> dict[str, Any]:
                 payload, _ = decoder.raw_decode(candidate[index:])
             except json.JSONDecodeError:
                 continue
-            if isinstance(payload, dict) and {"retrieval", "write", "forget", "consolidation", "reason"} <= set(payload):
-                return payload
+            if isinstance(payload, dict):
+                keys = set(payload)
+                if {"policy_id", "proposed_deltas"} & keys or {"retrieval", "write", "forget", "consolidation", "reason"} <= keys:
+                    return payload
     raise ValueError("No valid MemoryPolicy JSON payload found")
 
 
-def memory_policy_from_payload(payload: Mapping[str, Any], *, source: str = "small_llm") -> MemoryPolicy:
+def memory_policy_from_payload(payload: Mapping[str, Any], *, source: str = "small_llm") -> MemoryPolicy | MemoryPolicyV2:
     if "policy_id" in payload or "proposed_deltas" in payload:
-        MemoryPolicyV2.model_validate(dict(payload))
-        return MemoryPolicy(
-            retrieval=RetrievalPlan(enabled=False),
-            write=WritePlan(operation="NOOP"),
-            forget=ForgetPlan(operation="NOOP"),
-            consolidation=ConsolidationPlan(enabled=False),
-            reason="validated MemoryPolicyV2 proposal requires v2 executor",
-            source="small_llm" if source == "small_llm" else "deterministic",
-        )
+        return MemoryPolicyV2.model_validate(dict(payload))
     return MemoryPolicy(
         retrieval=RetrievalPlan(**dict(payload["retrieval"])),
         write=WritePlan(**dict(payload["write"])),
