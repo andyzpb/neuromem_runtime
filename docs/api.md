@@ -15,7 +15,7 @@ The SQLite database also stores experience events and ledger events.
 | --- | --- |
 | `observe(event)` | Record an experience event and, by default, auto-commit a compatible memory item. |
 | `observe(event, auto_commit=False)` | Record only an immutable `ExperienceEvent` and return its ids in an `EvidenceBundle`. |
-| `query(query, budget_tokens=800)` | Return a prompt-ready `MemoryContext`. |
+| `query(query, budget_tokens=800)` | Return a prompt-ready `MemoryContext` through the Activation Retrieval Engine. |
 | `propose(input)` | Produce a deterministic structured `MemoryPolicy`. |
 | `commit(policy)` | Validate and apply a governed policy. |
 | `mutate(policy)` | Alias for `commit(policy)`. |
@@ -27,6 +27,27 @@ Physical deletion requires `authorize_delete=True`.
 
 `query(...)` uses a single retrieval transaction. The returned `MemoryContext`
 and persisted trace share the same selected ids, scores, and trace id.
+
+`query(...)` accepts optional filters: `retrieval_mode`, `retrieval_channels`,
+`rerank_mode`, `graph_activation`, `historical`, `require_provenance`, and
+`allow_abstain`.
+
+`MemoryContext.results` includes `why_retrieved`, `score_components`,
+`graph_paths`, `reranker_score`, `lifecycle_reason`, and `provenance_ids`.
+
+## Activation Retrieval
+
+Base retrieval is local and deterministic:
+
+```text
+QueryPlanV2 -> Contextual Memory Cards -> FTS5/BM25 + lexical/entity/current/procedural/canonical candidates
+            -> RRF fusion -> PPR-style graph activation -> lifecycle/provenance gate
+            -> lite rerank -> context packing -> retrieval ledger
+```
+
+Dense embeddings, late-interaction retrieval, cross-encoder reranking, and LLM
+listwise reranking are optional adapter paths. They may rank candidates, but they
+must not mutate memory.
 
 ## Ledger
 
@@ -40,6 +61,7 @@ nmem ledger why-written MEM_ID
 nmem ledger why-retrieved TRACE_ID MEM_ID
 nmem ledger replay --to-txn TXN_ID
 nmem ledger diff TXN_A TXN_B
+nmem retrieval explain TRACE_ID
 ```
 
 ## Policy Providers
@@ -74,16 +96,23 @@ The package exports the protocol surfaces used by the governed mutation runtime:
 - `LifecycleStateMachine`
 - `ValidatorStack`
 - `RetrievalTraceMetadata`
+- `RetrievalConfig`
+- `QueryPlanV2`
+- `MemoryCard`
+- `RetrievalCandidate`
+- `ActivationResult`
+- `RetrievalLedgerRecord`
+- `RerankProvider`
 - `EmbeddingProvider`
 - `VectorIndex`
 - `PlasticityEngine`
 - `SleepPlanner`
 
 Base retrieval remains local and deterministic. Dense vectors, learned sparse
-retrieval, multi-vector retrieval, and reranking should be implemented through
-explicit adapters.
+retrieval, multi-vector retrieval, and strong reranking should be implemented
+through explicit adapters.
 
 ## Packaging Boundary
 
-`neuromem-runtime` v0.1.0 is self-contained. Application code should import
+`neuromem-runtime` v0.1.5 is self-contained. Application code should import
 `neuromem_runtime`; other bundled packages are implementation details.

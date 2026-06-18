@@ -4,6 +4,7 @@ from collections.abc import Iterable, Sequence
 
 from neuromem.core.models import MemoryItem, MemoryQuery, MemoryResult
 from neuromem.modules.pfc_controller import PFCController, RetrievalPlan
+from neuromem.retrieval.activation import ActivationRetrievalEngine, retrieval_config_from_query
 from neuromem.retrieval.recall import RecallConfig, RecallResult, build_query_plan, evidence_from_memory, run_recall
 
 
@@ -26,7 +27,23 @@ def hybrid_retrieve_with_trace(
     memory_items = list(memories)
     memory_by_id = {item.id: item for item in memory_items}
     plan = plan or PFCController().plan_retrieval(query.query, query.filters, query.budget_tokens)
-    evidence = [evidence_from_memory(item, base_score=_base_score(item, query), source="core") for item in memory_items]
+    store = query.filters.get("_store")
+    activation = ActivationRetrievalEngine(store if hasattr(store, "list_edges") else None).retrieve(memory_items, query, config=retrieval_config_from_query(query))
+    activation_scores = {candidate.memory.id: candidate.final_score for candidate in activation.ranked}
+    graph_scores = {**(graph_scores or {}), **activation.activation.scores}
+    graph_paths = [*(graph_paths or []), *activation.activation.paths]
+    evidence = [
+        evidence_from_memory(
+            item,
+            base_score=max(_base_score(item, query), activation_scores.get(item.id, 0.0)),
+            source="activation",
+            trace={
+                "retrieval_ledger": activation.ledger_record.to_dict(),
+                "candidate": next((candidate.to_dict() for candidate in activation.ranked if candidate.memory.id == item.id), {}),
+            },
+        )
+        for item in memory_items
+    ]
     query_plan = build_query_plan(
         query.query,
         answer=str(query.filters.get("answer") or ""),
@@ -37,6 +54,30 @@ def hybrid_retrieve_with_trace(
     )
     config = _recall_config(query, plan)
     recall = run_recall(evidence, query_plan, config=config, graph_scores=graph_scores, graph_paths=graph_paths)
+    selected_ids = {candidate.memory.id for candidate in activation.selected}
+    if selected_ids:
+        recall = RecallResult(
+            evidence=[item for item in evidence if item.id in selected_ids],
+            candidates=recall.candidates,
+            query_plan=recall.query_plan,
+            rejected_ids=recall.rejected_ids,
+            suppression_reasons={**recall.suppression_reasons, **activation.suppressed},
+            canonical_fact_ids=recall.canonical_fact_ids,
+            graph_paths=[*recall.graph_paths, *activation.activation.paths],
+            gate_decision=activation.gate_decision,
+            memory_version=recall.memory_version,
+            invalidation_state=recall.invalidation_state,
+            recall_config_hash=recall.recall_config_hash,
+            extra_trace={
+                "query_plan_v2": activation.query_plan.to_dict(),
+                "query_plan_v2_hash": activation.query_plan.stable_hash(),
+                "retrieval_ledger": activation.ledger_record.to_dict(),
+                "activation": activation.activation.to_dict(),
+                "candidate_details": {candidate.memory.id: candidate.to_dict() for candidate in activation.ranked},
+                "source_channels": sorted(set(activation.ledger_record.channel_candidates)),
+            },
+        )
+    activation_by_id = {candidate.memory.id: candidate for candidate in activation.ranked}
     candidates_by_id = {candidate.evidence.id: candidate for candidate in recall.candidates}
     results: list[MemoryResult] = []
     for item in recall.evidence:
@@ -44,11 +85,17 @@ def hybrid_retrieve_with_trace(
         if memory is None:
             continue
         candidate = candidates_by_id.get(item.id)
-        why = [item.source or "hybrid_recall", f"gate={recall.gate_decision}", f"memory_version={recall.memory_version}"]
+        activation_candidate = activation_by_id.get(item.id)
+        why = [item.source or "activation_recall", f"gate={activation.gate_decision}", f"memory_version={recall.memory_version}"]
         if candidate is not None:
             why.extend(f"source:{channel}" for channel in candidate.source_channels)
             why.append(f"invalidation={candidate.invalidation_state}")
-        results.append(MemoryResult(memory=memory, score=candidate.final_score if candidate is not None else item.base_score, why_retrieved=why))
+        if activation_candidate is not None:
+            why.extend(activation_candidate.why_retrieved)
+            score = activation_candidate.final_score
+        else:
+            score = candidate.final_score if candidate is not None else item.base_score
+        results.append(MemoryResult(memory=memory, score=score, why_retrieved=list(dict.fromkeys(why))))
     return results, recall
 
 

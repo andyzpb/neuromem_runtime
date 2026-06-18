@@ -8,13 +8,25 @@ from neuromem_runtime.ledger import ExperienceEvent, LedgerEvent, MemoryLedger
 from neuromem_runtime.lifecycle import LifecycleStateMachine
 from neuromem_runtime.policy_v2 import MemoryPolicyV2, ValidatedMutation
 from neuromem_runtime.plasticity import PlasticityEngine
-from neuromem_runtime.retrieval import DeterministicEmbeddingProvider, EmbeddingProvider, RetrievalTraceMetadata, VectorIndex
+from neuromem_runtime.retrieval import (
+    ActivationResult,
+    DeterministicEmbeddingProvider,
+    EmbeddingProvider,
+    MemoryCard,
+    QueryPlanV2,
+    RerankProvider,
+    RetrievalCandidate,
+    RetrievalConfig,
+    RetrievalLedgerRecord,
+    RetrievalTraceMetadata,
+    VectorIndex,
+)
 from neuromem_runtime.sleep import SleepPlanner, SleepReport
 from neuromem_runtime.types import EvidenceBundle, MemoryContext, MemoryEvent, MemoryQuery, MemoryTransaction, RuntimeConfig
 from neuromem_runtime.validators import ValidatorStack
 from neuromem_runtime.providers import DeepSeekPolicyProvider, DeterministicPolicyProvider, OpenAICompatiblePolicyProvider, PolicyProvider
 
-__version__ = "0.1.0"
+__version__ = "0.1.5"
 
 __all__ = [
     "MemoryRuntime",
@@ -39,6 +51,13 @@ __all__ = [
     "ValidatorStack",
     "EmbeddingProvider",
     "VectorIndex",
+    "RetrievalConfig",
+    "QueryPlanV2",
+    "MemoryCard",
+    "RetrievalCandidate",
+    "ActivationResult",
+    "RetrievalLedgerRecord",
+    "RerankProvider",
     "RetrievalTraceMetadata",
     "DeterministicEmbeddingProvider",
     "PlasticityEngine",

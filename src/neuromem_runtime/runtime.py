@@ -152,9 +152,16 @@ class MemoryRuntime:
         transactions: list[dict[str, object]] = []
         trace.selected_memory_ids = [result.memory.id for result in results]
         trace.final_context_tokens = len(text.split())
+        candidate_details = trace.query_plan.get("candidate_details", {}) if isinstance(trace.query_plan.get("candidate_details", {}), dict) else {}
+        retrieval_ledger = trace.query_plan.get("retrieval_ledger", {}) if isinstance(trace.query_plan.get("retrieval_ledger", {}), dict) else {}
+        query_plan_v2 = trace.query_plan.get("query_plan_v2", {}) if isinstance(trace.query_plan.get("query_plan_v2", {}), dict) else {}
+        source_channels = list(retrieval_ledger.get("channel_candidates", {}).keys()) if isinstance(retrieval_ledger.get("channel_candidates", {}), dict) else list(trace.source_channels)
         trace.query_plan.update(
             {
                 "retrieval_metadata": RetrievalTraceMetadata(
+                    retrieval_mode=str(retrieval_ledger.get("retrieval_mode") or query_plan_v2.get("mode") or "local_activation"),
+                    candidate_sources=[str(item) for item in source_channels],
+                    fusion_strategy="rrf+ppr+lite_rerank",
                     rank_before_fusion=[result.memory.id for result in results],
                     rank_after_fusion=[result.memory.id for result in results],
                 ).to_dict()
@@ -176,7 +183,7 @@ class MemoryRuntime:
                 targets=trace.selected_memory_ids,
                 graph_delta=[{"paths": trace.graph_paths, "scores": trace.diffusion_scores}] if trace.graph_paths or trace.diffusion_scores else [],
                 lifecycle_delta=[{"memory_id": memory_id, "reason": reason} for memory_id, reason in trace.suppression_reasons.items()],
-                index_delta=[{"index": "sqlite", "status": "read"}],
+                index_delta=[{"index": "sqlite_fts5", "status": "read"}, {"index": "memory_graph", "status": "activated"}],
                 audit=trace.to_dict(),
             )
         )
@@ -191,6 +198,12 @@ class MemoryRuntime:
                     "score": result.score,
                     "content": result.memory.content,
                     "type": result.memory.type,
+                    "why_retrieved": list(result.why_retrieved),
+                    "score_components": dict(candidate_details.get(result.memory.id, {}).get("channel_scores", {})) if isinstance(candidate_details.get(result.memory.id, {}), dict) else {},
+                    "graph_paths": candidate_details.get(result.memory.id, {}).get("graph_paths", []) if isinstance(candidate_details.get(result.memory.id, {}), dict) else [],
+                    "reranker_score": candidate_details.get(result.memory.id, {}).get("reranker_score", result.score) if isinstance(candidate_details.get(result.memory.id, {}), dict) else result.score,
+                    "lifecycle_reason": candidate_details.get(result.memory.id, {}).get("lifecycle_reason", "active") if isinstance(candidate_details.get(result.memory.id, {}), dict) else "active",
+                    "provenance_ids": list(result.memory.evidence),
                 }
                 for result in results
             ],

@@ -15,7 +15,16 @@ def test_public_api_exports() -> None:
     assert nmem.ExperienceEvent
     assert nmem.MemoryPolicyV2
     assert nmem.MemoryLedger
+    assert nmem.RetrievalConfig
+    assert nmem.QueryPlanV2
+    assert nmem.MemoryCard
+    assert nmem.RetrievalCandidate
+    assert nmem.ActivationResult
+    assert nmem.RetrievalLedgerRecord
     assert "neuromem_runtime.langgraph" not in sys.modules
+    assert "torch" not in sys.modules
+    assert "transformers" not in sys.modules
+    assert "faiss" not in sys.modules
 
 
 def test_async_local_workflow(tmp_path) -> None:
@@ -43,6 +52,9 @@ def test_async_local_workflow(tmp_path) -> None:
         assert bundle.memory_id in context.selected_memory_ids
         assert context.trace_id is not None
         assert "session refresh" in context.to_prompt().lower()
+        assert context.results[0]["why_retrieved"]
+        assert "reranker_score" in context.results[0]
+        assert "lifecycle_reason" in context.results[0]
 
         report = await memory.sleep()
         assert "processed" in report
@@ -55,6 +67,8 @@ def test_async_local_workflow(tmp_path) -> None:
         ledger_events = memory.ledger.events_for_trace(context.trace_id)
         assert ledger_events
         assert ledger_events[-1]["event_hash"]
+        assert ledger_events[-1]["audit"]["query_plan"]["retrieval_metadata"]["retrieval_mode"] == "local_activation"
+        assert ledger_events[-1]["audit"]["query_plan"]["retrieval_ledger"]["selected_ids"] == context.selected_memory_ids
 
     asyncio.run(run())
 

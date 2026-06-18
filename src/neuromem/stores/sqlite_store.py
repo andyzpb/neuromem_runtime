@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import RLock
 
 from neuromem.core.models import MemoryEdge, MemoryItem
+from neuromem.retrieval.activation import build_memory_card
 from neuromem.stores.base import MemoryStore
 
 
@@ -98,8 +99,29 @@ class SQLiteMemoryStore(MemoryStore):
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_cards (
+                    memory_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    memory_type TEXT NOT NULL,
+                    lifecycle_state TEXT NOT NULL,
+                    retrieval_text TEXT NOT NULL,
+                    retrieval_context TEXT NOT NULL,
+                    canonical_fact_key TEXT NOT NULL,
+                    entity_json TEXT NOT NULL,
+                    keyword_json TEXT NOT NULL,
+                    provenance_json TEXT NOT NULL,
+                    trust_score REAL NOT NULL DEFAULT 0.5,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            self._init_fts(conn)
             self._dedupe_edges(conn)
             conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_edges_unique_relation ON edges(source_id, target_id, relation)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_cards_namespace ON memory_cards(namespace)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_cards_fact_key ON memory_cards(canonical_fact_key)")
             self._ensure_columns(
                 conn,
                 "memories",
@@ -132,6 +154,17 @@ class SQLiteMemoryStore(MemoryStore):
                     "contradiction_penalty": "REAL NOT NULL DEFAULT 0.0",
                 },
             )
+
+    def _init_fts(self, conn: sqlite3.Connection) -> None:
+        try:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_cards_fts
+                USING fts5(memory_id UNINDEXED, namespace UNINDEXED, retrieval_text, retrieval_context)
+                """
+            )
+        except sqlite3.OperationalError:
+            return
 
     def _dedupe_edges(self, conn: sqlite3.Connection) -> None:
         conn.execute(
@@ -247,6 +280,95 @@ class SQLiteMemoryStore(MemoryStore):
                     "acl": self._dump(record["acl"]),
                 },
             )
+            self._upsert_memory_card(conn, item)
+
+    def _upsert_memory_card(self, conn: sqlite3.Connection, item: MemoryItem) -> None:
+        card = build_memory_card(item)
+        conn.execute(
+            """
+            INSERT INTO memory_cards (
+                memory_id, namespace, memory_type, lifecycle_state, retrieval_text,
+                retrieval_context, canonical_fact_key, entity_json, keyword_json,
+                provenance_json, trust_score, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(memory_id) DO UPDATE SET
+                namespace=excluded.namespace,
+                memory_type=excluded.memory_type,
+                lifecycle_state=excluded.lifecycle_state,
+                retrieval_text=excluded.retrieval_text,
+                retrieval_context=excluded.retrieval_context,
+                canonical_fact_key=excluded.canonical_fact_key,
+                entity_json=excluded.entity_json,
+                keyword_json=excluded.keyword_json,
+                provenance_json=excluded.provenance_json,
+                trust_score=excluded.trust_score,
+                updated_at=excluded.updated_at
+            """,
+            (
+                card.memory_id,
+                card.namespace,
+                card.memory_type,
+                card.lifecycle_state,
+                card.retrieval_text,
+                card.retrieval_context,
+                card.canonical_fact_key,
+                self._dump(list(card.entities)),
+                self._dump(list(card.keywords)),
+                self._dump(list(card.provenance_ids)),
+                card.trust_score,
+                item.last_accessed_at.isoformat() if item.last_accessed_at else item.created_at.isoformat(),
+            ),
+        )
+        try:
+            conn.execute("DELETE FROM memory_cards_fts WHERE memory_id = ?", (card.memory_id,))
+            conn.execute(
+                "INSERT INTO memory_cards_fts(memory_id, namespace, retrieval_text, retrieval_context) VALUES (?, ?, ?, ?)",
+                (card.memory_id, card.namespace, card.retrieval_text, card.retrieval_context),
+            )
+        except sqlite3.OperationalError:
+            return
+
+    def search_memory_cards(self, query: str, *, namespace: str | None = None, limit: int = 20) -> list[tuple[str, float]]:
+        if not query.strip():
+            return []
+        with self._connect() as conn:
+            try:
+                params: list[object] = [query]
+                where = "memory_cards_fts MATCH ?"
+                if namespace is not None:
+                    where += " AND namespace = ?"
+                    params.append(namespace)
+                params.append(limit)
+                rows = conn.execute(
+                    f"""
+                    SELECT memory_id, bm25(memory_cards_fts) AS rank
+                    FROM memory_cards_fts
+                    WHERE {where}
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    tuple(params),
+                ).fetchall()
+                if rows:
+                    worst = max(abs(float(row["rank"])) for row in rows) or 1.0
+                    return [(str(row["memory_id"]), max(0.0, 1.0 - abs(float(row["rank"])) / worst)) for row in rows]
+            except sqlite3.OperationalError:
+                pass
+            terms = [term.lower() for term in query.split() if term.strip()]
+            sql = "SELECT memory_id, retrieval_text FROM memory_cards"
+            params2: tuple[object, ...] = ()
+            if namespace is not None:
+                sql += " WHERE namespace = ?"
+                params2 = (namespace,)
+            rows = conn.execute(sql, params2).fetchall()
+        scored: list[tuple[str, float]] = []
+        for row in rows:
+            text = str(row["retrieval_text"]).lower()
+            overlap = sum(1 for term in terms if term in text)
+            if overlap:
+                scored.append((str(row["memory_id"]), overlap / max(1, len(terms))))
+        return sorted(scored, key=lambda value: (-value[1], value[0]))[:limit]
+
 
     def _row_to_item(self, row: sqlite3.Row) -> MemoryItem:
         record = dict(row)

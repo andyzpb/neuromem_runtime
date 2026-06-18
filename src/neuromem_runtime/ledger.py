@@ -259,6 +259,18 @@ class MemoryLedger:
             ).fetchall()
         return [self._row_to_event(row) for row in rows]
 
+    def retrieval_explain(self, trace_id: str) -> dict[str, object] | None:
+        events = self.events_for_trace(trace_id)
+        retrieval_events = [event for event in events if event.get("event_type") == "memory_retrieved"]
+        if not retrieval_events:
+            return None
+        audit = retrieval_events[-1].get("audit", {})
+        if isinstance(audit, dict):
+            ledger = audit.get("retrieval_ledger")
+            if isinstance(ledger, dict):
+                return ledger
+        return retrieval_events[-1]
+
     def replay(self, to_transaction_id: str | None = None) -> list[dict[str, object]]:
         query = "SELECT * FROM ledger_events"
         params: tuple[object, ...] = ()

@@ -27,3 +27,7 @@ class MemoryStore(ABC):
     @abstractmethod
     def list_edges(self, source_id: str | None = None) -> list[MemoryEdge]:
         raise NotImplementedError
+
+    def search_memory_cards(self, query: str, *, namespace: str | None = None, limit: int = 20) -> list[tuple[str, float]]:
+        del query, namespace, limit
+        return []

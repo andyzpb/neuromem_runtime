@@ -68,6 +68,12 @@ def main(argv: list[str] | None = None) -> None:
     ledger_diff.add_argument("right_txn")
     ledger_diff.add_argument("--namespace", default="default")
 
+    retrieval_parser = subparsers.add_parser("retrieval", help="Retrieval inspection commands")
+    retrieval_subparsers = retrieval_parser.add_subparsers(dest="retrieval_command", required=True)
+    retrieval_explain = retrieval_subparsers.add_parser("explain", help="Explain activation retrieval for a trace")
+    retrieval_explain.add_argument("trace_id")
+    retrieval_explain.add_argument("--namespace", default="default")
+
     bench_parser = subparsers.add_parser("bench", help="Benchmark commands")
     bench_subparsers = bench_parser.add_subparsers(dest="bench_command", required=True)
     bench_run = bench_subparsers.add_parser("run", help="Run a benchmark")
@@ -90,6 +96,8 @@ def main(argv: list[str] | None = None) -> None:
             result = asyncio.run(_cmd_trace(args))
         elif args.command == "ledger":
             result = asyncio.run(_cmd_ledger(args))
+        elif args.command == "retrieval":
+            result = asyncio.run(_cmd_retrieval(args))
         elif args.command == "bench":
             result = _cmd_bench(args)
         else:
@@ -192,6 +200,22 @@ async def _cmd_ledger(args: argparse.Namespace) -> str:
     if args.ledger_command == "diff":
         return json.dumps(runtime.ledger.diff(args.left_txn, args.right_txn), indent=2, sort_keys=True)
     raise ValueError(f"unsupported ledger command: {args.ledger_command}")
+
+
+async def _cmd_retrieval(args: argparse.Namespace) -> str:
+    runtime = await _runtime(args)
+    if args.retrieval_command == "explain":
+        trace = await runtime.replay_trace(args.trace_id)
+        if trace is None:
+            raise ValueError(f"trace not found: {args.trace_id}")
+        query_plan = trace.get("query_plan", {}) if isinstance(trace, dict) else {}
+        if isinstance(query_plan, dict) and isinstance(query_plan.get("retrieval_ledger"), dict):
+            return json.dumps(query_plan["retrieval_ledger"], indent=2, sort_keys=True)
+        ledger = runtime.ledger.retrieval_explain(args.trace_id)
+        if ledger is not None:
+            return json.dumps(ledger, indent=2, sort_keys=True)
+        raise ValueError(f"retrieval ledger not found for trace: {args.trace_id}")
+    raise ValueError(f"unsupported retrieval command: {args.retrieval_command}")
 
 
 def _cmd_bench(args: argparse.Namespace) -> str:

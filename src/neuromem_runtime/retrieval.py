@@ -3,6 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from neuromem.retrieval.activation import (
+    ActivationResult,
+    MemoryCard,
+    QueryPlanV2,
+    RerankProvider,
+    RetrievalCandidate,
+    RetrievalConfig,
+    RetrievalLedgerRecord,
+)
+
 
 class EmbeddingProvider(Protocol):
     def embed(self, texts: list[str]) -> list[list[float]]:
@@ -22,12 +32,12 @@ class VectorIndex(Protocol):
 
 @dataclass(slots=True)
 class RetrievalTraceMetadata:
-    retrieval_mode: str = "local_hybrid"
+    retrieval_mode: str = "local_activation"
     embedding_mode: str = "disabled"
     embedding_model: str | None = None
     index_type: str = "sqlite"
-    candidate_sources: list[str] = field(default_factory=lambda: ["lexical", "bm25", "graph"])
-    fusion_strategy: str = "weighted_score"
+    candidate_sources: list[str] = field(default_factory=lambda: ["fts5", "bm25", "lexical", "graph_seed"])
+    fusion_strategy: str = "rrf+ppr+lite_rerank"
     rank_before_fusion: list[str] = field(default_factory=list)
     rank_after_fusion: list[str] = field(default_factory=list)
 
@@ -59,4 +69,16 @@ class DeterministicEmbeddingProvider:
         return vectors
 
 
-__all__ = ["DeterministicEmbeddingProvider", "EmbeddingProvider", "RetrievalTraceMetadata", "VectorIndex"]
+__all__ = [
+    "ActivationResult",
+    "DeterministicEmbeddingProvider",
+    "EmbeddingProvider",
+    "MemoryCard",
+    "QueryPlanV2",
+    "RerankProvider",
+    "RetrievalCandidate",
+    "RetrievalConfig",
+    "RetrievalLedgerRecord",
+    "RetrievalTraceMetadata",
+    "VectorIndex",
+]

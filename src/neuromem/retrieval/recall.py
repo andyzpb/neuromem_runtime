@@ -135,11 +135,12 @@ class RecallResult:
     memory_version: str = ""
     invalidation_state: str = "valid"
     recall_config_hash: str = ""
+    extra_trace: dict[str, object] = field(default_factory=dict)
 
     def trace(self) -> dict[str, object]:
         selected_ids = [item.id for item in self.evidence]
         selected_candidates = [candidate for candidate in self.candidates if candidate.evidence.id in selected_ids]
-        return {
+        value = {
             "query_plan": self.query_plan.to_dict(),
             "query_plan_hash": self.query_plan.stable_hash(),
             "gate_decision": self.gate_decision,
@@ -153,6 +154,8 @@ class RecallResult:
             "source_channels": sorted({channel for candidate in selected_candidates for channel in candidate.source_channels}),
             "score_components": {candidate.evidence.id: candidate.score_components() for candidate in selected_candidates},
         }
+        value.update(self.extra_trace)
+        return value
 
 
 def build_query_plan(

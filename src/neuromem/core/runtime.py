@@ -348,10 +348,12 @@ class NeuroMemRuntime:
     def retrieve(self, query: str, mode: str = "auto", filters: dict[str, object] | None = None, budget_tokens: int = 1500) -> list[MemoryResult]:
         if not query.strip():
             raise ValueError("retrieve() requires a non-empty query")
-        query_obj = MemoryQuery(query=query, mode=mode, filters=filters or {}, budget_tokens=budget_tokens)
         assert self.store is not None
         memories = self.store.list_memories(namespace=self.namespace)
         plan = self.controller.plan_retrieval(query, filters or {}, budget_tokens)
+        filters_for_retrieval = dict(filters or {})
+        filters_for_retrieval["_store"] = self.store
+        query_obj = MemoryQuery(query=query, mode=mode, filters=filters_for_retrieval, budget_tokens=budget_tokens)
         results, recall = hybrid_retrieve_with_trace(memories, query_obj, plan)
         graph_paths: list[list[str]] = []
         graph_scores: dict[str, float] = {}
@@ -487,6 +489,9 @@ class NeuroMemRuntime:
             invalidation_state=str(recall_trace.get("invalidation_state", "valid")),
             recall_config_hash=str(recall_trace.get("recall_config_hash", "")),
         )
+        for key in ["query_plan_v2", "query_plan_v2_hash", "retrieval_ledger", "activation", "candidate_details"]:
+            if key in recall_trace:
+                self.last_trace.query_plan[key] = recall_trace[key]
         self.memory_tap.attach(self.last_trace)
         if retrieval.enabled and retrieval.require_provenance:
             self.last_trace.rejected_memory_ids.extend(

@@ -53,6 +53,8 @@ def test_retrieval_and_plasticity_surfaces_are_operational() -> None:
 
     metadata = nmem.RetrievalTraceMetadata(rank_before_fusion=["a"], rank_after_fusion=["a"])
     assert metadata.to_dict()["embedding_mode"] == "disabled"
+    assert metadata.to_dict()["retrieval_mode"] == "local_activation"
+    assert metadata.to_dict()["fusion_strategy"] == "rrf+ppr+lite_rerank"
 
     edge = MemoryEdge(source_id="a", target_id="b", relation="supports", weight=0.2, confidence=0.8)
     delta = nmem.PlasticityEngine().update_edge(edge, salience=0.8, outcome_reward=1.0, confidence=0.9)

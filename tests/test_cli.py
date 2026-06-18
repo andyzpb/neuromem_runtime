@@ -36,6 +36,12 @@ def test_cli_local_workflow(tmp_path, capsys) -> None:
     context = json.loads(capsys.readouterr().out)
     assert context["selected_memory_ids"]
     assert context["trace_id"]
+    assert context["results"][0]["why_retrieved"]
+
+    main(["--path", str(workspace), "retrieval", "explain", context["trace_id"], "--namespace", "demo"])
+    retrieval = json.loads(capsys.readouterr().out)
+    assert retrieval["selected_ids"] == context["selected_memory_ids"]
+    assert retrieval["fusion_scores"]
 
     main(["--path", str(workspace), "sleep", "--namespace", "demo"])
     assert "processed" in json.loads(capsys.readouterr().out)

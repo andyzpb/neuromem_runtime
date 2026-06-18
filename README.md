@@ -10,7 +10,7 @@ The package name is `neuromem-runtime`. User code imports `neuromem_runtime`.
 pip install neuromem-runtime
 ```
 
-Current package release: `v0.1.0`.
+Current package release: `v0.1.5`.
 
 ## At a glance
 
@@ -18,6 +18,7 @@ Current package release: `v0.1.0`.
 - LLMs propose memory mutations; the runtime validates and commits them.
 - Every write, update, suppression, edge update, consolidation, and forgetting event is a transaction.
 - Retrieval is activation over an outcome-shaped experience graph.
+- The Activation Retrieval Engine uses local FTS5/BM25, RRF fusion, PPR-style graph activation, lifecycle gates, lite rerank, and a replayable retrieval ledger.
 - Forgetting is suppression before deletion.
 - Every memory effect is replayable through the Memory Ledger.
 - Local by default: SQLite plus trace files, with no Docker or hosted store required.
@@ -127,6 +128,8 @@ Query memory:
 
 ```bash
 nmem query "Have we fixed auth/session bugs before?" --namespace demo/repo
+nmem query "Have we fixed auth/session bugs before?" --namespace demo/repo --json
+nmem retrieval explain TRACE_ID --namespace demo/repo
 ```
 
 Run consolidation and inspect the trace:
@@ -192,6 +195,33 @@ event = await memory.observe(
 ```
 
 The returned bundle includes `event_id` and `content_hash`. Long-term memory capture can then be proposed and committed explicitly.
+
+## Activation Retrieval Engine
+
+The base package does not depend on a vector database. Querying uses a local activation pipeline:
+
+```text
+Query -> QueryPlanV2 -> Contextual Memory Cards
+      -> FTS5/BM25 + lexical/entity + current/procedural/canonical candidates
+      -> RRF fusion
+      -> PPR-style graph activation
+      -> lifecycle and provenance gates
+      -> lite rerank
+      -> context packing
+      -> retrieval ledger
+```
+
+`MemoryContext.results` includes `why_retrieved`, `score_components`, `graph_paths`, `reranker_score`, `lifecycle_reason`, and `provenance_ids`. `replay_trace()` and `nmem retrieval explain TRACE_ID` show the query plan, channel candidates, fusion scores, activation paths, selected ids, suppressed ids, and packed context.
+
+Dense embeddings, late-interaction retrieval, cross-encoder rerankers, and LLM listwise rerankers are adapter paths. Install the relevant extras only when wiring a provider:
+
+```bash
+pip install "neuromem-runtime[retrieval]"
+pip install "neuromem-runtime[rerank]"
+pip install "neuromem-runtime[llm-rerank]"
+```
+
+Those providers may rank candidates, but they do not mutate memory. Memory changes still go through policy validation and commit.
 
 ## Optional LLM policy provider
 
@@ -319,7 +349,7 @@ Governed runtime surfaces:
 - `MemoryPolicyV2` defines the forward policy shape for transaction-governed mutation.
 - `ValidatorStack` exposes fail-closed gates for schema, evidence, provenance, temporal, conflict, ACL, deletion, poisoning risk, lifecycle, and index consistency checks.
 - `MemoryLedger` stores experience events, ledger events, memory versions, and edge versions in SQLite.
-- `RetrievalTraceMetadata` records whether retrieval used local hybrid, disabled/proxy/provider embeddings, index type, candidate sources, and fusion strategy.
+- `RetrievalTraceMetadata` records activation retrieval mode, disabled/proxy/provider embeddings, index type, candidate sources, and fusion strategy.
 - `PlasticityEngine` produces graph deltas for outcome-shaped edge updates.
 - `SleepPlanner` and `SleepReport` define the sleep/replay/consolidation report surface.
 
@@ -352,7 +382,7 @@ NeuroMem Runtime is designed around governed mutation:
 - forgetting defaults to inhibition, invalidation, archive, or compression
 - traces can be replayed for audit and debugging
 
-Base retrieval is a deterministic local lexical/BM25/graph baseline. Dense vector retrieval is represented by `EmbeddingProvider` and `VectorIndex` protocols and remains an explicit adapter path, not a base-package claim.
+Base retrieval is a deterministic local FTS5/BM25/RRF/PPR/lifecycle-gated baseline. Dense vector retrieval is represented by `EmbeddingProvider` and `VectorIndex` protocols and remains an explicit adapter path, not a base-package claim.
 
 This matters for agents because memory mistakes accumulate. A stale command, wrong preference, or unsafe deletion should be visible and reversible at the policy layer.
 
