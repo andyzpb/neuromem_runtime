@@ -15,15 +15,26 @@ from neuromem.core.policy import (
     WritePlan,
 )
 from neuromem.core.runtime import NeuroMemRuntime
+from neuromem.core.models import AssociativeEdge, LogicEdge, MemoryFrame
+from neuromem_runtime.crystallization import (
+    ASSOCIATIVE_RELATIONS,
+    DefaultFrameValidator,
+    DefaultLogicRelationValidator,
+    associative_edge_from_proposal,
+    frame_from_proposal,
+    graph_delta_to_structural,
+    logic_edge_from_proposal,
+)
 from neuromem_runtime.deltas import GraphDelta, IndexDelta, LifecycleDelta, MemoryDelta, MutationExecutionResult
 from neuromem_runtime.ledger import LedgerEvent, MemoryLedger
 from neuromem_runtime.lifecycle import LifecycleStateMachine
-from neuromem_runtime.policy_v2 import GraphDeltaProposal, MemoryPolicyV2, ValidatedMutation, ValidationStep
+from neuromem_runtime.policy_v2 import AssociativeEdgeProposal, FrameDeltaProposal, GraphDeltaProposal, LogicEdgeProposal, MemoryPolicyV2, ValidatedMutation, ValidationStep
 from neuromem_runtime.semantic_graph import (
     GraphBuildContext,
     GraphDeltaValidator,
     GraphMutationCommitter,
     graph_delta_from_edge,
+    relation_family,
 )
 from neuromem_runtime.validators import ValidationContext, ValidatorStack
 
@@ -58,11 +69,14 @@ class PolicyExecutor:
         self.lifecycle = LifecycleStateMachine()
         self.graph_validator = GraphDeltaValidator()
         self.graph_committer = GraphMutationCommitter()
+        self.frame_validator = DefaultFrameValidator()
+        self.logic_validator = DefaultLogicRelationValidator()
 
     def execute(self, policy: MemoryPolicy | MemoryPolicyV2, context: PolicyExecutionContext) -> MutationExecutionResult:
         assert self.runtime.store is not None
         legacy_policy = self._coerce_policy(policy)
         graph_proposals = self._graph_proposals(policy)
+        frame_proposals, associative_proposals, logic_proposals = self._structural_proposals(policy, graph_proposals, context)
         if isinstance(policy, MemoryPolicyV2):
             unsupported = self._unsupported_v2_reason(policy)
             if unsupported:
@@ -115,17 +129,30 @@ class PolicyExecutor:
                     state=context.state,
                     retrieved_memory_ids=context.retrieved_memory_ids,
                 )
-                proposal_validation = self._validate_graph_proposals(graph_proposals, context)
-                if proposal_validation and not proposal_validation.approved:
-                    reason = "; ".join(step.reason for step in proposal_validation.validator_trace if not step.passed) or "graph delta validation failed"
-                    raise _PostCommitValidationError(reason, proposal_validation)
-                explicit_graph_deltas = self._commit_graph_proposals(graph_proposals, context)
+                frame_validation = self._validate_frame_proposals(frame_proposals, context)
+                if frame_validation and not frame_validation.approved:
+                    reason = "; ".join(step.reason for step in frame_validation.validator_trace if not step.passed) or "frame delta validation failed"
+                    raise _PostCommitValidationError(reason, frame_validation)
+                committed_frames = self._commit_frame_proposals(frame_proposals, context)
+                edge_validation = self._validate_split_edge_proposals(associative_proposals, logic_proposals, context)
+                if edge_validation and not edge_validation.approved:
+                    reason = "; ".join(step.reason for step in edge_validation.validator_trace if not step.passed) or "split graph delta validation failed"
+                    raise _PostCommitValidationError(reason, edge_validation)
+                explicit_graph_deltas = self._commit_split_edge_proposals(associative_proposals, logic_proposals, context)
                 trace = self.runtime.last_trace
                 if trace is None:
                     raise RuntimeError("policy execution did not produce a trace")
                 trace.query_plan["governed_transaction_id"] = transaction_id
                 if graph_proposals:
                     trace.query_plan["graph_delta_proposals"] = [proposal.model_dump(mode="json") for proposal in graph_proposals]
+                if frame_proposals:
+                    trace.query_plan["frame_delta_proposals"] = [proposal.model_dump(mode="json") for proposal in frame_proposals]
+                if associative_proposals:
+                    trace.query_plan["associative_delta_proposals"] = [proposal.model_dump(mode="json") for proposal in associative_proposals]
+                if logic_proposals:
+                    trace.query_plan["logic_delta_proposals"] = [proposal.model_dump(mode="json") for proposal in logic_proposals]
+                if committed_frames:
+                    trace.query_plan["committed_frames"] = [frame.to_record() for frame in committed_frames]
                 if explicit_graph_deltas:
                     trace.query_plan["governed_graph_deltas"] = [delta.to_dict() for delta in explicit_graph_deltas]
 
@@ -292,7 +319,7 @@ class PolicyExecutor:
     def _coerce_policy(self, policy: MemoryPolicy | MemoryPolicyV2) -> MemoryPolicy:
         if isinstance(policy, MemoryPolicy):
             return policy
-        if policy.graph_deltas and not policy.proposed_deltas:
+        if (policy.graph_deltas or policy.frame_deltas or policy.associative_deltas or policy.logic_deltas) and not policy.proposed_deltas:
             return MemoryPolicy(
                 retrieval=RetrievalPlan(enabled=False, query=policy.target_selector.query or ""),
                 write=WritePlan(operation="NOOP"),
@@ -340,14 +367,14 @@ class PolicyExecutor:
         )
 
     def _unsupported_v2_reason(self, policy: MemoryPolicyV2) -> str | None:
-        if policy.intent == "supersede" and not policy.graph_deltas:
+        if policy.intent == "supersede" and not (policy.graph_deltas or policy.logic_deltas):
             return "MemoryPolicyV2 supersede requires multi-delta graph or lifecycle execution; legacy one-delta supersede is not supported"
         if len(policy.proposed_deltas) <= 1:
             return None
         operations = {(delta.operation or policy.intent).lower() for delta in policy.proposed_deltas}
         if len(operations) == 1 and operations <= {"link", "update"}:
             return None
-        if policy.graph_deltas:
+        if policy.graph_deltas or policy.frame_deltas or policy.associative_deltas or policy.logic_deltas:
             return None
         return "multi-delta MemoryPolicyV2 transactions are not yet supported by this executor"
 
@@ -355,6 +382,29 @@ class PolicyExecutor:
         if isinstance(policy, MemoryPolicyV2):
             return list(policy.graph_deltas)
         return []
+
+    def _structural_proposals(
+        self,
+        policy: MemoryPolicy | MemoryPolicyV2,
+        graph_proposals: list[GraphDeltaProposal],
+        context: PolicyExecutionContext,
+    ) -> tuple[list[FrameDeltaProposal], list[AssociativeEdgeProposal], list[LogicEdgeProposal]]:
+        if not isinstance(policy, MemoryPolicyV2):
+            return [], [], []
+        graph_context = self._graph_context(context)
+        frames = list(policy.frame_deltas)
+        associative = list(policy.associative_deltas)
+        logic = list(policy.logic_deltas)
+        for proposal in graph_proposals:
+            frame_items, associative_items, logic_items = graph_delta_to_structural(proposal, context=graph_context)
+            frames.extend(frame_items)
+            associative.extend(associative_items)
+            logic.extend(logic_items)
+        deduped_frames: dict[str, FrameDeltaProposal] = {}
+        for frame in frames:
+            key = frame.frame_id or "|".join([frame.frame_type, frame.content, *frame.source_memory_ids])
+            deduped_frames[key] = frame
+        return list(deduped_frames.values()), associative, logic
 
     def _graph_context(self, context: PolicyExecutionContext) -> GraphBuildContext:
         assert self.runtime.store is not None
@@ -387,6 +437,141 @@ class PolicyExecutor:
             required_human_review=any(not step.passed and "high-risk" in step.reason for step in steps),
             risk_score=0.25 if approved else 0.85,
             validator_trace=steps,
+        )
+
+    def _validate_frame_proposals(self, proposals: list[FrameDeltaProposal], context: PolicyExecutionContext) -> ValidatedMutation | None:
+        if not proposals:
+            return None
+        graph_context = self._graph_context(context)
+        steps = [self.frame_validator.validate_frame(proposal, context=graph_context, store=self.runtime.store) for proposal in proposals]
+        approved = all(step.passed for step in steps)
+        return ValidatedMutation(approved=approved, risk_score=0.2 if approved else 0.8, validator_trace=steps)
+
+    def _validate_split_edge_proposals(
+        self,
+        associative_proposals: list[AssociativeEdgeProposal],
+        logic_proposals: list[LogicEdgeProposal],
+        context: PolicyExecutionContext,
+    ) -> ValidatedMutation | None:
+        if not associative_proposals and not logic_proposals:
+            return None
+        graph_context = self._graph_context(context)
+        steps: list[ValidationStep] = []
+        for proposal in associative_proposals:
+            steps.append(self._validate_associative_proposal(proposal, graph_context))
+        for proposal in logic_proposals:
+            steps.append(self.logic_validator.validate_logic_edge(proposal, context=graph_context, store=self.runtime.store))
+        approved = all(step.passed for step in steps)
+        return ValidatedMutation(
+            approved=approved,
+            required_human_review=any(not step.passed and "confidence is capped" in step.reason for step in steps),
+            risk_score=0.25 if approved else 0.85,
+            validator_trace=steps,
+        )
+
+    def _validate_associative_proposal(self, proposal: AssociativeEdgeProposal, context: GraphBuildContext) -> ValidationStep:
+        if proposal.relation not in ASSOCIATIVE_RELATIONS:
+            return ValidationStep(name="AssociativeEdgeValidator", passed=False, reason=f"unsupported associative relation: {proposal.relation}")
+        if proposal.source_memory_id == proposal.target_memory_id:
+            return ValidationStep(name="AssociativeEdgeValidator", passed=False, reason="associative edge endpoints must be distinct")
+        by_id = context.memory_by_id()
+        source = by_id.get(proposal.source_memory_id)
+        target = by_id.get(proposal.target_memory_id)
+        if source is None or target is None:
+            return ValidationStep(name="AssociativeEdgeValidator", passed=False, reason="associative edge endpoint not found")
+        if source.namespace != context.namespace or target.namespace != context.namespace:
+            return ValidationStep(name="AssociativeEdgeValidator", passed=False, reason="associative edge endpoint outside namespace")
+        return ValidationStep(name="AssociativeEdgeValidator", passed=True)
+
+    def _commit_frame_proposals(self, proposals: list[FrameDeltaProposal], context: PolicyExecutionContext) -> list[MemoryFrame]:
+        assert self.runtime.store is not None
+        frames: list[MemoryFrame] = []
+        for proposal in proposals:
+            frame = frame_from_proposal(proposal, namespace=context.namespace)
+            self.runtime.store.add_logic_node(frame)
+            frames.append(frame)
+        return frames
+
+    def _commit_split_edge_proposals(
+        self,
+        associative_proposals: list[AssociativeEdgeProposal],
+        logic_proposals: list[LogicEdgeProposal],
+        context: PolicyExecutionContext,
+    ) -> list[GraphDelta]:
+        assert self.runtime.store is not None
+        deltas: list[GraphDelta] = []
+        for proposal in associative_proposals:
+            before = self._associative_for_proposal(proposal, context.namespace)
+            old_weight = before.weight if before is not None else 0.0
+            edge = associative_edge_from_proposal(proposal, namespace=context.namespace)
+            self.runtime.store.add_associative_edge(edge)
+            deltas.append(self._graph_delta_for_associative(edge, old_weight=old_weight, operation=proposal.operation, proposer=proposal.proposer, reason=proposal.reason))
+        for proposal in logic_proposals:
+            before = self._logic_for_proposal(proposal, context.namespace)
+            old_weight = before.weight if before is not None else 0.0
+            edge = logic_edge_from_proposal(proposal, namespace=context.namespace)
+            self.runtime.store.add_logic_edge(edge)
+            deltas.append(self._graph_delta_for_logic(edge, old_weight=old_weight, operation=proposal.operation, proposer=proposal.proposer, reason=proposal.reason))
+        return deltas
+
+    def _associative_for_proposal(self, proposal: AssociativeEdgeProposal, namespace: str) -> AssociativeEdge | None:
+        assert self.runtime.store is not None
+        for edge in self.runtime.store.list_associative_edges(source_id=proposal.source_memory_id, namespace=namespace):
+            if edge.target_id == proposal.target_memory_id and edge.relation == proposal.relation:
+                return edge
+        return None
+
+    def _logic_for_proposal(self, proposal: LogicEdgeProposal, namespace: str) -> LogicEdge | None:
+        assert self.runtime.store is not None
+        for edge in self.runtime.store.list_logic_edges(source_frame_id=proposal.source_frame_id, namespace=namespace):
+            if edge.target_frame_id == proposal.target_frame_id and edge.relation == proposal.relation:
+                return edge
+        return None
+
+    def _graph_delta_for_associative(self, edge: AssociativeEdge, *, old_weight: float, operation: str, proposer: str, reason: str) -> GraphDelta:
+        return GraphDelta(
+            edge_id=f"associative:{edge.edge_id()}",
+            source_id=edge.source_id,
+            target_id=edge.target_id,
+            relation=edge.relation,
+            old_weight=old_weight,
+            new_weight=edge.weight,
+            delta=edge.weight - old_weight,
+            operation=operation,
+            relation_family="association",
+            lifecycle_state=edge.lifecycle_state,
+            eligibility=edge.eligibility_trace,
+            salience=edge.salience,
+            outcome_reward=edge.outcome_reward,
+            confidence=edge.confidence,
+            inhibition_penalty=edge.inhibition_score,
+            provenance=list(edge.provenance),
+            evidence_ids=list(edge.provenance),
+            proposer=proposer,
+            reason=reason or "associative graph delta committed",
+        )
+
+    def _graph_delta_for_logic(self, edge: LogicEdge, *, old_weight: float, operation: str, proposer: str, reason: str) -> GraphDelta:
+        return GraphDelta(
+            edge_id=f"logic:{edge.edge_id()}",
+            source_id=edge.source_memory_id or edge.source_frame_id,
+            target_id=edge.target_memory_id or edge.target_frame_id,
+            relation=edge.relation,
+            old_weight=old_weight,
+            new_weight=edge.weight,
+            delta=edge.weight - old_weight,
+            operation=operation,
+            relation_family=relation_family(edge.relation),
+            lifecycle_state=edge.lifecycle_state,
+            confidence=edge.confidence,
+            inhibition_penalty=edge.inhibition_score,
+            contradiction_penalty=edge.contradiction_penalty,
+            provenance=list(edge.evidence_ids),
+            evidence_ids=list(edge.evidence_ids),
+            proposer=proposer,
+            valid_from=edge.valid_from.isoformat() if edge.valid_from else None,
+            valid_to=edge.valid_to.isoformat() if edge.valid_to else None,
+            reason=reason or edge.proof_obligation,
         )
 
     def _commit_graph_proposals(self, proposals: list[GraphDeltaProposal], context: PolicyExecutionContext) -> list[GraphDelta]:
@@ -454,7 +639,20 @@ class PolicyExecutor:
 
     def _snapshot_edges(self) -> dict[str, dict[str, Any]]:
         assert self.runtime.store is not None
-        return {self._edge_id(edge.to_record()): edge.to_record() for edge in self.runtime.store.list_edges()}
+        snapshot: dict[str, dict[str, Any]] = {}
+        for edge in self.runtime.store.list_associative_edges():
+            state = edge.to_record()
+            state["record_kind"] = "associative_edge"
+            snapshot[f"associative:{edge.edge_id()}"] = state
+        for frame in self.runtime.store.list_logic_nodes():
+            state = frame.to_record()
+            state["record_kind"] = "logic_node"
+            snapshot[f"frame:{frame.frame_id}"] = state
+        for edge in self.runtime.store.list_logic_edges():
+            state = edge.to_record()
+            state["record_kind"] = "logic_edge"
+            snapshot[f"logic:{edge.edge_id()}"] = state
+        return snapshot
 
     def _memory_deltas(self, before: dict[str, dict[str, Any]], after: dict[str, dict[str, Any]]) -> list[MemoryDelta]:
         deltas: list[MemoryDelta] = []
@@ -506,12 +704,12 @@ class PolicyExecutor:
                 continue
             old_weight = float(old.get("weight", 0.0)) if old else 0.0
             new_weight = float(new.get("weight", 0.0))
-            if old != new:
+            if old != new and new.get("record_kind") != "logic_node":
                 deltas.append(
                     GraphDelta(
                         edge_id=edge_id,
-                        source_id=str(new.get("source_id", "")),
-                        target_id=str(new.get("target_id", "")),
+                        source_id=str(new.get("source_id") or new.get("source_memory_id") or new.get("source_frame_id") or ""),
+                        target_id=str(new.get("target_id") or new.get("target_memory_id") or new.get("target_frame_id") or ""),
                         relation=str(new.get("relation", "")),
                         old_weight=old_weight,
                         new_weight=new_weight,

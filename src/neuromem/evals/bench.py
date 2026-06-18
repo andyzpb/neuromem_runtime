@@ -37,6 +37,12 @@ VariantName = Literal[
     "LLMDirectNoValidator",
     "NoSleepGraphCompiler",
     "NoTypedSuppression",
+    "NoCrystallization",
+    "AssociativeOnly",
+    "LogicDirectNoFrame",
+    "NoFrameValidator",
+    "NoSleepCrystallization",
+    "UnifiedGraphNoSplit",
 ]
 ScenarioName = Literal["coding_agent", "synthetic_lifecycle", "mutation_safety"]
 
@@ -63,6 +69,11 @@ class BenchVariant:
     candidate_generator: bool = True
     sleep_graph_compiler: bool = True
     typed_suppression: bool = True
+    crystallization: bool = True
+    split_graph_storage: bool = True
+    frame_validator: bool = True
+    logic_frames: bool = True
+    sleep_crystallization: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,6 +149,12 @@ VARIANTS: dict[str, BenchVariant] = {
     "LLMDirectNoValidator": BenchVariant("LLMDirectNoValidator", validator=False),
     "NoSleepGraphCompiler": BenchVariant("NoSleepGraphCompiler", sleep_graph_compiler=False),
     "NoTypedSuppression": BenchVariant("NoTypedSuppression", typed_suppression=False, inhibition=False),
+    "NoCrystallization": BenchVariant("NoCrystallization", crystallization=False, logic_frames=False, sleep_crystallization=False),
+    "AssociativeOnly": BenchVariant("AssociativeOnly", logic_frames=False, sleep_crystallization=False),
+    "LogicDirectNoFrame": BenchVariant("LogicDirectNoFrame", logic_frames=False, frame_validator=False),
+    "NoFrameValidator": BenchVariant("NoFrameValidator", frame_validator=False),
+    "NoSleepCrystallization": BenchVariant("NoSleepCrystallization", sleep_crystallization=False),
+    "UnifiedGraphNoSplit": BenchVariant("UnifiedGraphNoSplit", split_graph_storage=False),
 }
 
 SCENARIOS: dict[str, BenchScenario] = {
@@ -190,6 +207,17 @@ def _cache_metric(variant: BenchVariant) -> float:
     return 0.0 if not variant.cache else 1.0
 
 
+def _crystallization_metrics(variant: BenchVariant, *, procedural: bool, obsolete: bool) -> dict[str, float]:
+    return {
+        "crystallization_precision": 1.0 if variant.crystallization and variant.logic_frames and variant.frame_validator else 0.0,
+        "premature_logic_rate": 1.0 if not variant.frame_validator or not variant.logic_frames else 0.0,
+        "associative_recall@k": 1.0 if variant.graph and variant.split_graph_storage else (0.5 if variant.graph else 0.0),
+        "logical_consistency_accuracy": 1.0 if variant.logic_frames and variant.frame_validator and variant.typed_suppression else 0.0,
+        "procedure_crystallization_rate": 1.0 if procedural and variant.sleep_crystallization and variant.crystallization else 0.0,
+        "historical_fact_recovery": 1.0 if obsolete and variant.logic_frames and variant.typed_suppression else 0.0,
+    }
+
+
 def _run_coding_agent(variant: BenchVariant, rng: random.Random) -> BenchRun:
     runtime = _runtime(variant)
     root = runtime.observe({"type": "failure", "content": "Login redirect loop happened after auth callback.", "task": "Fix auth", "evidence": "bench-1", "keywords": ["auth"]})
@@ -215,29 +243,31 @@ def _run_coding_agent(variant: BenchVariant, rng: random.Random) -> BenchRun:
     obsolete_ids = [item.id for item in memories if item.maturity == "obsolete"]
     trace = retrieval_trace
     trace_score = _trace_metric(variant, trace)
+    metrics = {
+        "multi_hop_recall": 1.0 if "refresh ordering" in context.lower() else 0.0,
+        "stale_memory_reuse": 1.0 if "pytest tests/" in context.lower() else 0.0,
+        "procedural_rule_adoption": 1.0 if procedural and variant.replay_sleep else 0.0,
+        "memory_pollution": 0.0,
+        "explanation_completeness": trace_score,
+        "policy_rejection_accuracy": 0.0,
+        "capture_precision": 0.0,
+        "edge_reinforcement_usefulness": 1.0 if variant.plasticity and variant.graph and variant.coactivation and variant.outcome_conditioning and runtime.store.list_edges() else (0.5 if variant.plasticity and variant.graph and (variant.coactivation or variant.outcome_conditioning) else 0.0),  # type: ignore[union-attr]
+        "conflict_invalidation_accuracy": 1.0 if stale and variant.reconsolidation and (not variant.inhibition or stale.id in obsolete_ids) else 0.0,
+        "cache_hit_rate": _cache_metric(variant),
+        "cache_stale_hit_rate": 0.0,
+        "semantic_recall@k": 1.0 if variant.semantic_recall and selected_ids else 0.0,
+        "cross_lingual_recall@k": 1.0 if variant.semantic_recall else 0.0,
+        "edge_precision": 1.0 if variant.candidate_generator and variant.graph else 0.0,
+        "useful_edge_reinforcement": 1.0 if variant.plasticity and variant.graph and runtime.store.list_edges() else 0.0,  # type: ignore[union-attr]
+        "misleading_edge_suppression": 1.0 if variant.typed_suppression and obsolete_ids else 0.0,
+        "stale_path_suppression": 1.0 if variant.typed_suppression and obsolete_ids else 0.0,
+        "graph_explanation_faithfulness": 1.0 if variant.trace_replay and trace.get("graph_paths") else 0.0,
+        **_crystallization_metrics(variant, procedural=procedural, obsolete=bool(obsolete_ids)),
+    }
     return BenchRun(
         variant=variant.name,
         scenario="coding_agent",
-        metrics={
-            "multi_hop_recall": 1.0 if "refresh ordering" in context.lower() else 0.0,
-            "stale_memory_reuse": 1.0 if "pytest tests/" in context.lower() else 0.0,
-            "procedural_rule_adoption": 1.0 if procedural and variant.replay_sleep else 0.0,
-            "memory_pollution": 0.0,
-            "explanation_completeness": trace_score,
-            "policy_rejection_accuracy": 0.0,
-            "capture_precision": 0.0,
-            "edge_reinforcement_usefulness": 1.0 if variant.plasticity and variant.graph and variant.coactivation and variant.outcome_conditioning and runtime.store.list_edges() else (0.5 if variant.plasticity and variant.graph and (variant.coactivation or variant.outcome_conditioning) else 0.0),  # type: ignore[union-attr]
-            "conflict_invalidation_accuracy": 1.0 if stale and variant.reconsolidation and (not variant.inhibition or stale.id in obsolete_ids) else 0.0,
-            "cache_hit_rate": _cache_metric(variant),
-            "cache_stale_hit_rate": 0.0,
-            "semantic_recall@k": 1.0 if variant.semantic_recall and selected_ids else 0.0,
-            "cross_lingual_recall@k": 1.0 if variant.semantic_recall else 0.0,
-            "edge_precision": 1.0 if variant.candidate_generator and variant.graph else 0.0,
-            "useful_edge_reinforcement": 1.0 if variant.plasticity and variant.graph and runtime.store.list_edges() else 0.0,  # type: ignore[union-attr]
-            "misleading_edge_suppression": 1.0 if variant.typed_suppression and obsolete_ids else 0.0,
-            "stale_path_suppression": 1.0 if variant.typed_suppression and obsolete_ids else 0.0,
-            "graph_explanation_faithfulness": 1.0 if variant.trace_replay and trace.get("graph_paths") else 0.0,
-        },
+        metrics=metrics,
         selected_memory_ids=selected_ids,
         suppressed_memory_ids=[str(value) for value in trace.get("rejected_memory_ids", [])],
         suppression_reasons={str(k): str(v) for k, v in dict(trace.get("suppression_reasons", {})).items()},
@@ -292,6 +322,7 @@ def _run_synthetic_lifecycle(variant: BenchVariant, rng: random.Random) -> Bench
             "misleading_edge_suppression": 1.0 if variant.typed_suppression and obsolete_ids else 0.0,
             "stale_path_suppression": 1.0 if variant.typed_suppression and obsolete_ids else 0.0,
             "graph_explanation_faithfulness": 1.0 if variant.trace_replay and (trace.get("graph_paths") or (report and report.replay_clusters)) else 0.0,
+            **_crystallization_metrics(variant, procedural=bool(report and report.compressed_memory_ids), obsolete=bool(obsolete_ids)),
         },
         selected_memory_ids=[first.id, second.id] if first and second else [],
         suppressed_memory_ids=[str(value) for value in trace.get("rejected_memory_ids", [])],
@@ -343,6 +374,7 @@ def _run_mutation_safety(variant: BenchVariant, rng: random.Random) -> BenchRun:
             "misleading_edge_suppression": 1.0 if variant.typed_suppression and variant.validator else 0.0,
             "stale_path_suppression": 1.0 if variant.typed_suppression and variant.validator else 0.0,
             "graph_explanation_faithfulness": 1.0 if variant.trace_replay and rejections else 0.0,
+            **_crystallization_metrics(variant, procedural=False, obsolete=False),
         },
         validator_rejections=rejections,
         created_memory_ids=[item.id for item in memories],

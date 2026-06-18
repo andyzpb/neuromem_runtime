@@ -470,6 +470,7 @@ class MemoryLedger:
             return version_snapshot
         memories: dict[str, dict[str, object]] = {}
         edges: dict[str, dict[str, object]] = {}
+        frames: dict[str, dict[str, object]] = {}
         last_txn: str | None = None
         for event in events:
             last_txn = str(event["transaction_id"])
@@ -577,6 +578,7 @@ class MemoryLedger:
         placeholders = ",".join("?" for _ in transaction_ids)
         memories: dict[str, dict[str, object]] = {}
         edges: dict[str, dict[str, object]] = {}
+        frames: dict[str, dict[str, object]] = {}
         with self._connect() as conn:
             memory_rows = conn.execute(
                 f"""
@@ -603,8 +605,11 @@ class MemoryLedger:
             memories[str(row["memory_id"])] = state
         for row in edge_rows:
             state = json.loads(row["state_json"])
-            edges[str(row["edge_id"])] = state
-        return MemorySnapshot(memories=memories, edges=edges)
+            if state.get("record_kind") == "logic_node":
+                frames[str(state.get("frame_id") or row["edge_id"])] = state
+            else:
+                edges[str(row["edge_id"])] = state
+        return MemorySnapshot(memories=memories, edges=edges, frames=frames)
 
 
 class _BorrowedConnection:

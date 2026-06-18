@@ -12,19 +12,29 @@ from neuromem_runtime.policy_v2 import GraphDeltaProposal, ValidationStep
 GraphMode = Literal["off", "deterministic", "governed_hybrid"]
 GraphEdgeState = Literal["candidate", "provisional", "captured", "reinforced", "mature", "inhibited", "expired", "superseded"]
 
-SAFE_RELATIONS = {"evidence_for", "retrieved_with", "coactivated_with", "precedes", "derived_from", "compresses_to"}
+ASSOCIATIVE_RELATIONS = {"associated_with", "retrieved_with", "coactivated_with", "precedes", "same_trace", "same_episode", "nearby_context", "used_with_success", "used_with_failure"}
+SAFE_RELATIONS = {"evidence_for", "retrieved_with", "coactivated_with", "precedes", "derived_from", "compresses_to", "associated_with", "same_trace", "same_episode", "nearby_context", "used_with_success", "used_with_failure"}
 SEMANTIC_RELATIONS = {"supports", "same_as", "procedure_for", "generalizes", "specializes"}
 HIGH_RISK_RELATIONS = {"causes", "contradicts", "supersedes", "inhibits"}
+LOGIC_RELATIONS = {"supports", "same_as", "procedure_for", "generalizes", "specializes", "causes", "contradicts", "supersedes", "inhibits", "evidence_for", "derived_from", "compresses_to", "preference_of", "applies_to"}
 RELATION_FAMILIES = {
+    "associated_with": "association",
     "evidence_for": "evidence",
     "derived_from": "lifecycle",
     "compresses_to": "lifecycle",
     "retrieved_with": "activation",
     "coactivated_with": "activation",
     "precedes": "activation",
+    "same_trace": "activation",
+    "same_episode": "activation",
+    "nearby_context": "activation",
+    "used_with_success": "activation",
+    "used_with_failure": "activation",
     "supports": "semantic",
     "same_as": "semantic",
     "procedure_for": "procedural",
+    "preference_of": "preference",
+    "applies_to": "semantic",
     "generalizes": "semantic",
     "specializes": "semantic",
     "causes": "causal",
@@ -32,7 +42,7 @@ RELATION_FAMILIES = {
     "supersedes": "suppression",
     "inhibits": "suppression",
 }
-ALLOWED_GRAPH_RELATIONS = frozenset(SAFE_RELATIONS | SEMANTIC_RELATIONS | HIGH_RISK_RELATIONS)
+ALLOWED_GRAPH_RELATIONS = frozenset(SAFE_RELATIONS | SEMANTIC_RELATIONS | HIGH_RISK_RELATIONS | LOGIC_RELATIONS)
 
 
 @dataclass(slots=True)

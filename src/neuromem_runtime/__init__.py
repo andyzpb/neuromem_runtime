@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 from neuromem.core.policy import MemoryPolicy, MemoryTrace
+from neuromem.core.models import AssociativeEdge, LogicEdge, MemoryFrame
+from neuromem_runtime.crystallization import (
+    CrystallizationPlanner,
+    DefaultFrameValidator,
+    DefaultLogicRelationValidator,
+    DeterministicCrystallizationPlanner,
+    DeterministicFrameExtractor,
+    FrameExtractor,
+    FrameValidator,
+    LogicRelationValidator,
+    RetrievalLens,
+)
 
 from neuromem_runtime.runtime import MemoryRuntime
 from neuromem_runtime.deltas import ExecutionDeltaPlan, GraphDelta, IndexDelta, LifecycleDelta, MemoryDelta, MemorySnapshot, MutationExecutionResult
 from neuromem_runtime.ledger import ExperienceEvent, LedgerEvent, MemoryLedger
 from neuromem_runtime.lifecycle import LifecycleStateMachine
-from neuromem_runtime.policy_v2 import GraphDeltaProposal, MemoryPolicyV2, ValidatedMutation
+from neuromem_runtime.policy_v2 import AssociativeEdgeProposal, FrameDeltaProposal, GraphDeltaProposal, LogicEdgeProposal, MemoryPolicyV2, ValidatedMutation
 from neuromem_runtime.plasticity import PlasticityEngine
 from neuromem_runtime.retrieval import (
     ActivationResult,
@@ -54,8 +66,15 @@ __all__ = [
     "MemoryTrace",
     "ExperienceEvent",
     "MemoryPolicyV2",
+    "FrameDeltaProposal",
+    "AssociativeEdgeProposal",
+    "LogicEdgeProposal",
     "GraphDeltaProposal",
     "ValidatedMutation",
+    "MemoryFrame",
+    "AssociativeEdge",
+    "LogicEdge",
+    "RetrievalLens",
     "ExecutionDeltaPlan",
     "MemoryDelta",
     "GraphDelta",
@@ -90,6 +109,14 @@ __all__ = [
     "DeterministicRelationProposer",
     "GraphDeltaValidator",
     "GraphMutationCommitter",
+    "FrameExtractor",
+    "FrameValidator",
+    "LogicRelationValidator",
+    "CrystallizationPlanner",
+    "DeterministicFrameExtractor",
+    "DefaultFrameValidator",
+    "DefaultLogicRelationValidator",
+    "DeterministicCrystallizationPlanner",
     "PlasticityEngine",
     "SleepPlanner",
     "SleepReport",

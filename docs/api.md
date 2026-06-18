@@ -27,7 +27,7 @@ This creates:
   traces/
 ```
 
-The SQLite database stores memories, memory cards, graph edges, experience events, ledger events, memory versions, and edge versions.
+The SQLite database stores memories, memory cards, associative edges, logic nodes, logic edges, experience events, ledger events, memory versions, and split graph/frame versions.
 
 ## Public Actions
 
@@ -35,7 +35,7 @@ The SQLite database stores memories, memory cards, graph edges, experience event
 | --- | --- |
 | `observe(event)` | Record only an immutable `ExperienceEvent`; no long-term memory is written. |
 | `observe_and_commit(event)` | Explicitly validate and commit a long-term memory from an event. |
-| `query(query, budget_tokens=800)` | Return a prompt-ready `MemoryContext` through activation retrieval. |
+| `query(query, budget_tokens=800, lens="auto")` | Return a prompt-ready `MemoryContext` through a deterministic retrieval lens. |
 | `propose(input)` | Produce a structured `MemoryPolicy` or `MemoryPolicyV2` with the configured provider. |
 | `commit(policy)` | Validate and apply governed memory changes. |
 | `mutate(policy)` | Alias for `commit(policy)`. |
@@ -84,7 +84,10 @@ The returned trace includes `mutation_execution_result`:
 - `updated_memory_ids`
 - `deleted_memory_ids`
 - `memory_deltas`
-- `graph_deltas`
+- `frame_deltas`
+- `associative_deltas`
+- `logic_deltas`
+- `graph_deltas` bridge inputs converted into split structural deltas
 - `lifecycle_deltas`
 - `index_deltas`
 
@@ -205,19 +208,30 @@ memory = await nmem.MemoryRuntime.local(
 )
 ```
 
-## Governed Semantic Graph
+## Progressive Crystallization
 
-Graph construction is a governed mutation path:
+NeuroMem treats logical structure as a governed compiled layer, not as the default form of memory. The mutation path is:
 
 ```text
 GraphCandidateGenerator
   -> RelationProposer
-  -> GraphDeltaValidator
+  -> Frame extraction
+  -> FrameValidator / LogicRelationValidator
   -> PolicyExecutor transaction
   -> MemoryLedger
 ```
 
-`MemoryPolicyV2.graph_deltas` is the first-class graph mutation channel. Graph deltas support `add_edge`, `update_edge`, `inhibit_edge`, and `expire_edge`, and every proposal must bind endpoints, relation, confidence, evidence ids, and reason. Safe relations such as `evidence_for`, `retrieved_with`, `coactivated_with`, `precedes`, `derived_from`, and `compresses_to` can be committed directly when validated. Semantic relations such as `supports`, `same_as`, `procedure_for`, `generalizes`, and `specializes` start provisional. High-risk relations such as `causes`, `contradicts`, `supersedes`, and `inhibits` are conservative and route through validation/suppression rather than deletion.
+`MemoryPolicyV2.frame_deltas`, `associative_deltas`, and `logic_deltas` are the first-class structural mutation channels. Associative deltas connect memory ids with low-commitment activation relations such as `retrieved_with`, `coactivated_with`, `precedes`, and `used_with_success`. Logic deltas connect Frame endpoints and require evidence ids plus a proof obligation. Frame ontology currently covers Episode, Fact, Claim, Procedure, Preference, Constraint, Entity, Schema, and FailurePattern frames.
+
+`graph_deltas` are accepted as bridge inputs and are converted to split structural deltas inside the executor. New code should use the split fields directly.
+
+Retrieval lenses:
+
+- `associative`: similar episodes and low-commitment graph activation
+- `logical`: validated facts, preferences, constraints, and consistent current knowledge
+- `procedural`: procedures, schemas, and failure-avoidance patterns
+- `historical`: supersession and temporal history
+- `audit`: ledger, evidence, validator, and rollback paths
 
 ## Forgetting
 
@@ -240,7 +254,7 @@ Deletion is rejected unless `authorize_delete=True`. Normal forgetting keeps aud
 - replay clusters
 - promoted/compressed/archived memory ids
 - memory/lifecycle deltas
-- graph candidates, proposed graph deltas, approved graph deltas, compiled nodes, and suppressed stale paths
+- graph candidates, approved graph deltas, frame candidates, validated frames, logic promotions, compiled schemas, rejected crystallizations, and suppressed stale paths
 - ledger transaction ids
 
 ## Policy Providers
@@ -287,6 +301,9 @@ The package exports:
 - `ExperienceEvent`
 - `MemoryPolicy`
 - `MemoryPolicyV2`
+- `FrameDeltaProposal`
+- `AssociativeEdgeProposal`
+- `LogicEdgeProposal`
 - `GraphDeltaProposal`
 - `ValidatedMutation`
 - `MemoryDelta`
@@ -321,6 +338,14 @@ The package exports:
 - `GraphProposalProvider`
 - `GraphDeltaValidator`
 - `GraphMutationCommitter`
+- `MemoryFrame`
+- `AssociativeEdge`
+- `LogicEdge`
+- `RetrievalLens`
+- `FrameExtractor`
+- `FrameValidator`
+- `LogicRelationValidator`
+- `CrystallizationPlanner`
 - `PlasticityEngine`
 - `SleepPlanner`
 

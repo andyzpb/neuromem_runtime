@@ -65,6 +65,7 @@ class ExecutionDeltaPlan:
 class MemorySnapshot:
     memories: dict[str, dict[str, object]] = field(default_factory=dict)
     edges: dict[str, dict[str, object]] = field(default_factory=dict)
+    frames: dict[str, dict[str, object]] = field(default_factory=dict)
     transaction_id: str | None = None
 
     def to_dict(self) -> dict[str, object]:

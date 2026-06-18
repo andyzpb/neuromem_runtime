@@ -6,13 +6,21 @@ from pathlib import Path
 from uuid import uuid4
 
 from neuromem.core.policy import ConsolidationPlan, ForgetPlan, MemoryPolicy, RetrievalPlan, WritePlan
+from neuromem.core.models import MemoryItem
 from neuromem.core.runtime import NeuroMemRuntime
 from neuromem.stores.sqlite_store import SQLiteMemoryStore
 
+from neuromem_runtime.crystallization import (
+    DeterministicCrystallizationPlanner,
+    DeterministicFrameExtractor,
+    frame_id_for_memory,
+    frame_proposal_for_memory,
+    infer_frame_type,
+)
 from neuromem_runtime.deltas import LifecycleDelta, MemoryDelta
 from neuromem_runtime.executor import PolicyExecutionContext, PolicyExecutor
 from neuromem_runtime.ledger import ExperienceEvent, LedgerEvent, MemoryLedger
-from neuromem_runtime.policy_v2 import EvidenceRef, MemoryPolicyV2
+from neuromem_runtime.policy_v2 import EvidenceRef, LogicEdgeProposal, MemoryPolicyV2
 from neuromem_runtime.providers import DeterministicPolicyProvider, PolicyProvider
 from neuromem_runtime.retrieval import (
     EmbeddingProvider,
@@ -48,6 +56,8 @@ class MemoryRuntime:
         *,
         allow_unsafe_internal: bool = False,
         graph_mode: GraphMode = "governed_hybrid",
+        crystallization_mode: str = "governed_progressive",
+        graph_storage: str = "split",
         embedding_provider: EmbeddingProvider | None = None,
         vector_index: VectorIndex | None = None,
         rerank_provider: RerankProvider | None = None,
@@ -58,6 +68,8 @@ class MemoryRuntime:
     ) -> None:
         self.config = config
         self.config.graph_mode = graph_mode
+        self.config.crystallization_mode = crystallization_mode
+        self.config.graph_storage = graph_storage
         self._runtime = runtime
         self._allow_unsafe_internal = allow_unsafe_internal
         self._validator_stack = ValidatorStack()
@@ -74,6 +86,8 @@ class MemoryRuntime:
         self._entity_alias_resolver = entity_alias_resolver or StaticEntityAliasResolver()
         self._graph_candidate_generator = GraphCandidateGenerator()
         self._relation_proposer = relation_proposer or DeterministicRelationProposer()
+        self._frame_extractor = DeterministicFrameExtractor()
+        self._crystallization_planner = DeterministicCrystallizationPlanner()
 
     @classmethod
     async def local(
@@ -85,6 +99,8 @@ class MemoryRuntime:
         policy_provider: PolicyProvider | None = None,
         allow_unsafe_internal: bool = False,
         graph_mode: GraphMode = "governed_hybrid",
+        crystallization_mode: str = "governed_progressive",
+        graph_storage: str = "split",
         embedding_provider: EmbeddingProvider | None = None,
         vector_index: VectorIndex | None = None,
         rerank_provider: RerankProvider | None = None,
@@ -107,6 +123,8 @@ class MemoryRuntime:
             mode=mode,
             model_policy_enabled=policy_provider is not None,
             graph_mode=graph_mode,
+            crystallization_mode=crystallization_mode,
+            graph_storage=graph_storage,
         )
         _write_config(root / "config.toml", config)
         runtime = NeuroMemRuntime(
@@ -121,6 +139,8 @@ class MemoryRuntime:
             policy_provider=policy_provider,
             allow_unsafe_internal=allow_unsafe_internal,
             graph_mode=graph_mode,
+            crystallization_mode=crystallization_mode,
+            graph_storage=graph_storage,
             embedding_provider=embedding_provider,
             vector_index=vector_index,
             rerank_provider=rerank_provider,
@@ -143,6 +163,8 @@ class MemoryRuntime:
             agent_id=str(data.get("agent_id", "local-agent")),
             mode=str(data.get("mode", "lite")),
             graph_mode=str(data.get("graph_mode", "governed_hybrid")),  # type: ignore[arg-type]
+            crystallization_mode=str(data.get("crystallization_mode", "governed_progressive")),
+            graph_storage=str(data.get("graph_storage", "split")),
         )
 
     @property
@@ -269,11 +291,24 @@ class MemoryRuntime:
         query: str | MemoryQuery,
         budget_tokens: int = 800,
         filters: dict[str, object] | None = None,
+        *,
+        lens: str = "auto",
+        namespace: str | None = None,
+        top_k: int | None = None,
     ) -> MemoryContext:
         query_obj = query if isinstance(query, MemoryQuery) else MemoryQuery(query=query, budget_tokens=budget_tokens, filters=filters or {})
+        resolved_lens = self._resolve_lens(query_obj.query, lens)
+        query_obj.filters["retrieval_lens"] = resolved_lens
+        if top_k is not None:
+            query_obj.filters["top_k"] = top_k
         query_obj.filters.update(self._semantic_filters(query_obj.query))
+        if namespace is not None:
+            query_obj.filters["namespace"] = namespace
         before_states = self._memory_states()
         results, trace = self._runtime.retrieve_with_trace(query_obj.query, filters=query_obj.filters, budget_tokens=query_obj.budget_tokens, task_id=query_obj.query)
+        results = self._apply_retrieval_lens(results, resolved_lens)
+        if top_k is not None:
+            results = results[:top_k]
         after_states = self._memory_states()
         text = "\n".join(f"- [{result.score:.2f}] {result.memory.content}" for result in results)
         trace_id = trace.trace_id
@@ -297,6 +332,7 @@ class MemoryRuntime:
                 ).to_dict()
             }
         )
+        trace.query_plan["retrieval_lens"] = resolved_lens
         txn = trace.to_transactions()[0]
         access_deltas = _memory_deltas_for_fields(
             before_states,
@@ -348,6 +384,7 @@ class MemoryRuntime:
                     "reranker_score": candidate_details.get(result.memory.id, {}).get("reranker_score", result.score) if isinstance(candidate_details.get(result.memory.id, {}), dict) else result.score,
                     "lifecycle_reason": candidate_details.get(result.memory.id, {}).get("lifecycle_reason", "active") if isinstance(candidate_details.get(result.memory.id, {}), dict) else "active",
                     "provenance_ids": list(result.memory.evidence),
+                    "retrieval_lens": resolved_lens,
                 }
                 for result in results
             ],
@@ -430,9 +467,16 @@ class MemoryRuntime:
                 sleep_clusters=sleep_clusters,
                 mutation_trace={"operation": "sleep_graph_compiler"},
             ) or {}
+            sleep_crystallization = self._commit_sleep_crystallization(
+                sleep_clusters=sleep_clusters,
+                evidence_ids=[f"sleep:{transaction_id}"],
+                transaction_id=transaction_id,
+            )
             memories_after = self._memory_states()
             deltas = _memory_deltas_for_fields(memories_before, memories_after, fields=None, reason="governed sleep")
             graph_deltas = list(((sleep_graph.get("result") or {}).get("graph_deltas", []))) if isinstance(sleep_graph.get("result"), dict) else []
+            if isinstance(sleep_crystallization.get("result"), dict):
+                graph_deltas.extend(list(sleep_crystallization["result"].get("graph_deltas", [])))
             targets = sorted({str(delta["memory_id"]) for delta in deltas if delta.get("memory_id")})
             lifecycle_deltas = [delta for delta in deltas if delta.get("field") in {"maturity", "type", "summary", "tags", "supersedes", "derived_from"}]
             memory_delta_objs = [_memory_delta_from_dict(delta) for delta in deltas]
@@ -468,7 +512,7 @@ class MemoryRuntime:
                     memory_delta=deltas,
                     lifecycle_delta=lifecycle_deltas,
                     graph_delta=graph_deltas,
-                    audit={"consolidation_report": consolidation_report, "sleep_graph": sleep_graph},
+                    audit={"consolidation_report": consolidation_report, "sleep_graph": sleep_graph, "sleep_crystallization": sleep_crystallization},
                 ),
                 conn=conn,
             )
@@ -504,7 +548,7 @@ class MemoryRuntime:
                     targets=[str(item) for item in consolidation_report.get("compressed_memory_ids", [])],
                     memory_delta=[delta for delta in deltas if delta.get("field") in {"type", "summary", "tags", "consolidation_count"}],
                     graph_delta=graph_deltas,
-                    audit={"compressed_memory_ids": consolidation_report.get("compressed_memory_ids", []), "sleep_graph": sleep_graph},
+                    audit={"compressed_memory_ids": consolidation_report.get("compressed_memory_ids", []), "sleep_graph": sleep_graph, "sleep_crystallization": sleep_crystallization},
                 ),
                 conn=conn,
             )
@@ -523,7 +567,7 @@ class MemoryRuntime:
                     memory_delta=deltas,
                     lifecycle_delta=lifecycle_deltas,
                     graph_delta=graph_deltas,
-                    audit={"consolidation_report": consolidation_report, "sleep_graph": sleep_graph},
+                    audit={"consolidation_report": consolidation_report, "sleep_graph": sleep_graph, "sleep_crystallization": sleep_crystallization},
                 ),
                 conn=conn,
             )
@@ -560,6 +604,12 @@ class MemoryRuntime:
             "rejected_deltas": [],
             "compiled_nodes": compiled_nodes,
             "suppressed_stale_paths": [str(item) for item in consolidation_report.get("archived_memory_ids", [])],
+            "frame_candidates": sleep_crystallization.get("frame_candidates", []),
+            "validated_frames": sleep_crystallization.get("validated_frames", []),
+            "associative_promotions": sleep_crystallization.get("associative_promotions", []),
+            "logic_promotions": sleep_crystallization.get("logic_promotions", []),
+            "compiled_schemas": sleep_crystallization.get("compiled_schemas", []),
+            "rejected_crystallizations": sleep_crystallization.get("rejected_crystallizations", []),
         }
         return {**consolidation_report, "sleep": sleep_report, "ledger_transaction_id": transaction_id}
 
@@ -622,6 +672,44 @@ class MemoryRuntime:
         if self._runtime.store is None:
             return {}
         return {item.id: item.to_record() for item in self._runtime.store.list_memories(namespace=self.config.namespace)}
+
+    def _resolve_lens(self, query: str, lens: str) -> str:
+        if lens != "auto":
+            if lens not in {"associative", "logical", "procedural", "historical", "audit"}:
+                raise ValueError(f"unsupported retrieval lens: {lens}")
+            return lens
+        lowered = query.lower()
+        if any(term in lowered for term in ["why", "audit", "ledger", "evidence", "trusted", "written"]):
+            return "audit"
+        if any(term in lowered for term in ["history", "historical", "previous", "old", "superseded", "changed"]):
+            return "historical"
+        if any(term in lowered for term in ["how", "procedure", "workflow", "steps", "fix", "run"]):
+            return "procedural"
+        if any(term in lowered for term in ["current", "fact", "preference", "constraint", "should", "must"]):
+            return "logical"
+        return "associative"
+
+    def _apply_retrieval_lens(self, results: list[object], lens: str) -> list[object]:
+        if self._runtime.store is None or lens in {"associative", "historical", "audit"}:
+            return results
+        if lens == "logical":
+            allowed: set[str] = set()
+            for frame in self._runtime.store.list_logic_nodes(namespace=self.config.namespace):
+                if frame.lifecycle_state == "candidate":
+                    continue
+                if frame.commitment_level not in {"validated_logic", "compiled_schema"}:
+                    continue
+                allowed.update(frame.source_memory_ids)
+            return [result for result in results if getattr(getattr(result, "memory", None), "id", None) in allowed]
+        if lens == "procedural":
+            allowed = {
+                memory_id
+                for frame in self._runtime.store.list_logic_nodes(namespace=self.config.namespace)
+                if frame.frame_type in {"procedure", "schema", "failure_pattern"} and frame.lifecycle_state in {"validated", "compiled", "mature"}
+                for memory_id in frame.source_memory_ids
+            }
+            return [result for result in results if getattr(getattr(result, "memory", None), "type", None) == "procedural" or getattr(getattr(result, "memory", None), "id", None) in allowed]
+        return results
 
     def _semantic_filters(self, query: str) -> dict[str, object]:
         filters: dict[str, object] = {"namespace": self.config.namespace}
@@ -712,6 +800,90 @@ class MemoryRuntime:
             "result": result.to_dict(),
         }
 
+    def _commit_sleep_crystallization(self, *, sleep_clusters: list[list[str]], evidence_ids: list[str], transaction_id: str) -> dict[str, object]:
+        if self._runtime.store is None:
+            return {"frame_candidates": [], "validated_frames": [], "associative_promotions": [], "logic_promotions": [], "compiled_schemas": [], "rejected_crystallizations": []}
+        memories = self._runtime.store.list_memories(namespace=self.config.namespace)
+        if not sleep_clusters:
+            sleep_clusters = _fallback_sleep_clusters(memories)
+        if not sleep_clusters:
+            return {"frame_candidates": [], "validated_frames": [], "associative_promotions": [], "logic_promotions": [], "compiled_schemas": [], "rejected_crystallizations": []}
+        context = GraphBuildContext(
+            namespace=self.config.namespace,
+            memories=memories,
+            selected_memory_ids=[memory_id for cluster in sleep_clusters for memory_id in cluster],
+            target_memory_ids=[],
+            evidence_ids=evidence_ids,
+            sleep_clusters=sleep_clusters,
+            outcome="success",
+            proposer="deterministic",
+        )
+        compiled_frames = self._crystallization_planner.plan_sleep_frames(context)
+        if not compiled_frames:
+            return {"frame_candidates": [], "validated_frames": [], "associative_promotions": [], "logic_promotions": [], "compiled_schemas": [], "rejected_crystallizations": []}
+        by_id = context.memory_by_id()
+        source_frames = []
+        logic_deltas: list[LogicEdgeProposal] = []
+        for compiled in compiled_frames:
+            for memory_id in compiled.source_memory_ids:
+                memory = by_id.get(memory_id)
+                if memory is None:
+                    continue
+                source_frame = frame_proposal_for_memory(memory, context=context, validated=False)
+                source_frames.append(source_frame)
+                logic_deltas.append(
+                    LogicEdgeProposal(
+                        operation="add_edge",
+                        source_frame_id=source_frame.frame_id or frame_id_for_memory(memory, infer_frame_type(memory)),
+                        target_frame_id=compiled.frame_id or "",
+                        source_memory_id=memory.id,
+                        target_memory_id=None,
+                        relation="derived_from",
+                        weight=0.42,
+                        confidence=0.72,
+                        proof_obligation="sleep replay cluster links source experience to compiled frame",
+                        evidence_ids=list(compiled.evidence_ids),
+                        reason="sleep crystallization derived source experience into compiled frame",
+                        proposer="deterministic",
+                        lifecycle_state="captured",
+                    )
+                )
+        frame_deltas = list({(frame.frame_id or frame.content): frame for frame in [*source_frames, *compiled_frames]}.values())
+        policy = MemoryPolicyV2(
+            intent="consolidate",
+            proposer="SleepCrystallizationPlanner",
+            proposal_source="deterministic",
+            evidence_chain=[EvidenceRef(event_id=evidence_id, source="sleep_crystallization") for evidence_id in evidence_ids],
+            target_selector={"memory_ids": context.selected_memory_ids, "namespace": self.config.namespace},
+            frame_deltas=frame_deltas,
+            logic_deltas=logic_deltas,
+            rollback_plan=f"rollback sleep crystallization {transaction_id}",
+        )
+        result = self._executor.execute(
+            policy,
+            PolicyExecutionContext(
+                phase="sleep_crystallization",
+                task="governed progressive crystallization",
+                query="sleep_crystallization",
+                state={"status": "success", "target_memory_ids": context.selected_memory_ids},
+                namespace=self.config.namespace,
+                agent_id=self.config.agent_id,
+            ),
+        )
+        self._persist_trace(result.trace.trace_id, result.trace.to_dict())
+        approved = result.validated_mutation.approved
+        frame_payloads = [frame.model_dump(mode="json") for frame in frame_deltas]
+        logic_payloads = [delta.model_dump(mode="json") for delta in logic_deltas]
+        return {
+            "frame_candidates": frame_payloads,
+            "validated_frames": frame_payloads if approved else [],
+            "associative_promotions": [],
+            "logic_promotions": logic_payloads if approved else [],
+            "compiled_schemas": [frame.model_dump(mode="json") for frame in compiled_frames] if approved else [],
+            "rejected_crystallizations": [] if approved else [step.model_dump() for step in result.validated_mutation.validator_trace if not step.passed],
+            "result": result.to_dict(),
+        }
+
 
 def _policy_forget_operation(action: str) -> str:
     return {
@@ -729,7 +901,7 @@ def _write_config(path: Path, config: RuntimeConfig) -> None:
         return
     values = config.to_dict()
     lines = []
-    for key in ["namespace", "db_path", "traces_path", "agent_id", "mode", "version"]:
+    for key in ["namespace", "db_path", "traces_path", "agent_id", "mode", "graph_mode", "crystallization_mode", "graph_storage", "version"]:
         lines.append(f'{key} = "{values[key]}"')
     lines.append(f"model_policy_enabled = {str(config.model_policy_enabled).lower()}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -777,3 +949,21 @@ def _lifecycle_delta_from_dict(delta: dict[str, object]) -> LifecycleDelta:
         reason=str(delta.get("reason", "")),
         rollback_state=str(delta.get("old", "")) if delta.get("old") is not None else None,
     )
+
+
+def _fallback_sleep_clusters(memories: list[MemoryItem]) -> list[list[str]]:
+    groups: dict[str, list[str]] = {}
+    for memory in memories:
+        terms = [term.lower() for term in [*memory.entities, *memory.keywords] if len(term) > 2]
+        if not terms:
+            terms = [term.strip(".,:;()[]`'\"?").lower() for term in memory.content.split() if len(term.strip(".,:;()[]`'\"?")) > 4]
+        for term in sorted(set(terms))[:4]:
+            groups.setdefault(term, []).append(memory.id)
+    clusters = []
+    seen: set[tuple[str, ...]] = set()
+    for ids in groups.values():
+        unique = tuple(sorted(set(ids)))
+        if len(unique) >= 2 and unique not in seen:
+            seen.add(unique)
+            clusters.append(list(unique))
+    return clusters[:3]

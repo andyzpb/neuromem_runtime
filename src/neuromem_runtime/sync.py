@@ -28,6 +28,8 @@ class MemoryRuntime:
         policy_provider: PolicyProvider | None = None,
         allow_unsafe_internal: bool = False,
         graph_mode: GraphMode = "governed_hybrid",
+        crystallization_mode: str = "governed_progressive",
+        graph_storage: str = "split",
         embedding_provider: EmbeddingProvider | None = None,
         vector_index: VectorIndex | None = None,
         rerank_provider: RerankProvider | None = None,
@@ -46,6 +48,8 @@ class MemoryRuntime:
                     policy_provider=policy_provider,
                     allow_unsafe_internal=allow_unsafe_internal,
                     graph_mode=graph_mode,
+                    crystallization_mode=crystallization_mode,
+                    graph_storage=graph_storage,
                     embedding_provider=embedding_provider,
                     vector_index=vector_index,
                     rerank_provider=rerank_provider,
@@ -71,8 +75,8 @@ class MemoryRuntime:
     def observe_and_commit(self, event: MemoryEvent | dict[str, object]) -> Any:
         return _run(self._async_runtime.observe_and_commit(event))
 
-    def query(self, query: str | MemoryQuery, budget_tokens: int = 800, filters: dict[str, object] | None = None) -> Any:
-        return _run(self._async_runtime.query(query, budget_tokens=budget_tokens, filters=filters))
+    def query(self, query: str | MemoryQuery, budget_tokens: int = 800, filters: dict[str, object] | None = None, *, lens: str = "auto", namespace: str | None = None, top_k: int | None = None) -> Any:
+        return _run(self._async_runtime.query(query, budget_tokens=budget_tokens, filters=filters, lens=lens, namespace=namespace, top_k=top_k))
 
     def propose(self, value: str | dict[str, object]) -> MemoryPolicy | MemoryPolicyV2:
         return _run(self._async_runtime.propose(value))

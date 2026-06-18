@@ -7,6 +7,9 @@ from neuromem.core.policy import MemoryPolicy, MemoryTrace, MemoryTransactionRec
 from neuromem_runtime.ledger import ExperienceEvent
 
 
+RetrievalLens = str
+
+
 @dataclass(slots=True)
 class RuntimeConfig:
     namespace: str = "default"
@@ -17,6 +20,8 @@ class RuntimeConfig:
     mode: str = "lite"
     model_policy_enabled: bool = False
     graph_mode: str = "governed_hybrid"
+    crystallization_mode: str = "governed_progressive"
+    graph_storage: str = "split"
     version: str = "0.2.0"
 
     def to_dict(self) -> dict[str, object]:
@@ -29,6 +34,8 @@ class RuntimeConfig:
             "mode": self.mode,
             "model_policy_enabled": self.model_policy_enabled,
             "graph_mode": self.graph_mode,
+            "crystallization_mode": self.crystallization_mode,
+            "graph_storage": self.graph_storage,
             "version": self.version,
         }
 
@@ -121,5 +128,6 @@ __all__ = [
     "MemoryPolicy",
     "MemoryTransaction",
     "MemoryTrace",
+    "RetrievalLens",
     "event_to_dict",
 ]

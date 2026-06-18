@@ -18,9 +18,9 @@ NeuroMem gives you that local runtime:
 
 - `observe` records immutable experience events.
 - `commit` validates memory mutations before they touch storage.
-- `query` returns prompt-ready context with reasons and trace ids.
+- `query` returns prompt-ready context with reasons, trace ids, and an optional retrieval lens.
 - `forget` inhibits, invalidates, archives, compresses, or deletes by policy.
-- `sleep` consolidates repeated experience into more useful memory.
+- `sleep` consolidates repeated experience into more useful memory and compiled frames.
 - `replay_trace` and the ledger explain what happened.
 
 Base install is SQLite + trace files. No Docker, API key, hosted store, vector database, LangGraph import, or model call is required.
@@ -45,7 +45,7 @@ async def main() -> None:
         "keywords": ["login", "session", "redirect"],
     })
 
-    ctx = await memory.query("Have we fixed a similar login/session bug before?")
+    ctx = await memory.query("Have we fixed a similar login/session bug before?", lens="associative")
 
     print(ctx.to_prompt())
     print(ctx.selected_memory_ids)
@@ -94,15 +94,19 @@ Memory cards -> FTS5/BM25 + lexical/entity/current candidates
 
 Dense embeddings, query rewrite, HyDE, alias expansion, and rerankers are opt-in provider surfaces. The base package ships local protocol interfaces plus deterministic test-friendly components; it does not install hosted models or call the network.
 
-## Governed Memory Graph
+`query(..., lens="auto")` chooses a deterministic retrieval lens. You can pass `associative`, `logical`, `procedural`, `historical`, or `audit` when the caller needs a specific memory surface.
 
-NeuroMem builds graph edges through bounded mutation proposals:
+## Progressive Crystallization
 
-```text
-candidate generation -> relation proposal -> graph validator -> transaction commit -> outcome/sleep plasticity
-```
+NeuroMem does not turn every event into a logical graph. It uses governed progressive crystallization:
 
-Deterministic code proposes safe candidates from traces, evidence, retrieval co-use, and sleep clusters. Optional semantic proposers may classify candidate relations, but edges only become durable after validation and ledgered transaction commit.
+- raw experience stays in the append-only ledger
+- low-commitment links go into an associative graph
+- candidate facts, procedures, preferences, constraints, entities, schemas, and failure patterns become Frames
+- validated logical relations connect Frames in a separate logic graph
+- sleep/replay promotes repeated evidence into compiled schema or procedure Frames
+
+SQLite stores the associative graph, logic nodes, and logic edges in separate tables. `list_edges()` remains an internal projection for activation retrieval, but split graph storage is the baseline.
 
 ## Safety Model
 
@@ -113,7 +117,7 @@ Deterministic code proposes safe candidates from traces, evidence, retrieval co-
 - Unsafe access to the bundled core runtime requires explicit `allow_unsafe_internal=True` opt-in.
 - Ledger reads and CLI ledger commands are namespace-scoped.
 - Retrieval access counter updates are ledgered memory effects.
-- Graph edges are validated memory mutations, not direct model writes.
+- Associative and logic graph changes are validated memory mutations, not direct model writes.
 - Ledger events are sequence-ordered, hash-linked, and replayable.
 
 ## Integrations
