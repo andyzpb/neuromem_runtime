@@ -600,7 +600,9 @@ def _edge_transfer(edge: MemoryEdge, *, source_id: str, plan: QueryPlanV2) -> tu
         neighbor = edge.target_id if edge.source_id == source_id else edge.source_id
         return 0.0, f"conflict_via_contradicts:{neighbor}"
     if edge.relation == "supersedes" and edge.target_id == source_id:
-        return 0.0, f"superseded_by:{edge.source_id}"
+        return 1.0, None
+    if edge.relation == "supersedes" and edge.source_id == source_id:
+        return 0.0, f"suppressed_by_supersedes:{edge.target_id}"
     if edge.inhibition_score >= 0.8 or edge.contradiction_penalty >= 0.8:
         return 0.0, "edge_inhibited_or_contradicted"
     transfer = (

@@ -1,57 +1,135 @@
-# NeuroMem Runtime API
+# NeuroMem Runtime Manual
 
-## Entry Point
+## Runtime Model
+
+NeuroMem Runtime is a local-first Memory Mutation Runtime for long-running LLM agents. The public package is `neuromem-runtime`; application code imports `neuromem_runtime`.
+
+The runtime separates three things:
+
+- **Experience events**: immutable observations recorded through `observe()`.
+- **Memory mutations**: writes, updates, forgetting, consolidation, graph updates, and access effects.
+- **Ledger records**: hash-linked transaction events that explain and replay memory effects.
+
+The product rule is simple: durable memory changes go through `PolicyExecutor`, deterministic validation, delta capture, version snapshots, and ledger events.
+
+## Workspace
 
 ```python
 memory = await MemoryRuntime.local(namespace="default", path=".neuromem")
 ```
 
-This creates a local workspace with SQLite memory storage and trace files.
-The SQLite database also stores experience events and ledger events.
+This creates:
 
-## Actions
+```text
+.neuromem/
+  config.toml
+  memory.sqlite3
+  traces/
+```
+
+The SQLite database stores memories, memory cards, graph edges, experience events, ledger events, memory versions, and edge versions.
+
+## Public Actions
 
 | Method | Purpose |
 | --- | --- |
-| `observe(event)` | Record an experience event and, by default, auto-commit a compatible memory item. |
-| `observe(event, auto_commit=False)` | Record only an immutable `ExperienceEvent` and return its ids in an `EvidenceBundle`. |
-| `query(query, budget_tokens=800)` | Return a prompt-ready `MemoryContext` through the Activation Retrieval Engine. |
-| `propose(input)` | Produce a deterministic structured `MemoryPolicy`. |
-| `commit(policy)` | Validate and apply a governed policy. |
+| `observe(event)` | Record only an immutable `ExperienceEvent`; no long-term memory is written. |
+| `observe_and_commit(event)` | Explicitly validate and commit a long-term memory from an event. |
+| `query(query, budget_tokens=800)` | Return a prompt-ready `MemoryContext` through activation retrieval. |
+| `propose(input)` | Produce a structured `MemoryPolicy` with the configured provider. |
+| `commit(policy)` | Validate and apply governed memory changes. |
 | `mutate(policy)` | Alias for `commit(policy)`. |
-| `sleep()` | Run replay consolidation. |
+| `sleep()` | Run ledgered replay consolidation and lifecycle updates. |
 | `forget(memory_id, action="inhibit")` | Apply governed forgetting. |
-| `replay_trace(trace_id)` | Return replayable trace data. |
+| `replay_trace(trace_id)` | Return trace plus ledger-backed deltas and replay data. |
 
 Physical deletion requires `authorize_delete=True`.
 
-`query(...)` uses a single retrieval transaction. The returned `MemoryContext`
-and persisted trace share the same selected ids, scores, and trace id.
+## Strict Observation
 
-`query(...)` accepts optional filters: `retrieval_mode`, `retrieval_channels`,
-`rerank_mode`, `graph_activation`, `historical`, `require_provenance`, and
-`allow_abstain`.
+`observe()` records evidence only:
 
-`MemoryContext.results` includes `why_retrieved`, `score_components`,
-`graph_paths`, `reranker_score`, `lifecycle_reason`, and `provenance_ids`.
-
-## Activation Retrieval
-
-Base retrieval is local and deterministic:
-
-```text
-QueryPlanV2 -> Contextual Memory Cards -> FTS5/BM25 + lexical/entity/current/procedural/canonical candidates
-            -> RRF fusion -> PPR-style graph activation -> lifecycle/provenance gate
-            -> lite rerank -> context packing -> retrieval ledger
+```python
+event = await memory.observe({
+    "type": "task_result",
+    "content": "Session refresh order fixed the login redirect loop.",
+    "task": "Fix login",
+})
 ```
 
-Dense embeddings, late-interaction retrieval, cross-encoder reranking, and LLM
-listwise reranking are optional adapter paths. They may rank candidates, but they
-must not mutate memory.
+The returned `EvidenceBundle` includes `event_id` and `content_hash`. To create durable memory from that event, use a policy and `commit()`, or the explicit convenience path:
+
+```python
+bundle = await memory.observe_and_commit({
+    "type": "task_result",
+    "content": "Session refresh order fixed the login redirect loop.",
+    "task": "Fix login",
+})
+```
+
+`observe_and_commit()` still goes through evidence validation, `PolicyExecutor`, ledger phases, and memory version snapshots.
+
+## Commit Path
+
+`commit()` accepts both the compatibility `MemoryPolicy` and forward `MemoryPolicyV2`:
+
+```python
+trace = await memory.commit(policy)
+```
+
+The returned trace includes `mutation_execution_result`:
+
+- `validated_mutation`
+- `created_memory_ids`
+- `updated_memory_ids`
+- `deleted_memory_ids`
+- `memory_deltas`
+- `graph_deltas`
+- `lifecycle_deltas`
+- `index_deltas`
+
+Rejected policies write `validation_rejected` and `audit_finalized` ledger events and do not mutate memory, graph, lifecycle state, or indexes.
+
+## Validator Stack
+
+The product executor uses `ValidatorStack` before mutation:
+
+- `SchemaValidator`
+- `EvidenceValidator`
+- `ProvenanceValidator`
+- `TemporalValidator`
+- `ConflictValidator`
+- `PrivacyAclValidator`
+- `DeletionGuardValidator`
+- `PoisoningRiskValidator`
+- `LifecycleTransitionValidator`
+- `IndexConsistencyValidator`
+
+The implemented gates fail closed for unsupported operations, missing evidence, unknown provenance, unsafe deletion, poisoning phrases, unauthorized private-memory mutation, stale target updates without historical intent, invalid lifecycle transitions, and missing post-commit memory-card index rows.
 
 ## Ledger
 
-`MemoryRuntime.local(...)` exposes `memory.ledger` for transaction audit.
+`MemoryRuntime.local(...)` exposes `memory.ledger`.
+
+Ledger transactions are split into phase events:
+
+- `proposal_recorded`
+- `validation_approved` or `validation_rejected`
+- `memory_delta_committed`
+- `index_updated`
+- `graph_delta_committed`
+- `lifecycle_delta_committed`
+- `audit_finalized`
+
+Useful methods:
+
+```python
+memory.ledger.verify_hash_chain()
+memory.ledger.reconstruct(to_transaction_id=None)
+memory.ledger.replay_trace(trace_id)
+memory.ledger.why_written(memory_id)
+memory.ledger.retrieval_explain(trace_id)
+```
 
 CLI commands:
 
@@ -64,33 +142,108 @@ nmem ledger diff TXN_A TXN_B
 nmem retrieval explain TRACE_ID
 ```
 
+## Activation Retrieval
+
+Base retrieval is local and deterministic:
+
+```text
+QueryPlanV2 -> Contextual Memory Cards
+            -> FTS5/BM25 + lexical/entity/current/procedural/canonical candidates
+            -> RRF fusion
+            -> PPR-style graph activation
+            -> lifecycle/provenance gate
+            -> lite rerank
+            -> context packing
+            -> retrieval ledger
+```
+
+`query(...)` uses one retrieval transaction. The returned `MemoryContext`, persisted trace, and retrieval ledger share the same selected ids, suppression reasons, scores, graph paths, and trace id.
+
+Optional query filters:
+
+- `retrieval_mode`
+- `retrieval_channels`
+- `rerank_mode`
+- `graph_activation`
+- `historical`
+- `require_provenance`
+- `allow_abstain`
+
+`MemoryContext.results` includes:
+
+- `why_retrieved`
+- `score_components`
+- `graph_paths`
+- `reranker_score`
+- `lifecycle_reason`
+- `provenance_ids`
+
+Retrieval access effects, such as `access_count`, `activation_count`, and `last_accessed_at`, are ledgered as memory deltas.
+
+Dense embeddings, late-interaction retrieval, cross-encoder reranking, and LLM listwise reranking are optional adapter paths. They may rank candidates, but they must not mutate memory.
+
+## Forgetting
+
+Supported actions:
+
+- `decay`
+- `inhibit`
+- `invalidate`
+- `archive`
+- `compress`
+- `delete`
+
+Deletion is rejected unless `authorize_delete=True`. Normal forgetting keeps audit history and uses lifecycle transitions before destructive behavior.
+
+## Sleep
+
+`sleep()` runs replay consolidation and writes a governed sleep transaction. The report includes:
+
+- processed memory count
+- replay clusters
+- promoted/compressed/archived memory ids
+- memory/lifecycle deltas
+- ledger transaction ids
+
 ## Policy Providers
 
-`MemoryRuntime.local(...)` accepts an optional `policy_provider`.
+The base package never calls an external model. To use an LLM for memory-policy proposals, pass a provider explicitly:
 
-Built-in providers:
+```python
+provider = nmem.DeepSeekPolicyProvider(
+    api_key_env="DEEPSEEK_API_KEY",
+    model="deepseek-v4-flash",
+)
 
-- `DeterministicPolicyProvider`
-- `OpenAICompatiblePolicyProvider`
-- `DeepSeekPolicyProvider`
+memory = await nmem.MemoryRuntime.local(
+    namespace="demo/repo",
+    policy_provider=provider,
+)
+```
 
-Providers return structured `MemoryPolicy` objects. They do not mutate memory.
-All mutations still pass through `commit()` validation.
+Providers return structured policy proposals. The runtime still validates and commits them.
 
-Provider JSON can also be validated as `MemoryPolicyV2` using Pydantic. The v2
-policy shape is the forward path for governed mutation transactions.
+## Exports
 
-## Governed Runtime Surfaces
+The package exports:
 
-The package exports the protocol surfaces used by the governed mutation runtime:
-
+- `MemoryRuntime`
+- `RuntimeConfig`
+- `MemoryEvent`
+- `MemoryQuery`
+- `MemoryContext`
+- `EvidenceBundle`
 - `ExperienceEvent`
+- `MemoryPolicy`
 - `MemoryPolicyV2`
 - `ValidatedMutation`
 - `MemoryDelta`
 - `GraphDelta`
 - `LifecycleDelta`
 - `IndexDelta`
+- `ExecutionDeltaPlan`
+- `MutationExecutionResult`
+- `MemorySnapshot`
 - `LedgerEvent`
 - `MemoryLedger`
 - `LifecycleStateMachine`
@@ -108,11 +261,6 @@ The package exports the protocol surfaces used by the governed mutation runtime:
 - `PlasticityEngine`
 - `SleepPlanner`
 
-Base retrieval remains local and deterministic. Dense vectors, learned sparse
-retrieval, multi-vector retrieval, and strong reranking should be implemented
-through explicit adapters.
-
 ## Packaging Boundary
 
-`neuromem-runtime` v0.1.5 is self-contained. Application code should import
-`neuromem_runtime`; other bundled packages are implementation details.
+`neuromem-runtime` v0.2.0 is self-contained. User code should import `neuromem_runtime`; bundled implementation packages are internal compatibility layers.

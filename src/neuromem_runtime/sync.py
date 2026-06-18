@@ -37,6 +37,9 @@ class MemoryRuntime:
     def observe(self, event: MemoryEvent | dict[str, object]) -> Any:
         return _run(self._async_runtime.observe(event))
 
+    def observe_and_commit(self, event: MemoryEvent | dict[str, object]) -> Any:
+        return _run(self._async_runtime.observe_and_commit(event))
+
     def query(self, query: str | MemoryQuery, budget_tokens: int = 800, filters: dict[str, object] | None = None) -> Any:
         return _run(self._async_runtime.query(query, budget_tokens=budget_tokens, filters=filters))
 

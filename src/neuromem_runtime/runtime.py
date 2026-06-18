@@ -6,15 +6,16 @@ from pathlib import Path
 
 from neuromem.core.policy import ConsolidationPlan, ForgetPlan, MemoryPolicy, RetrievalPlan, WritePlan
 from neuromem.core.runtime import NeuroMemRuntime
-from neuromem.core.validator import PolicyValidator
 from neuromem.stores.sqlite_store import SQLiteMemoryStore
 
 from neuromem_runtime.executor import PolicyExecutionContext, PolicyExecutor
 from neuromem_runtime.ledger import ExperienceEvent, LedgerEvent, MemoryLedger
+from neuromem_runtime.policy_v2 import MemoryPolicyV2
 from neuromem_runtime.providers import DeterministicPolicyProvider, PolicyProvider
 from neuromem_runtime.retrieval import RetrievalTraceMetadata
 from neuromem_runtime.sleep import LedgerReport, ReplayBatch, SleepPlanner, SleepReport
 from neuromem_runtime.types import EvidenceBundle, MemoryContext, MemoryEvent, MemoryQuery, RuntimeConfig, event_to_dict
+from neuromem_runtime.validators import ValidatorStack
 
 
 class MemoryRuntime:
@@ -23,10 +24,10 @@ class MemoryRuntime:
     def __init__(self, config: RuntimeConfig, runtime: NeuroMemRuntime, policy_provider: PolicyProvider | None = None) -> None:
         self.config = config
         self._runtime = runtime
-        self._validator = PolicyValidator()
+        self._validator_stack = ValidatorStack()
         self._policy_provider = policy_provider or DeterministicPolicyProvider()
         self._ledger = MemoryLedger(config.db_path)
-        self._executor = PolicyExecutor(runtime, self._ledger, self._validator)
+        self._executor = PolicyExecutor(runtime, self._ledger, self._validator_stack)
         self._sleep_planner = SleepPlanner()
 
     @classmethod
@@ -83,7 +84,7 @@ class MemoryRuntime:
     def ledger(self) -> MemoryLedger:
         return self._ledger
 
-    async def observe(self, event: MemoryEvent | dict[str, object], *, auto_commit: bool = True) -> EvidenceBundle:
+    async def observe(self, event: MemoryEvent | dict[str, object], *, auto_commit: bool = False) -> EvidenceBundle:
         payload = event_to_dict(event)
         content = str(payload.get("content", ""))
         if not content:
@@ -96,48 +97,81 @@ class MemoryRuntime:
                 metadata={key: value for key, value in payload.items() if key != "content"},
             )
         )
-        if not auto_commit:
-            event_txn = f"txn_{experience.event_id}"
-            self._ledger.append(
-                LedgerEvent(
-                    transaction_id=event_txn,
-                    phase="AUDITED",
-                    event_type="experience_observed",
-                    operation="NOOP",
-                    proposer="system",
-                    evidence=[experience.to_dict()],
-                    audit={"experience_event": experience.to_dict()},
-                )
-            )
-            return EvidenceBundle(
-                memory_id=None,
-                content=content,
-                evidence=[],
-                event_id=experience.event_id,
-                content_hash=experience.content_hash,
-            )
-        payload.setdefault("evidence", experience.event_id)
-        item = self._runtime.observe(payload)
-        if item is None:
-            return EvidenceBundle(memory_id=None, content=content, evidence=[], event_id=experience.event_id, content_hash=experience.content_hash)
-        transaction_id = f"txn_observe_{item.id}"
-        self._ledger.record_memory_version(item.id, transaction_id, item.to_record())
         self._ledger.append(
             LedgerEvent(
-                transaction_id=transaction_id,
-                phase="COMMITTED",
-                event_type="experience_committed",
-                operation="ADD",
-                proposer="deterministic",
-                validator_decision="auto_commit_compat",
+                transaction_id=f"txn_{experience.event_id}",
+                phase="AUDITED",
+                event_type="experience_observed",
+                operation="NOOP",
+                proposer="system",
                 evidence=[experience.to_dict()],
-                targets=[item.id],
-                memory_delta=[{"memory_id": item.id, "field": "created", "old": None, "new": item.to_record()}],
-                index_delta=[{"index": "sqlite", "status": "updated", "memory_id": item.id}],
-                audit={"compatibility": "observe(auto_commit=True)", "experience_event": experience.to_dict()},
+                audit={"experience_event": experience.to_dict(), "auto_commit": auto_commit},
             )
         )
-        return EvidenceBundle(memory_id=item.id, content=item.content, memory_type=item.type, evidence=list(item.evidence), event_id=experience.event_id, content_hash=experience.content_hash)
+        if not auto_commit:
+            return EvidenceBundle(memory_id=None, content=content, evidence=[], event_id=experience.event_id, content_hash=experience.content_hash)
+        return await self.observe_and_commit({**payload, "evidence": experience.event_id}, experience=experience)
+
+    async def observe_and_commit(self, event: MemoryEvent | dict[str, object], *, experience: ExperienceEvent | None = None) -> EvidenceBundle:
+        payload = event_to_dict(event)
+        content = str(payload.get("content", ""))
+        if not content:
+            raise ValueError("observe_and_commit() requires a non-empty content field")
+        if experience is None:
+            observed = await self.observe(payload, auto_commit=False)
+            if observed.event_id is None:
+                raise RuntimeError("observe_and_commit() could not record experience event")
+            stored = self._ledger.get_experience(observed.event_id)
+            if stored is None:
+                raise RuntimeError("observe_and_commit() could not load recorded experience event")
+            experience = stored
+        memory_type = "episodic"
+        if payload.get("type") == "user_preference":
+            memory_type = "preference"
+        elif payload.get("type") == "rule":
+            memory_type = "procedural"
+        elif payload.get("type") == "fact":
+            memory_type = "semantic"
+        policy = MemoryPolicy(
+            retrieval=RetrievalPlan(enabled=False, query=content),
+            write=WritePlan(
+                operation="ADD",
+                memory_type=memory_type,
+                content=content,
+                confidence=float(payload.get("confidence", 0.85) or 0.85),
+                evidence_ids=[experience.event_id],
+            ),
+            forget=ForgetPlan(operation="NOOP"),
+            consolidation=ConsolidationPlan(enabled=False),
+            reason="explicit observe_and_commit",
+            source="deterministic",
+        )
+        result = self._executor.execute(
+            policy,
+            PolicyExecutionContext(
+                phase="after_step",
+                task=str(payload.get("task") or content),
+                query=content,
+                state={
+                    "status": str(payload.get("outcome", "success")),
+                    "confidence": float(payload.get("confidence", 0.85) or 0.85),
+                    "prediction_error": float(payload.get("prediction_error", 0.0) or 0.0),
+                    "future_utility": float(payload.get("future_utility", 0.0) or 0.0),
+                },
+                namespace=self.config.namespace,
+            ),
+        )
+        self._persist_trace(result.trace.trace_id, result.trace.to_dict())
+        memory_id = result.created_memory_ids[0] if result.created_memory_ids else None
+        stored_item = self._runtime.store.get_memory(memory_id) if self._runtime.store is not None and memory_id else None
+        return EvidenceBundle(
+            memory_id=memory_id,
+            content=stored_item.content if stored_item is not None else content,
+            memory_type=stored_item.type if stored_item is not None else memory_type,
+            evidence=list(stored_item.evidence) if stored_item is not None else [experience.event_id],
+            event_id=experience.event_id,
+            content_hash=experience.content_hash,
+        )
 
     async def query(
         self,
@@ -146,7 +180,9 @@ class MemoryRuntime:
         filters: dict[str, object] | None = None,
     ) -> MemoryContext:
         query_obj = query if isinstance(query, MemoryQuery) else MemoryQuery(query=query, budget_tokens=budget_tokens, filters=filters or {})
+        before_states = self._memory_states()
         results, trace = self._runtime.retrieve_with_trace(query_obj.query, filters=query_obj.filters, budget_tokens=query_obj.budget_tokens, task_id=query_obj.query)
+        after_states = self._memory_states()
         text = "\n".join(f"- [{result.score:.2f}] {result.memory.content}" for result in results)
         trace_id = trace.trace_id
         transactions: list[dict[str, object]] = []
@@ -167,9 +203,15 @@ class MemoryRuntime:
                 ).to_dict()
             }
         )
-        transactions = [transaction.to_dict() for transaction in trace.to_transactions()]
-        self._persist_trace(trace_id, trace.to_dict())
         txn = trace.to_transactions()[0]
+        access_deltas = _memory_deltas_for_fields(
+            before_states,
+            after_states,
+            fields={"access_count", "activation_count", "last_accessed_at"},
+            reason="retrieval access update",
+        )
+        trace.query_plan["retrieval_access_deltas"] = access_deltas
+        trace_dict = trace.to_dict()
         self._ledger.append(
             LedgerEvent(
                 transaction_id=txn.transaction_id,
@@ -184,9 +226,12 @@ class MemoryRuntime:
                 graph_delta=[{"paths": trace.graph_paths, "scores": trace.diffusion_scores}] if trace.graph_paths or trace.diffusion_scores else [],
                 lifecycle_delta=[{"memory_id": memory_id, "reason": reason} for memory_id, reason in trace.suppression_reasons.items()],
                 index_delta=[{"index": "sqlite_fts5", "status": "read"}, {"index": "memory_graph", "status": "activated"}],
-                audit=trace.to_dict(),
+                memory_delta=access_deltas,
+                audit=trace_dict,
             )
         )
+        transactions = self._ledger.events_for_trace(trace.trace_id) or [transaction.to_dict() for transaction in trace.to_transactions()]
+        self._persist_trace(trace_id, trace_dict)
         return MemoryContext(
             query=query_obj.query,
             text=text,
@@ -214,36 +259,59 @@ class MemoryRuntime:
         data = {"query": value} if isinstance(value, str) else dict(value)
         return self._policy_provider.propose(data)
 
-    async def commit(self, policy: MemoryPolicy, *, authorize_delete: bool = False) -> dict[str, object]:
-        phase = "after_step" if policy.write.operation != "NOOP" or policy.forget.operation != "NOOP" or policy.consolidation.enabled else "before_step"
-        task = policy.retrieval.query or policy.write.content or policy.forget.target_memory_id or "memory mutation"
-        trace = self._executor.execute(
+    async def commit(self, policy: MemoryPolicy | MemoryPolicyV2, *, authorize_delete: bool = False) -> dict[str, object]:
+        legacy_policy = self._executor._coerce_policy(policy)  # noqa: SLF001 - public facade needs task derivation for both policy generations.
+        phase = "after_step" if legacy_policy.write.operation != "NOOP" or legacy_policy.forget.operation != "NOOP" or legacy_policy.consolidation.enabled else "before_step"
+        task = legacy_policy.retrieval.query or legacy_policy.write.content or legacy_policy.forget.target_memory_id or "memory mutation"
+        result = self._executor.execute(
             policy,
             PolicyExecutionContext(
                 phase=phase,
                 task=task,
-                query=policy.retrieval.query or task,
-                state={"status": "success", "confidence": policy.write.confidence or 0.75},
+                query=legacy_policy.retrieval.query or task,
+                state={"status": "success", "confidence": legacy_policy.write.confidence or 0.75},
                 authorize_delete=authorize_delete,
+                namespace=self.config.namespace,
             ),
         )
-        self._persist_trace(trace.trace_id, trace.to_dict())
-        return trace.to_dict()
+        self._persist_trace(result.trace.trace_id, result.trace.to_dict())
+        value = result.trace.to_dict()
+        value["mutation_execution_result"] = result.to_dict()
+        return value
 
-    async def mutate(self, policy: MemoryPolicy, *, authorize_delete: bool = False) -> dict[str, object]:
+    async def mutate(self, policy: MemoryPolicy | MemoryPolicyV2, *, authorize_delete: bool = False) -> dict[str, object]:
         return await self.commit(policy, authorize_delete=authorize_delete)
 
     async def sleep(self) -> dict[str, object]:
+        memories_before = self._memory_states()
         consolidation_report = self._runtime.neuro_sleep().to_dict()
+        memories_after = self._memory_states()
         trace = self._runtime.last_trace
         if trace is not None:
             self._persist_trace(trace.trace_id, trace.to_dict())
+        deltas = _memory_deltas_for_fields(memories_before, memories_after, fields=None, reason="governed sleep")
+        transaction_id = f"txn_sleep_{trace.trace_id if trace is not None else 'manual'}"
+        self._ledger.append(
+            LedgerEvent(
+                transaction_id=transaction_id,
+                trace_id=trace.trace_id if trace is not None else None,
+                phase="COMMITTED",
+                event_type="sleep_committed",
+                operation="CONSOLIDATE",
+                proposer="deterministic",
+                validator_decision="approved",
+                targets=sorted({str(delta["memory_id"]) for delta in deltas if delta.get("memory_id")}),
+                memory_delta=deltas,
+                lifecycle_delta=[delta for delta in deltas if delta.get("field") == "maturity"],
+                audit={"consolidation_report": consolidation_report},
+            )
+        )
         sleep_report = SleepReport(
             plan=self._sleep_planner.plan(policy="manual", replay_trace_ids=[trace.trace_id] if trace is not None else []),
             replay=ReplayBatch(trace_ids=[trace.trace_id] if trace is not None else []),
-            ledger=LedgerReport(transaction_ids=[f"txn_{trace.trace_id}"] if trace is not None else []),
+            ledger=LedgerReport(transaction_ids=[transaction_id]),
         ).to_dict()
-        return {**consolidation_report, "sleep": sleep_report}
+        return {**consolidation_report, "sleep": sleep_report, "ledger_transaction_id": transaction_id}
 
     async def forget(
         self,
@@ -281,15 +349,29 @@ class MemoryRuntime:
     async def replay_trace(self, trace_id: str) -> dict[str, object] | None:
         live = self._runtime.replay_trace(trace_id)
         if live is not None:
+            ledger = self._ledger.replay_trace(trace_id)
+            if ledger is not None:
+                merged = dict(live)
+                merged.update({key: value for key, value in ledger.items() if key not in merged or key.endswith("_deltas") or key == "ledger_events"})
+                return merged
             return live
         path = self.config.traces_path / f"{trace_id}.json"
         if not path.exists():
-            return None
-        return json.loads(path.read_text(encoding="utf-8"))
+            return self._ledger.replay_trace(trace_id)
+        value = json.loads(path.read_text(encoding="utf-8"))
+        ledger = self._ledger.replay_trace(trace_id)
+        if ledger is not None:
+            value.update({key: item for key, item in ledger.items() if key not in value or key.endswith("_deltas") or key == "ledger_events"})
+        return value
 
     def _persist_trace(self, trace_id: str, data: dict[str, object]) -> None:
         self.config.traces_path.mkdir(parents=True, exist_ok=True)
         (self.config.traces_path / f"{trace_id}.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def _memory_states(self) -> dict[str, dict[str, object]]:
+        if self._runtime.store is None:
+            return {}
+        return {item.id: item.to_record() for item in self._runtime.store.list_memories(namespace=self.config.namespace)}
 
 
 def _policy_forget_operation(action: str) -> str:
@@ -315,3 +397,21 @@ def _write_config(path: Path, config: RuntimeConfig) -> None:
 
 
 __all__ = ["MemoryRuntime"]
+
+
+def _memory_deltas_for_fields(
+    before: dict[str, dict[str, object]],
+    after: dict[str, dict[str, object]],
+    *,
+    fields: set[str] | None,
+    reason: str,
+) -> list[dict[str, object]]:
+    deltas: list[dict[str, object]] = []
+    for memory_id in sorted(set(before) | set(after)):
+        old = before.get(memory_id, {})
+        new = after.get(memory_id, {})
+        keys = (set(old) | set(new)) if fields is None else fields
+        for field in sorted(keys):
+            if old.get(field) != new.get(field):
+                deltas.append({"memory_id": memory_id, "field": field, "old": old.get(field), "new": new.get(field), "reason": reason})
+    return deltas

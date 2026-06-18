@@ -3,7 +3,7 @@ from __future__ import annotations
 from neuromem.core.policy import MemoryPolicy, MemoryTrace
 
 from neuromem_runtime.runtime import MemoryRuntime
-from neuromem_runtime.deltas import GraphDelta, IndexDelta, LifecycleDelta, MemoryDelta
+from neuromem_runtime.deltas import ExecutionDeltaPlan, GraphDelta, IndexDelta, LifecycleDelta, MemoryDelta, MemorySnapshot, MutationExecutionResult
 from neuromem_runtime.ledger import ExperienceEvent, LedgerEvent, MemoryLedger
 from neuromem_runtime.lifecycle import LifecycleStateMachine
 from neuromem_runtime.policy_v2 import MemoryPolicyV2, ValidatedMutation
@@ -26,7 +26,7 @@ from neuromem_runtime.types import EvidenceBundle, MemoryContext, MemoryEvent, M
 from neuromem_runtime.validators import ValidatorStack
 from neuromem_runtime.providers import DeepSeekPolicyProvider, DeterministicPolicyProvider, OpenAICompatiblePolicyProvider, PolicyProvider
 
-__version__ = "0.1.5"
+__version__ = "0.2.0"
 
 __all__ = [
     "MemoryRuntime",
@@ -41,10 +41,13 @@ __all__ = [
     "ExperienceEvent",
     "MemoryPolicyV2",
     "ValidatedMutation",
+    "ExecutionDeltaPlan",
     "MemoryDelta",
     "GraphDelta",
     "LifecycleDelta",
     "IndexDelta",
+    "MemorySnapshot",
+    "MutationExecutionResult",
     "LedgerEvent",
     "MemoryLedger",
     "LifecycleStateMachine",

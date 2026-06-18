@@ -10,9 +10,11 @@ MemoryType = Literal["working", "provisional", "episodic", "semantic", "procedur
 Maturity = Literal[
     "fresh",
     "tagged",
+    "provisional",
     "captured",
     "linked",
     "reinforced",
+    "consolidated",
     "mature",
     "core",
     "inhibited",

@@ -31,6 +31,15 @@ def test_cli_local_workflow(tmp_path, capsys) -> None:
     main(["--path", str(workspace), "observe", str(events), "--namespace", "demo"])
     observed = json.loads(capsys.readouterr().out)
     assert observed["observed"] == 1
+    assert observed["memory_ids"] == []
+
+    main(["--path", str(workspace), "query", "login session", "--namespace", "demo", "--json"])
+    empty_context = json.loads(capsys.readouterr().out)
+    assert empty_context["selected_memory_ids"] == []
+
+    main(["--path", str(workspace), "observe", str(events), "--namespace", "demo", "--commit"])
+    committed = json.loads(capsys.readouterr().out)
+    assert committed["memory_ids"]
 
     main(["--path", str(workspace), "query", "login session", "--namespace", "demo", "--json"])
     context = json.loads(capsys.readouterr().out)

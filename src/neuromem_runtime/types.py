@@ -16,7 +16,7 @@ class RuntimeConfig:
     agent_id: str = "local-agent"
     mode: str = "lite"
     model_policy_enabled: bool = False
-    version: str = "0.1.5"
+    version: str = "0.2.0"
 
     def to_dict(self) -> dict[str, object]:
         return {

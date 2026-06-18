@@ -4,6 +4,7 @@ from itertools import combinations
 from collections import deque
 
 from neuromem.core.models import MemoryEdge, MemoryItem, utcnow
+from neuromem.core.deltas import GraphDelta
 from neuromem.stores.base import MemoryStore
 
 
@@ -31,8 +32,8 @@ def update_edges_after_use(
     outcome: str | None,
     salience: float,
     confidence: float,
-) -> list[MemoryEdge]:
-    updated: list[MemoryEdge] = []
+) -> list[GraphDelta]:
+    updated: list[GraphDelta] = []
     if len(used_memories) < 2:
         return updated
     existing = {(edge.source_id, edge.target_id, edge.relation): edge for edge in store.list_edges()}
@@ -47,6 +48,7 @@ def update_edges_after_use(
             weight=min(left.confidence, right.confidence) * 0.2,
             provenance=[left.id, right.id],
         )
+        old_weight = edge.weight
         delta = three_factor_delta(edge, outcome=outcome, salience=salience, confidence=confidence)
         edge.weight = max(0.0, min(1.0, edge.weight + delta))
         edge.confidence = max(edge.confidence, min(1.0, confidence))
@@ -64,7 +66,25 @@ def update_edges_after_use(
             item.reinforcement_score = min(1.0, item.reinforcement_score + max(0.0, delta))
             store.upsert_memory(item)
         store.add_edge(edge)
-        updated.append(edge)
+        updated.append(
+            GraphDelta(
+                edge_id="|".join([edge.source_id, edge.target_id, edge.relation]),
+                source_id=edge.source_id,
+                target_id=edge.target_id,
+                relation=edge.relation,
+                old_weight=old_weight,
+                new_weight=edge.weight,
+                delta=edge.weight - old_weight,
+                eligibility=edge.eligibility_trace,
+                salience=salience,
+                outcome_reward=outcome_reward(outcome),
+                confidence=confidence,
+                inhibition_penalty=edge.inhibition_score,
+                contradiction_penalty=edge.contradiction_penalty,
+                provenance=list(edge.provenance),
+                reason="coactivation plasticity after governed policy execution",
+            )
+        )
     return updated
 
 

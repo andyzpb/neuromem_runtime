@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from neuromem_runtime.deltas import MemorySnapshot
+
 
 def _now_text() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -177,6 +179,21 @@ class MemoryLedger:
             )
         return event
 
+    def get_experience(self, event_id: str) -> ExperienceEvent | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM experience_events WHERE event_id = ?", (event_id,)).fetchone()
+        if row is None:
+            return None
+        return ExperienceEvent(
+            event_id=str(row["event_id"]),
+            namespace=str(row["namespace"]),
+            source=str(row["source"]),
+            content=str(row["content"]),
+            content_hash=str(row["content_hash"]),
+            metadata=json.loads(row["metadata_json"]),
+            observed_at=str(row["observed_at"]),
+        )
+
     def append(self, event: LedgerEvent) -> LedgerEvent:
         with self._connect() as conn:
             row = conn.execute("SELECT event_hash FROM ledger_events ORDER BY created_at DESC, ledger_id DESC LIMIT 1").fetchone()
@@ -269,7 +286,27 @@ class MemoryLedger:
             ledger = audit.get("retrieval_ledger")
             if isinstance(ledger, dict):
                 return ledger
+            query_plan = audit.get("query_plan")
+            if isinstance(query_plan, dict):
+                nested = query_plan.get("retrieval_ledger")
+                if isinstance(nested, dict):
+                    return nested
         return retrieval_events[-1]
+
+    def replay_trace(self, trace_id: str) -> dict[str, object] | None:
+        events = self.events_for_trace(trace_id)
+        if not events:
+            return None
+        audit = events[-1].get("audit", {})
+        if isinstance(audit, dict) and audit:
+            replay = dict(audit)
+            replay["ledger_events"] = events
+            replay["retrieval_ledger"] = self.retrieval_explain(trace_id)
+            replay["memory_deltas"] = [delta for event in events for delta in event.get("memory_delta", [])]
+            replay["graph_deltas"] = [delta for event in events for delta in event.get("graph_delta", [])]
+            replay["lifecycle_deltas"] = [delta for event in events for delta in event.get("lifecycle_delta", [])]
+            return replay
+        return {"trace_id": trace_id, "ledger_events": events}
 
     def replay(self, to_transaction_id: str | None = None) -> list[dict[str, object]]:
         query = "SELECT * FROM ledger_events"
@@ -281,6 +318,68 @@ class MemoryLedger:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [self._row_to_event(row) for row in rows]
+
+    def reconstruct(self, to_transaction_id: str | None = None) -> MemorySnapshot:
+        events = self.replay(to_transaction_id)
+        memories: dict[str, dict[str, object]] = {}
+        edges: dict[str, dict[str, object]] = {}
+        last_txn: str | None = None
+        for event in events:
+            last_txn = str(event["transaction_id"])
+            for delta in event.get("memory_delta", []):
+                if not isinstance(delta, dict):
+                    continue
+                memory_id = str(delta.get("memory_id", ""))
+                field = str(delta.get("field", ""))
+                if not memory_id or not field:
+                    continue
+                if field == "created" and isinstance(delta.get("new"), dict):
+                    memories[memory_id] = dict(delta["new"])  # type: ignore[arg-type]
+                elif field == "deleted":
+                    memories.pop(memory_id, None)
+                else:
+                    memories.setdefault(memory_id, {})[field] = delta.get("new")
+            for delta in event.get("graph_delta", []):
+                if not isinstance(delta, dict):
+                    continue
+                edge_id = str(delta.get("edge_id") or "|".join(str(delta.get(key, "")) for key in ["source_id", "target_id", "relation"]))
+                if edge_id.strip("|"):
+                    edges.setdefault(edge_id, {}).update(delta)
+        return MemorySnapshot(memories=memories, edges=edges, transaction_id=to_transaction_id or last_txn)
+
+    def verify_hash_chain(self) -> bool:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM ledger_events ORDER BY created_at ASC, ledger_id ASC").fetchall()
+        previous: str | None = None
+        for row in rows:
+            event = LedgerEvent(
+                ledger_id=str(row["ledger_id"]),
+                transaction_id=str(row["transaction_id"]),
+                trace_id=row["trace_id"],
+                phase=str(row["phase"]),
+                event_type=str(row["event_type"]),
+                operation=row["operation"],
+                proposer=str(row["proposer"]),
+                validator_decision=str(row["validator_decision"]),
+                evidence=json.loads(row["evidence_json"]),
+                targets=json.loads(row["target_json"]),
+                graph_delta=json.loads(row["graph_delta_json"]),
+                lifecycle_delta=json.loads(row["lifecycle_delta_json"]),
+                index_delta=json.loads(row["index_delta_json"]),
+                memory_delta=json.loads(row["memory_delta_json"]),
+                rollback_reason=row["rollback_reason"],
+                audit=json.loads(row["audit_json"]),
+                previous_hash=row["previous_hash"],
+                event_hash=row["event_hash"],
+                created_at=str(row["created_at"]),
+            )
+            if event.previous_hash != previous:
+                return False
+            expected = _hash({"previous_hash": event.previous_hash, "event": event.payload_for_hash()})
+            if event.event_hash != expected:
+                return False
+            previous = event.event_hash
+        return True
 
     def diff(self, left_txn: str, right_txn: str) -> dict[str, object]:
         left = self.show_transaction(left_txn)

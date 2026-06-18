@@ -1,56 +1,31 @@
 # NeuroMem Runtime
 
-NeuroMem Runtime is a local-first Memory Mutation Runtime for long-running LLM agents.
+Local-first memory for long-running LLM agents.
 
-It gives a coding agent, chat agent, research assistant, or LangGraph workflow a durable memory layer that can remember task results, retrieve useful context for the next prompt, consolidate repeated lessons, forget stale facts, and replay why a memory was used.
-
-The package name is `neuromem-runtime`. User code imports `neuromem_runtime`.
+NeuroMem is not another vector-store wrapper. It is a **Memory Mutation Runtime**: agents can observe events and LLMs can propose memory changes, but durable memory only changes after validation, transaction logging, lifecycle handling, and replayable audit.
 
 ```bash
 pip install neuromem-runtime
 ```
 
-Current package release: `v0.1.5`.
+Current release: `v0.2.0`.
 
-## At a glance
+## Why It Exists
 
-- Memory mutation runtime, not just a memory store.
-- LLMs propose memory mutations; the runtime validates and commits them.
-- Every write, update, suppression, edge update, consolidation, and forgetting event is a transaction.
-- Retrieval is activation over an outcome-shaped experience graph.
-- The Activation Retrieval Engine uses local FTS5/BM25, RRF fusion, PPR-style graph activation, lifecycle gates, lite rerank, and a replayable retrieval ledger.
-- Forgetting is suppression before deletion.
-- Every memory effect is replayable through the Memory Ledger.
-- Local by default: SQLite plus trace files, with no Docker or hosted store required.
-- Optional integrations: LLM policy providers and LangGraph are opt-in extras.
+Long-running agents need more than recall. They need to know when a memory was written, what evidence supported it, whether it is stale, why it was retrieved, and who was allowed to change it.
 
-## Why use it
+NeuroMem gives you that local runtime:
 
-Most agent memory examples stop at "put text in a vector store, search it later." NeuroMem Runtime treats memory as a governed lifecycle:
+- `observe` records immutable experience events.
+- `commit` validates memory mutations before they touch storage.
+- `query` returns prompt-ready context with reasons and trace ids.
+- `forget` inhibits, invalidates, archives, compresses, or deletes by policy.
+- `sleep` consolidates repeated experience into more useful memory.
+- `replay_trace` and the ledger explain what happened.
 
-- `observe` records events, tool results, feedback, preferences, and task outcomes.
-- `query` returns prompt-ready memory context with selected memory ids and a trace id.
-- `propose` creates a structured memory policy.
-- `commit` or `mutate` validates that policy before it changes storage.
-- `sleep` consolidates and updates lifecycle state.
-- `forget` inhibits, invalidates, archives, compresses, or deletes only when policy allows it.
-- `replay_trace` shows the transaction trail behind retrieval and mutation.
+Base install is SQLite + trace files. No Docker, API key, hosted store, vector database, LangGraph import, or model call is required.
 
-The useful difference is control. An LLM can help propose what to remember, but it does not get to directly rewrite the memory store.
-
-## What it is for
-
-Use NeuroMem Runtime when an agent needs to carry knowledge across runs:
-
-- a coding agent remembering fixes, commands, repo conventions, and failed approaches
-- a support or operations assistant remembering user preferences and incident resolutions
-- a research assistant remembering evidence, decisions, and invalidated claims
-- a LangGraph app that needs memory retrieval before an agent node and memory commit after it
-- local demos where Docker, hosted vector stores, and API keys would slow the first run down
-
-The default runtime is local. It uses SQLite and trace files under `.neuromem/`. It does not call an external model unless you pass a provider explicitly.
-
-## Five-minute local start
+## Quickstart
 
 ```python
 import asyncio
@@ -63,18 +38,14 @@ async def main() -> None:
         path="./.neuromem",
     )
 
-    await memory.observe({
+    await memory.observe_and_commit({
         "type": "task_result",
         "content": "Login redirect bug was fixed by changing session refresh order.",
         "task": "Fix login redirect",
-        "evidence": "demo-trace-1",
         "keywords": ["login", "session", "redirect"],
     })
 
-    ctx = await memory.query(
-        "Have we fixed a similar login/session bug before?",
-        budget_tokens=800,
-    )
+    ctx = await memory.query("Have we fixed a similar login/session bug before?")
 
     print(ctx.to_prompt())
     print(ctx.selected_memory_ids)
@@ -84,340 +55,68 @@ async def main() -> None:
 asyncio.run(main())
 ```
 
-That creates:
+`observe()` alone is stricter: it records an immutable event and does not create long-term memory. Use `observe_and_commit()` only when you explicitly want the runtime to validate and persist a memory from that event.
 
-```text
-.neuromem/
-  config.toml
-  memory.sqlite3
-  traces/
-```
-
-The SQLite database also stores observed experience events and ledger events. Trace JSON files remain available for easy inspection.
-
-The returned `MemoryContext` is ready to place into an agent prompt:
-
-```python
-agent_input = {
-    "question": user_question,
-    "memory_context": ctx.to_prompt(),
-    "memory_trace_id": ctx.trace_id,
-}
-```
-
-## CLI quickstart
-
-Create a local workspace:
+## CLI
 
 ```bash
 nmem init --namespace demo/repo
 nmem doctor
-```
 
-Record events from JSONL:
-
-```bash
 cat > events.jsonl <<'JSONL'
-{"type":"task_result","content":"Session refresh order fixed login redirect loop.","task":"Fix login","evidence":"trace-1","keywords":["session","login"]}
+{"type":"task_result","content":"Session refresh order fixed login redirect loop.","task":"Fix login","keywords":["session","login"]}
 JSONL
 
 nmem observe events.jsonl --namespace demo/repo
-```
+nmem observe events.jsonl --namespace demo/repo --commit
 
-Query memory:
-
-```bash
 nmem query "Have we fixed auth/session bugs before?" --namespace demo/repo
 nmem query "Have we fixed auth/session bugs before?" --namespace demo/repo --json
 nmem retrieval explain TRACE_ID --namespace demo/repo
-```
-
-Run consolidation and inspect the trace:
-
-```bash
-nmem sleep --namespace demo/repo
-nmem trace show TRACE_ID
-nmem trace export TRACE_ID --format json
 nmem ledger replay
 ```
 
-## Agent loop pattern
+Without `--commit`, `nmem observe` records evidence only. With `--commit`, it validates and commits long-term memory.
 
-A typical agent loop uses NeuroMem at two points: retrieve before the model call, then observe or commit after the tool/model result.
+## Retrieval
 
-```python
-async def run_agent_turn(memory: nmem.MemoryRuntime, user_task: str) -> str:
-    ctx = await memory.query(user_task, budget_tokens=800)
-
-    response = await call_your_agent_model(
-        task=user_task,
-        memory_context=ctx.to_prompt(),
-    )
-
-    await memory.observe({
-        "type": "task_result",
-        "content": response,
-        "task": user_task,
-        "evidence": ctx.trace_id,
-        "keywords": ["agent-result"],
-    })
-
-    return response
-```
-
-For stricter mutation control, ask the runtime to propose a policy and commit it:
-
-```python
-policy = await memory.propose({
-    "phase": "after_step",
-    "task": user_task,
-    "content": response,
-    "evidence": ctx.trace_id,
-})
-
-trace = await memory.commit(policy)
-```
-
-`commit()` validates the policy and returns replayable trace data.
-
-For the stricter protocol path, record an immutable experience event without immediately creating long-term memory:
-
-```python
-event = await memory.observe(
-    {
-        "type": "task_result",
-        "content": response,
-        "task": user_task,
-        "evidence": ctx.trace_id,
-    },
-    auto_commit=False,
-)
-```
-
-The returned bundle includes `event_id` and `content_hash`. Long-term memory capture can then be proposed and committed explicitly.
-
-## Activation Retrieval Engine
-
-The base package does not depend on a vector database. Querying uses a local activation pipeline:
+The base retrieval path is local activation retrieval:
 
 ```text
-Query -> QueryPlanV2 -> Contextual Memory Cards
-      -> FTS5/BM25 + lexical/entity + current/procedural/canonical candidates
-      -> RRF fusion
-      -> PPR-style graph activation
-      -> lifecycle and provenance gates
-      -> lite rerank
-      -> context packing
-      -> retrieval ledger
+Memory cards -> FTS5/BM25 + lexical/entity/current candidates
+             -> RRF fusion
+             -> PPR-style graph activation
+             -> lifecycle/provenance gates
+             -> lite rerank
+             -> packed prompt context + retrieval ledger
 ```
 
-`MemoryContext.results` includes `why_retrieved`, `score_components`, `graph_paths`, `reranker_score`, `lifecycle_reason`, and `provenance_ids`. `replay_trace()` and `nmem retrieval explain TRACE_ID` show the query plan, channel candidates, fusion scores, activation paths, selected ids, suppressed ids, and packed context.
+Dense embeddings, cross-encoder rerankers, and LLM listwise rerankers are optional adapters. They may rank candidates, but they do not mutate memory.
 
-Dense embeddings, late-interaction retrieval, cross-encoder rerankers, and LLM listwise rerankers are adapter paths. Install the relevant extras only when wiring a provider:
+## Safety Model
+
+- LLMs propose memory policies; they do not directly rewrite memory.
+- Every product-surface mutation goes through `PolicyExecutor`.
+- Writes require evidence.
+- Deletes require explicit authorization.
+- Retrieval access counter updates are ledgered memory effects.
+- Ledger events are hash-linked and replayable.
+
+## Integrations
+
+Optional extras:
 
 ```bash
-pip install "neuromem-runtime[retrieval]"
-pip install "neuromem-runtime[rerank]"
-pip install "neuromem-runtime[llm-rerank]"
+pip install "neuromem-runtime[langgraph]"
+pip install "neuromem-runtime[providers]"
+pip install "neuromem-runtime[eval]"
 ```
 
-Those providers may rank candidates, but they do not mutate memory. Memory changes still go through policy validation and commit.
+LangGraph is the reference orchestration integration, but NeuroMem Core stays framework-agnostic.
 
-## Optional LLM policy provider
+## Learn More
 
-The base package never calls an external model. To use an LLM for memory-policy proposals, pass a provider explicitly:
-
-```python
-import neuromem_runtime as nmem
-
-provider = nmem.DeepSeekPolicyProvider(
-    api_key_env="DEEPSEEK_API_KEY",
-    model="deepseek-v4-flash",
-)
-
-memory = await nmem.MemoryRuntime.local(
-    namespace="demo/repo",
-    policy_provider=provider,
-)
-
-policy = await memory.propose({
-    "phase": "after_step",
-    "task": "Fix login redirect",
-    "content": "Session refresh order fixed the redirect loop.",
-    "evidence": "trace-1",
-})
-
-trace = await memory.commit(policy)
-```
-
-The model proposes a `MemoryPolicy`. The runtime still validates that policy before storage changes.
-
-Use the OpenAI-compatible provider for other hosted models:
-
-```python
-provider = nmem.OpenAICompatiblePolicyProvider(
-    api_key_env="OPENAI_API_KEY",
-    model="gpt-4.1-mini",
-    base_url="https://api.openai.com",
-)
-```
-
-Install provider dependencies when needed:
-
-```bash
-pip install neuromem-runtime[providers]
-```
-
-## LangGraph integration
-
-Install optional dependencies:
-
-```bash
-pip install neuromem-runtime[langgraph]
-```
-
-Wire memory around an agent node:
-
-```python
-from langgraph.graph import StateGraph
-import neuromem_runtime as nmem
-from neuromem_runtime.langgraph import add_neuromem_runtime
-
-memory = await nmem.MemoryRuntime.local(namespace="repo/demo")
-
-builder = StateGraph(dict)
-builder.add_node("run_agent", run_agent_node)
-
-add_neuromem_runtime(
-    builder,
-    memory=memory,
-    before="run_agent",
-    after="run_agent",
-)
-```
-
-LangGraph owns orchestration. NeuroMem Runtime owns memory policy, validation, lifecycle state, and trace replay.
-
-## Public API
-
-```python
-from neuromem_runtime import (
-    MemoryRuntime,
-    RuntimeConfig,
-    MemoryEvent,
-    MemoryQuery,
-    MemoryContext,
-    EvidenceBundle,
-    ExperienceEvent,
-    MemoryPolicy,
-    MemoryPolicyV2,
-    MemoryTransaction,
-    MemoryTrace,
-    MemoryLedger,
-    ValidatorStack,
-    RetrievalTraceMetadata,
-    PlasticityEngine,
-    SleepPlanner,
-)
-```
-
-Main actions:
-
-- `MemoryRuntime.local(...)` creates or opens a local `.neuromem` workspace.
-- `observe(event)` records an experience event and, by default, keeps quickstart-compatible auto-commit behavior.
-- `observe(event, auto_commit=False)` records only the immutable experience event.
-- `query(query, budget_tokens=800)` retrieves prompt-ready memory context.
-- `propose(input)` creates a structured memory policy with the configured provider.
-- `commit(policy)` validates and applies governed memory changes.
-- `mutate(policy)` aliases `commit(policy)`.
-- `sleep()` runs replay consolidation and lifecycle updates.
-- `forget(memory_id, action="inhibit", reason="...")` applies governed forgetting.
-- `replay_trace(trace_id)` returns replayable trace data.
-
-Ledger CLI:
-
-```bash
-nmem ledger show TXN_ID
-nmem ledger why-written MEM_ID
-nmem ledger why-retrieved TRACE_ID MEM_ID
-nmem ledger replay --to-txn TXN_ID
-nmem ledger diff TXN_A TXN_B
-```
-
-Governed runtime surfaces:
-
-- `MemoryPolicyV2` defines the forward policy shape for transaction-governed mutation.
-- `ValidatorStack` exposes fail-closed gates for schema, evidence, provenance, temporal, conflict, ACL, deletion, poisoning risk, lifecycle, and index consistency checks.
-- `MemoryLedger` stores experience events, ledger events, memory versions, and edge versions in SQLite.
-- `RetrievalTraceMetadata` records activation retrieval mode, disabled/proxy/provider embeddings, index type, candidate sources, and fusion strategy.
-- `PlasticityEngine` produces graph deltas for outcome-shaped edge updates.
-- `SleepPlanner` and `SleepReport` define the sleep/replay/consolidation report surface.
-
-## Sync wrapper
-
-```python
-from neuromem_runtime.sync import MemoryRuntime
-
-memory = MemoryRuntime.local(namespace="demo")
-memory.observe({"content": "User prefers concise answers."})
-
-ctx = memory.query("What style does the user prefer?")
-print(ctx.to_prompt())
-```
-
-The sync wrapper is for scripts. Inside an existing event loop, use the async API.
-
-## Safety model
-
-NeuroMem Runtime is designed around governed mutation:
-
-- local mode uses SQLite and trace files
-- observed experience events are recorded before long-term memory capture
-- ledger events are append-only and hash-linked
-- external model calls are off by default
-- deterministic policy proposals are available without API keys
-- model output is a proposal, not a direct mutation
-- every committed policy passes validation
-- unauthorized physical deletion is rejected
-- forgetting defaults to inhibition, invalidation, archive, or compression
-- traces can be replayed for audit and debugging
-
-Base retrieval is a deterministic local FTS5/BM25/RRF/PPR/lifecycle-gated baseline. Dense vector retrieval is represented by `EmbeddingProvider` and `VectorIndex` protocols and remains an explicit adapter path, not a base-package claim.
-
-This matters for agents because memory mistakes accumulate. A stale command, wrong preference, or unsafe deletion should be visible and reversible at the policy layer.
-
-## Package boundaries
-
-`neuromem-runtime` keeps the public surface small:
-
-- public package: `neuromem_runtime`
+- API and runtime manual: [`docs/api.md`](docs/api.md)
+- Public import: `import neuromem_runtime as nmem`
 - CLI: `nmem`
-- optional LangGraph integration: `neuromem_runtime.langgraph`
-- optional model policy providers: explicit `policy_provider=...`
-
-User code should import `neuromem_runtime`. The base import path does not import LangGraph or call external models.
-
-## Benchmark command
-
-The mini benchmark command delegates to bundled deterministic evaluation code:
-
-```bash
-nmem bench run mini --methods full,vector,no_graph,no_pfc
-```
-
-If an optional evaluation dependency is missing, install:
-
-```bash
-pip install neuromem-runtime[eval]
-```
-
-## Development
-
-```bash
-pip install -e .[dev]
-pytest -q
-python -m build
-twine check dist/*
-```
-
-The package is typed with `py.typed`.
+- Package: `neuromem-runtime`

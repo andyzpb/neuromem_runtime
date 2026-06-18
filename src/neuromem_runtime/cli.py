@@ -27,6 +27,7 @@ def main(argv: list[str] | None = None) -> None:
     observe_parser = subparsers.add_parser("observe", help="Observe JSONL memory events")
     observe_parser.add_argument("events", type=Path)
     observe_parser.add_argument("--namespace", default="default")
+    observe_parser.add_argument("--commit", action="store_true", help="Validate and commit observed events as long-term memories")
 
     query_parser = subparsers.add_parser("query", help="Query local memory")
     query_parser.add_argument("query")
@@ -145,7 +146,8 @@ async def _cmd_observe(args: argparse.Namespace) -> str:
         for line in handle:
             if not line.strip():
                 continue
-            bundle = await runtime.observe(json.loads(line))
+            event = json.loads(line)
+            bundle = await runtime.observe_and_commit(event) if args.commit else await runtime.observe(event)
             count += 1
             if bundle.memory_id is not None:
                 memory_ids.append(bundle.memory_id)

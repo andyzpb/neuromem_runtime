@@ -331,9 +331,10 @@ class SQLiteMemoryStore(MemoryStore):
     def search_memory_cards(self, query: str, *, namespace: str | None = None, limit: int = 20) -> list[tuple[str, float]]:
         if not query.strip():
             return []
+        fts_query = self._sanitize_fts_query(query)
         with self._connect() as conn:
             try:
-                params: list[object] = [query]
+                params: list[object] = [fts_query]
                 where = "memory_cards_fts MATCH ?"
                 if namespace is not None:
                     where += " AND namespace = ?"
@@ -368,6 +369,12 @@ class SQLiteMemoryStore(MemoryStore):
             if overlap:
                 scored.append((str(row["memory_id"]), overlap / max(1, len(terms))))
         return sorted(scored, key=lambda value: (-value[1], value[0]))[:limit]
+
+    def _sanitize_fts_query(self, query: str) -> str:
+        terms = [term.strip().replace('"', '""') for term in query.split() if term.strip()]
+        if not terms:
+            return query
+        return " OR ".join(f'"{term}"' for term in terms)
 
 
     def _row_to_item(self, row: sqlite3.Row) -> MemoryItem:

@@ -21,6 +21,9 @@ def test_public_api_exports() -> None:
     assert nmem.RetrievalCandidate
     assert nmem.ActivationResult
     assert nmem.RetrievalLedgerRecord
+    assert nmem.ExecutionDeltaPlan
+    assert nmem.MemorySnapshot
+    assert nmem.MutationExecutionResult
     assert "neuromem_runtime.langgraph" not in sys.modules
     assert "torch" not in sys.modules
     assert "transformers" not in sys.modules
@@ -34,7 +37,7 @@ def test_async_local_workflow(tmp_path) -> None:
         assert (tmp_path / ".neuromem" / "memory.sqlite3").exists()
         assert (tmp_path / ".neuromem" / "traces").is_dir()
 
-        bundle = await memory.observe(
+        bundle = await memory.observe_and_commit(
             {
                 "type": "task_result",
                 "content": "Login redirect bug was fixed by changing session refresh order.",
@@ -58,6 +61,8 @@ def test_async_local_workflow(tmp_path) -> None:
 
         report = await memory.sleep()
         assert "processed" in report
+        assert report["ledger_transaction_id"]
+        assert memory.ledger.verify_hash_chain()
 
         trace = await memory.replay_trace(context.trace_id)
         assert trace is not None
@@ -66,9 +71,10 @@ def test_async_local_workflow(tmp_path) -> None:
 
         ledger_events = memory.ledger.events_for_trace(context.trace_id)
         assert ledger_events
-        assert ledger_events[-1]["event_hash"]
-        assert ledger_events[-1]["audit"]["query_plan"]["retrieval_metadata"]["retrieval_mode"] == "local_activation"
-        assert ledger_events[-1]["audit"]["query_plan"]["retrieval_ledger"]["selected_ids"] == context.selected_memory_ids
+        retrieval_event = next(event for event in ledger_events if event["event_type"] == "memory_retrieved")
+        assert retrieval_event["event_hash"]
+        assert retrieval_event["audit"]["query_plan"]["retrieval_metadata"]["retrieval_mode"] == "local_activation"
+        assert retrieval_event["audit"]["query_plan"]["retrieval_ledger"]["selected_ids"] == context.selected_memory_ids
 
     asyncio.run(run())
 
@@ -76,7 +82,7 @@ def test_async_local_workflow(tmp_path) -> None:
 def test_observe_can_record_experience_without_long_term_mutation(tmp_path) -> None:
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem")
-        bundle = await memory.observe({"content": "Keep as an immutable observation only."}, auto_commit=False)
+        bundle = await memory.observe({"content": "Keep as an immutable observation only."})
         assert bundle.event_id is not None
         assert bundle.memory_id is None
         assert memory.internal_runtime.store is not None
@@ -91,7 +97,7 @@ def test_sync_wrapper(tmp_path) -> None:
     from neuromem_runtime.sync import MemoryRuntime
 
     memory = MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem")
-    bundle = memory.observe({"content": "User prefers concise answers.", "type": "user_preference", "evidence": "pref-1"})
+    bundle = memory.observe_and_commit({"content": "User prefers concise answers.", "type": "user_preference", "evidence": "pref-1"})
     context = memory.query("concise answers")
     assert bundle.memory_id in context.selected_memory_ids
 
@@ -99,12 +105,12 @@ def test_sync_wrapper(tmp_path) -> None:
 def test_delete_requires_authorization(tmp_path) -> None:
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem")
-        bundle = await memory.observe({"content": "Temporary secret should be removed.", "evidence": "trace-1"})
+        bundle = await memory.observe_and_commit({"content": "Temporary secret should be removed.", "evidence": "trace-1"})
         assert bundle.memory_id is not None
         rejected = await memory.forget(bundle.memory_id, action="delete", reason="test delete")
-        assert rejected["validator_decision"] == "DELETE_REQUEST requires explicit user authorization"
+        assert "DELETE_REQUEST requires explicit user authorization" in rejected["validator_decision"]
         assert rejected["rejected_reasons"]
-        assert rejected["transactions"][0]["phase"] == "REJECTED"
+        assert rejected["mutation_execution_result"]["validated_mutation"]["approved"] is False
         stored = memory.internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[union-attr]
         assert stored is not None
         assert stored.maturity != "deleted"
@@ -115,7 +121,7 @@ def test_delete_requires_authorization(tmp_path) -> None:
 def test_forget_decay_applies_once_after_validation(tmp_path) -> None:
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem")
-        bundle = await memory.observe({"content": "Temporary command can decay.", "evidence": "trace-1"})
+        bundle = await memory.observe_and_commit({"content": "Temporary command can decay.", "evidence": "trace-1"})
         assert bundle.memory_id is not None
         before = memory.internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[union-attr]
         assert before is not None
@@ -123,7 +129,7 @@ def test_forget_decay_applies_once_after_validation(tmp_path) -> None:
         after = memory.internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[union-attr]
         assert after is not None
         assert round(after.decay_score - before.decay_score, 3) == 0.2
-        assert result["transactions"][0]["phase"] == "COMMITTED"
+        assert result["mutation_execution_result"]["validated_mutation"]["approved"] is True
         assert memory.ledger.why_written(bundle.memory_id)
 
     asyncio.run(run())
@@ -132,9 +138,10 @@ def test_forget_decay_applies_once_after_validation(tmp_path) -> None:
 def test_commit_policy_records_trace(tmp_path) -> None:
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem")
+        evidence = await memory.observe({"content": "Evidence for test commit."})
         policy = MemoryPolicy(
             retrieval=RetrievalPlan(enabled=False, query="write rule"),
-            write=WritePlan(operation="ADD", memory_type="procedural", content="Always run tests after schema changes.", confidence=0.9, evidence_ids=["trace-1"]),
+            write=WritePlan(operation="ADD", memory_type="procedural", content="Always run tests after schema changes.", confidence=0.9, evidence_ids=[evidence.event_id]),
             forget=ForgetPlan(operation="NOOP"),
             consolidation=ConsolidationPlan(enabled=False),
             reason="test commit",
@@ -143,16 +150,22 @@ def test_commit_policy_records_trace(tmp_path) -> None:
         trace = await memory.commit(policy)
         assert "ADD" in trace["executed_actions"]
         assert trace["transactions"]
+        execution = trace["mutation_execution_result"]
+        created_id = execution["created_memory_ids"][0]
+        events = memory.ledger.why_written(created_id)
+        assert any(event["event_type"] == "memory_delta_committed" for event in events)
+        assert any(delta["field"] == "created" for event in events for delta in event["memory_delta"])
+        assert memory.ledger.reconstruct().memories[created_id]["content"] == "Always run tests after schema changes."
 
     asyncio.run(run())
 
 
 def test_custom_policy_provider_is_used(tmp_path) -> None:
     class Provider:
-        def propose(self, payload):
-            return MemoryPolicy(
-                retrieval=RetrievalPlan(enabled=False, query=str(payload["task"])),
-                write=WritePlan(operation="ADD", memory_type="semantic", content="Provider generated policy.", confidence=0.9, evidence_ids=["provider"]),
+            def propose(self, payload):
+                return MemoryPolicy(
+                    retrieval=RetrievalPlan(enabled=False, query=str(payload["task"])),
+                    write=WritePlan(operation="ADD", memory_type="semantic", content="Provider generated policy.", confidence=0.9, evidence_ids=[payload["evidence_id"]]),
                 forget=ForgetPlan(operation="NOOP"),
                 consolidation=ConsolidationPlan(enabled=False),
                 reason="provider test",
@@ -161,7 +174,8 @@ def test_custom_policy_provider_is_used(tmp_path) -> None:
 
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", policy_provider=Provider())
-        policy = await memory.propose({"task": "provider task"})
+        evidence = await memory.observe({"content": "Provider evidence."})
+        policy = await memory.propose({"task": "provider task", "evidence_id": evidence.event_id})
         assert policy.source == "small_llm"
         assert policy.reason == "provider test"
         trace = await memory.commit(policy)
