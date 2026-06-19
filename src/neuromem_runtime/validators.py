@@ -33,7 +33,7 @@ class SchemaValidator(MutationValidator):
     name = "SchemaValidator"
 
     def validate(self, policy: MemoryPolicy, context: ValidationContext) -> ValidationStep:
-        valid = policy.write.operation in {"ADD", "UPDATE", "LINK", "NOOP"} and policy.forget.operation in {"NOOP", "DECAY", "INHIBIT", "INVALIDATE", "ARCHIVE", "DELETE_REQUEST"}
+        valid = policy.write.operation in {"ADD", "LINK", "NOOP"} and policy.forget.operation in {"NOOP", "DECAY", "INHIBIT", "INVALIDATE", "ARCHIVE"}
         return ValidationStep(name=self.name, passed=valid, reason="" if valid else "unsupported operation")
 
 
@@ -133,8 +133,8 @@ class DeletionGuardValidator(MutationValidator):
     name = "DeletionGuardValidator"
 
     def validate(self, policy: MemoryPolicy, context: ValidationContext) -> ValidationStep:
-        if policy.forget.operation == "DELETE_REQUEST" and not context.authorize_delete:
-            return ValidationStep(name=self.name, passed=False, reason="DELETE_REQUEST requires explicit user authorization")
+        if policy.forget.operation == "DELETE_REQUEST":
+            return ValidationStep(name=self.name, passed=False, reason="DELETE_REQUEST is not supported by append-only runtime; use suppression or redaction evidence")
         return ValidationStep(name=self.name, passed=True)
 
 

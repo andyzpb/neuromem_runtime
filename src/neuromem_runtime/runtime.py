@@ -22,7 +22,8 @@ from neuromem_runtime.crystallization import (
 )
 from neuromem_runtime.deltas import LifecycleDelta, MemoryDelta
 from neuromem_runtime.executor import PolicyExecutionContext, PolicyExecutor
-from neuromem_runtime.ledger import ExperienceEvent, LedgerEvent, MemoryLedger
+from neuromem_runtime.impact import WorldviewImpactAssessment, WorldviewImpactMeter
+from neuromem_runtime.ledger import EdgeEvidenceEvent, ExperienceEvent, LedgerEvent, MemoryLedger
 from neuromem_runtime.policy_v2 import EvidenceRef, LogicEdgeProposal, MemoryPolicyV2
 from neuromem_runtime.providers import DeterministicPolicyProvider, PolicyProvider
 from neuromem_runtime.performance import BackgroundJobQueue, EmbeddingCache, RetrievalCache, RuntimeTiming, TimingSpan, stable_hash
@@ -47,6 +48,7 @@ from neuromem_runtime.semantic_graph import (
 from neuromem_runtime.sleep import CompilationDelta, ConsolidationDelta, LedgerReport, ReplayBatch, SleepPlanner, SleepReport, SuppressionDelta
 from neuromem_runtime.types import EvidenceBundle, MemoryContext, MemoryEvent, MemoryQuery, RuntimeConfig, event_to_dict
 from neuromem_runtime.validators import ValidatorStack
+from neuromem_runtime.worldview import WorldviewResolver
 
 
 class MemoryRuntime:
@@ -62,6 +64,7 @@ class MemoryRuntime:
         graph_mode: GraphMode = "governed_hybrid",
         crystallization_mode: str = "governed_progressive",
         graph_storage: str = "split",
+        mutation_mode: str = "append_only_view",
         embedding_provider: EmbeddingProvider | None = None,
         vector_index: VectorIndex | None = None,
         rerank_provider: RerankProvider | None = None,
@@ -71,15 +74,20 @@ class MemoryRuntime:
         entity_alias_resolver: EntityAliasResolver | None = None,
     ) -> None:
         self.config = config
+        if mutation_mode == "mutable_compat":
+            raise ValueError("mutable_compat is no longer supported; use append-only evidence and materialized views")
         self.config.graph_mode = graph_mode
         self.config.crystallization_mode = crystallization_mode
         self.config.graph_storage = graph_storage
+        self.config.mutation_mode = mutation_mode  # type: ignore[assignment]
         self._runtime = runtime
         self._allow_unsafe_internal = allow_unsafe_internal
         self._validator_stack = ValidatorStack()
         self._policy_provider = policy_provider or DeterministicPolicyProvider()
         self._ledger = MemoryLedger(config.db_path)
         self._executor = PolicyExecutor(runtime, self._ledger, self._validator_stack)
+        self._impact_meter = WorldviewImpactMeter()
+        self._worldview_resolver = WorldviewResolver()
         self._sleep_planner = SleepPlanner()
         self._graph_mode = graph_mode
         self._embedding_provider = embedding_provider
@@ -109,6 +117,7 @@ class MemoryRuntime:
         graph_mode: GraphMode = "governed_hybrid",
         crystallization_mode: str = "governed_progressive",
         graph_storage: str = "split",
+        mutation_mode: str = "append_only_view",
         embedding_provider: EmbeddingProvider | None = None,
         vector_index: VectorIndex | None = None,
         rerank_provider: RerankProvider | None = None,
@@ -117,6 +126,8 @@ class MemoryRuntime:
         relation_proposer: GraphProposalProvider | None = None,
         entity_alias_resolver: EntityAliasResolver | None = None,
     ) -> "MemoryRuntime":
+        if mutation_mode == "mutable_compat":
+            raise ValueError("mutable_compat is no longer supported; use append-only evidence and materialized views")
         root = Path(path)
         root.mkdir(parents=True, exist_ok=True)
         traces = root / "traces"
@@ -133,6 +144,7 @@ class MemoryRuntime:
             graph_mode=graph_mode,
             crystallization_mode=crystallization_mode,
             graph_storage=graph_storage,
+            mutation_mode=mutation_mode,  # type: ignore[arg-type]
             embedding_cache_enabled=_bool_env("NEUROMEM_EMBEDDING_CACHE", True),
             retrieval_cache_ttl_seconds=_int_env("NEUROMEM_RETRIEVAL_CACHE_TTL_SECONDS", 20),
             retrieval_graph_commit=_graph_commit_env(),
@@ -154,6 +166,7 @@ class MemoryRuntime:
             graph_mode=graph_mode,
             crystallization_mode=crystallization_mode,
             graph_storage=graph_storage,
+            mutation_mode=mutation_mode,
             embedding_provider=embedding_provider,
             vector_index=vector_index,
             rerank_provider=rerank_provider,
@@ -178,6 +191,7 @@ class MemoryRuntime:
             graph_mode=str(data.get("graph_mode", "governed_hybrid")),  # type: ignore[arg-type]
             crystallization_mode=str(data.get("crystallization_mode", "governed_progressive")),
             graph_storage=str(data.get("graph_storage", "split")),
+            mutation_mode=str(data.get("mutation_mode", "append_only_view")),
         )
 
     @property
@@ -222,8 +236,23 @@ class MemoryRuntime:
                 audit={"experience_event": experience.to_dict(), "auto_commit": auto_commit},
             )
         )
+        impact = self._assess_experience(experience)
+        self._ledger.record_impact_assessment(impact)
+        self._ledger.append(
+            LedgerEvent(
+                transaction_id=f"txn_{experience.event_id}",
+                namespace=self.config.namespace,
+                agent_id=self.config.agent_id,
+                phase="AUDITED",
+                event_type="worldview_impact_assessed",
+                operation="ASSESS_IMPACT",
+                proposer="deterministic",
+                evidence=[experience.to_dict()],
+                audit={"impact_assessment": impact.to_dict()},
+            )
+        )
         if not auto_commit:
-            return EvidenceBundle(memory_id=None, content=content, evidence=[], event_id=experience.event_id, content_hash=experience.content_hash)
+            return EvidenceBundle(memory_id=None, content=content, evidence=[], event_id=experience.event_id, content_hash=experience.content_hash, impact=impact.to_dict())
         return await self.observe_and_commit({**payload, "evidence": experience.event_id}, experience=experience)
 
     async def observe_and_commit(self, event: MemoryEvent | dict[str, object], *, experience: ExperienceEvent | None = None) -> EvidenceBundle:
@@ -239,6 +268,11 @@ class MemoryRuntime:
             if stored is None:
                 raise RuntimeError("observe_and_commit() could not load recorded experience event")
             experience = stored
+        impact = self._ledger.get_impact_assessment(experience.event_id, namespace=self.config.namespace)
+        if impact is None:
+            assessed = self._assess_experience(experience)
+            self._ledger.record_impact_assessment(assessed)
+            impact = assessed.to_dict()
         memory_type = "episodic"
         if payload.get("type") == "user_preference":
             memory_type = "preference"
@@ -276,6 +310,7 @@ class MemoryRuntime:
                 agent_id=self.config.agent_id,
             ),
         )
+        result.trace.query_plan["worldview_impact"] = impact
         self._persist_trace(result.trace.trace_id, result.trace.to_dict())
         self._invalidate_retrieval_cache()
         memory_id = result.created_memory_ids[0] if result.created_memory_ids else None
@@ -298,7 +333,33 @@ class MemoryRuntime:
             evidence=list(stored_item.evidence) if stored_item is not None else [experience.event_id],
             event_id=experience.event_id,
             content_hash=experience.content_hash,
+            impact=impact,
         )
+
+    async def assess_impact(self, event_id: str) -> dict[str, object]:
+        stored = self._ledger.get_impact_assessment(event_id, namespace=self.config.namespace)
+        if stored is not None:
+            return stored
+        experience = self._ledger.get_experience(event_id, namespace=self.config.namespace)
+        if experience is None:
+            raise ValueError(f"experience event not found: {event_id}")
+        assessment = self._assess_experience(experience)
+        self._ledger.record_impact_assessment(assessment)
+        return assessment.to_dict()
+
+    async def observe_and_route(self, event: MemoryEvent | dict[str, object]) -> dict[str, object]:
+        observed = await self.observe(event, auto_commit=False)
+        if observed.event_id is None:
+            raise RuntimeError("observe_and_route() could not record experience")
+        impact = observed.impact or await self.assess_impact(observed.event_id)
+        decision = str(impact.get("decision"))
+        if decision in {"ledger_only", "ask_clarification", "quarantine"}:
+            return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False}
+        experience = self._ledger.get_experience(observed.event_id, namespace=self.config.namespace)
+        if experience is None:
+            raise RuntimeError("observe_and_route() could not reload experience")
+        committed = await self.observe_and_commit(event, experience=experience)
+        return {"decision": decision, "impact": impact, "bundle": committed.to_dict(), "committed": committed.memory_id is not None}
 
     async def query(
         self,
@@ -309,6 +370,7 @@ class MemoryRuntime:
         lens: str = "auto",
         namespace: str | None = None,
         top_k: int | None = None,
+        include_worldview: bool = True,
     ) -> MemoryContext:
         timing = RuntimeTiming()
         query_obj = query if isinstance(query, MemoryQuery) else MemoryQuery(query=query, budget_tokens=budget_tokens, filters=filters or {})
@@ -348,6 +410,10 @@ class MemoryRuntime:
         with TimingSpan(timing, "retrieval_ms"):
             results, trace = self._runtime.retrieve_with_trace(query_obj.query, filters=query_obj.filters, budget_tokens=query_obj.budget_tokens, task_id=query_obj.query)
         results = self._apply_retrieval_lens(results, resolved_lens)
+        if resolved_lens not in {"historical", "audit"}:
+            suppressed = self._ledger.active_suppressed_memory_ids(namespace_value)
+            if suppressed:
+                results = [result for result in results if getattr(getattr(result, "memory", None), "id", None) not in suppressed]
         if top_k is not None:
             results = results[:top_k]
         after_states = self._memory_states()
@@ -420,6 +486,19 @@ class MemoryRuntime:
         }
         retrieval_metadata = dict(trace.query_plan.get("retrieval_metadata", {})) if isinstance(trace.query_plan.get("retrieval_metadata", {}), dict) else {}
         retrieval_metadata["retrieval_lens"] = resolved_lens
+        worldview_payload: dict[str, object] | None = None
+        if include_worldview and self._runtime.store is not None:
+            packet = self._worldview_resolver.resolve(
+                namespace=namespace_value,
+                lens=resolved_lens,
+                query=query_obj.query,
+                memories=self._runtime.store.list_memories(namespace=namespace_value),
+                suppressed_memory_ids=self._ledger.active_suppressed_memory_ids(namespace_value),
+            )
+            worldview_payload = packet.to_dict()
+            worldview_payload["prompt"] = packet.to_prompt()
+            trace.query_plan["worldview_packet"] = {key: value for key, value in worldview_payload.items() if key != "prompt"}
+            self._persist_trace(trace_id, trace.to_dict())
         context = MemoryContext(
             query=query_obj.query,
             text=text,
@@ -445,6 +524,7 @@ class MemoryRuntime:
             timing=timing.to_dict(),
             cache=cache_info,
             retrieval_metadata=retrieval_metadata,
+            worldview=worldview_payload,
         )
         self._retrieval_cache.set(cache_key, context, semantic_version=store_version, filter_hash=filter_hash)
         self._retrieval_cache_fingerprints[cache_probe_key] = (store_version, filter_hash)
@@ -456,6 +536,12 @@ class MemoryRuntime:
 
     async def commit(self, policy: MemoryPolicy | MemoryPolicyV2, *, authorize_delete: bool = False) -> dict[str, object]:
         legacy_policy = self._executor._coerce_policy(policy)  # noqa: SLF001 - public facade needs task derivation for both policy generations.
+        destructive_reason = _destructive_policy_reason(policy, legacy_policy)
+        if destructive_reason is not None:
+            return _append_only_rejection(legacy_policy.write.target_memory_id or legacy_policy.forget.target_memory_id, destructive_reason)
+        suppression = self._append_only_suppression_from_policy(legacy_policy)
+        if suppression is not None:
+            return suppression
         phase = "after_step" if legacy_policy.write.operation != "NOOP" or legacy_policy.forget.operation != "NOOP" or legacy_policy.consolidation.enabled else "before_step"
         task = legacy_policy.retrieval.query or legacy_policy.write.content or legacy_policy.forget.target_memory_id or "memory mutation"
         result = self._executor.execute(
@@ -471,11 +557,83 @@ class MemoryRuntime:
             ),
         )
         self._persist_trace(result.trace.trace_id, result.trace.to_dict())
-        if phase == "after_step":
+        structural_mutation = isinstance(policy, MemoryPolicyV2) and bool(policy.frame_deltas or policy.associative_deltas or policy.logic_deltas or policy.graph_deltas)
+        if phase == "after_step" or structural_mutation:
             self._invalidate_retrieval_cache()
         value = result.trace.to_dict()
         value["mutation_execution_result"] = result.to_dict()
         return value
+
+    def _append_only_suppression_from_policy(self, policy: MemoryPolicy) -> dict[str, object] | None:
+        if policy.forget.operation not in {"DECAY", "INHIBIT", "INVALIDATE", "ARCHIVE"}:
+            return None
+        memory_id = policy.forget.target_memory_id
+        if not memory_id:
+            return _append_only_rejection(None, "append-only suppression requires a target memory id")
+        item = self._runtime.store.get_memory(memory_id) if self._runtime.store is not None else None
+        if item is None:
+            return _append_only_rejection(memory_id, f"memory not found: {memory_id}")
+        if item.namespace != self.config.namespace:
+            return _append_only_rejection(memory_id, f"target memory outside namespace: {memory_id}")
+        if item.privacy_level in {"user", "sensitive"} and item.acl:
+            return _append_only_rejection(memory_id, "user is not authorized for private memory")
+        transaction_id = f"txn_suppress_{uuid4().hex}"
+        event_type = {
+            "DECAY": "decay",
+            "INHIBIT": "inhibit",
+            "INVALIDATE": "expire",
+            "ARCHIVE": "suppress",
+        }[policy.forget.operation]
+        edge_event = EdgeEvidenceEvent(
+            namespace=self.config.namespace,
+            source_kind="policy",
+            source_id=transaction_id,
+            target_kind="memory",
+            target_id=memory_id,
+            relation="inhibits" if event_type in {"inhibit", "suppress"} else event_type,
+            relation_family="suppression",
+            event_type=event_type,
+            delta_weight=-0.7 if event_type in {"inhibit", "suppress", "expire"} else -0.2,
+            confidence=0.9,
+            evidence_ids=list(policy.write.evidence_ids) or [memory_id],
+            proof_obligation=policy.forget.reason or policy.reason,
+            proposer=policy.source or "deterministic",
+        )
+        self._ledger.append_edge_evidence(edge_event)
+        audit = {"edge_evidence_event": edge_event.to_dict(), "append_only": True, "reason": policy.forget.reason or policy.reason}
+        self._ledger.append(
+            LedgerEvent(
+                transaction_id=transaction_id,
+                namespace=self.config.namespace,
+                agent_id=self.config.agent_id,
+                phase="COMMITTED",
+                event_type="suppression_event_appended",
+                operation=policy.forget.operation,
+                proposer=policy.source or "deterministic",
+                validator_decision="approved",
+                evidence=[{"memory_id": memory_id, "source": "forget"}],
+                targets=[memory_id],
+                lifecycle_delta=[{"memory_id": memory_id, "event_type": event_type, "reason": policy.forget.reason or policy.reason, "append_only": True}],
+                audit=audit,
+            )
+        )
+        self._ledger.append(
+            LedgerEvent(
+                transaction_id=transaction_id,
+                namespace=self.config.namespace,
+                agent_id=self.config.agent_id,
+                phase="AUDITED",
+                event_type="audit_finalized",
+                operation=policy.forget.operation,
+                proposer=policy.source or "deterministic",
+                validator_decision="approved",
+                evidence=[{"memory_id": memory_id, "source": "forget"}],
+                targets=[memory_id],
+                audit=audit,
+            )
+        )
+        self._invalidate_retrieval_cache()
+        return _append_only_suppression_result(memory_id, policy.forget.operation, event_type, edge_event, policy.forget.reason or policy.reason)
 
     async def mutate(self, policy: MemoryPolicy | MemoryPolicyV2, *, authorize_delete: bool = False) -> dict[str, object]:
         return await self.commit(policy, authorize_delete=authorize_delete)
@@ -687,21 +845,76 @@ class MemoryRuntime:
         authorize_delete: bool = False,
     ) -> dict[str, object]:
         normalized = action.lower()
-        if normalized == "delete" and not authorize_delete:
-            policy = MemoryPolicy(
-                retrieval=RetrievalPlan(enabled=False, query=memory_id),
-                write=WritePlan(operation="NOOP"),
-                forget=ForgetPlan(operation="DELETE_REQUEST", target_memory_id=memory_id, reason=reason),
-                consolidation=ConsolidationPlan(enabled=False),
-                reason="delete rejected without explicit authorization",
-                source="deterministic",
-            )
-            return await self.commit(policy, authorize_delete=False)
         if normalized not in {"decay", "inhibit", "invalidate", "archive", "compress", "delete"}:
             raise ValueError(f"unsupported forget action: {action}")
+        if normalized == "delete":
+            return _append_only_rejection(memory_id, "destructive memory delete is not supported; append suppression or redaction evidence instead")
         item = self._runtime.store.get_memory(memory_id) if self._runtime.store is not None else None
         if item is None:
             raise ValueError(f"memory not found: {memory_id}")
+        if normalized != "delete":
+            if item.namespace != self.config.namespace:
+                return _append_only_rejection(memory_id, f"target memory outside namespace: {memory_id}")
+            if item.privacy_level in {"user", "sensitive"} and item.acl:
+                return _append_only_rejection(memory_id, "user is not authorized for private memory")
+            transaction_id = f"txn_forget_{uuid4().hex}"
+            event_type = {
+                "decay": "decay",
+                "inhibit": "inhibit",
+                "invalidate": "expire",
+                "archive": "suppress",
+                "compress": "suppress",
+            }.get(normalized, "inhibit")
+            edge_event = EdgeEvidenceEvent(
+                namespace=self.config.namespace,
+                source_kind="system",
+                source_id=transaction_id,
+                target_kind="memory",
+                target_id=memory_id,
+                relation="inhibits" if event_type in {"inhibit", "suppress"} else event_type,
+                relation_family="suppression",
+                event_type=event_type,
+                delta_weight=-0.7 if event_type in {"inhibit", "suppress", "expire"} else -0.2,
+                confidence=0.9,
+                evidence_ids=[memory_id],
+                proof_obligation=reason,
+                proposer="deterministic",
+            )
+            self._ledger.append_edge_evidence(edge_event)
+            audit = {"edge_evidence_event": edge_event.to_dict(), "append_only": True, "reason": reason}
+            self._ledger.append(
+                LedgerEvent(
+                    transaction_id=transaction_id,
+                    namespace=self.config.namespace,
+                    agent_id=self.config.agent_id,
+                    phase="COMMITTED",
+                    event_type="suppression_event_appended",
+                    operation=_policy_forget_operation(normalized),
+                    proposer="deterministic",
+                    validator_decision="approved",
+                    evidence=[{"memory_id": memory_id, "source": "forget"}],
+                    targets=[memory_id],
+                    lifecycle_delta=[{"memory_id": memory_id, "event_type": event_type, "reason": reason, "append_only": True}],
+                    audit=audit,
+                )
+            )
+            self._ledger.append(
+                LedgerEvent(
+                    transaction_id=transaction_id,
+                    namespace=self.config.namespace,
+                    agent_id=self.config.agent_id,
+                    phase="AUDITED",
+                    event_type="audit_finalized",
+                    operation=_policy_forget_operation(normalized),
+                    proposer="deterministic",
+                    validator_decision="approved",
+                    evidence=[{"memory_id": memory_id, "source": "forget"}],
+                    targets=[memory_id],
+                    audit=audit,
+                )
+            )
+            self._invalidate_retrieval_cache()
+            return _append_only_suppression_result(memory_id, _policy_forget_operation(normalized), event_type, edge_event, reason)
         policy = MemoryPolicy(
             retrieval=RetrievalPlan(enabled=False, query=memory_id),
             write=WritePlan(operation="NOOP"),
@@ -733,6 +946,10 @@ class MemoryRuntime:
     def _persist_trace(self, trace_id: str, data: dict[str, object]) -> None:
         self.config.traces_path.mkdir(parents=True, exist_ok=True)
         (self.config.traces_path / f"{trace_id}.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def _assess_experience(self, experience: ExperienceEvent) -> WorldviewImpactAssessment:
+        memories = self._runtime.store.list_memories(namespace=experience.namespace) if self._runtime.store is not None else []
+        return self._impact_meter.assess(experience, memories)
 
     def _memory_states(self) -> dict[str, dict[str, object]]:
         if self._runtime.store is None:
@@ -801,6 +1018,9 @@ class MemoryRuntime:
         mode = self.config.retrieval_graph_commit
         if mode == "off":
             return {"status": "off"}
+        if mode == "trace_only":
+            selected = [str(memory_id) for memory_id in getattr(trace, "selected_memory_ids", [])]
+            return {"status": "trace_only", "selected_memory_ids": selected}
         if mode == "async":
             selected = [str(memory_id) for memory_id in getattr(trace, "selected_memory_ids", [])]
             if len(selected) < 2:
@@ -1099,9 +1319,79 @@ def _policy_forget_operation(action: str) -> str:
         "inhibit": "INHIBIT",
         "invalidate": "INVALIDATE",
         "archive": "ARCHIVE",
-        "delete": "DELETE_REQUEST",
         "compress": "ARCHIVE",
     }[action]
+
+
+def _destructive_policy_reason(policy: MemoryPolicy | MemoryPolicyV2, legacy_policy: MemoryPolicy) -> str | None:
+    if legacy_policy.write.operation == "UPDATE":
+        return "destructive memory update is not supported; append new evidence or a supersession relation instead"
+    if legacy_policy.forget.operation == "DELETE_REQUEST":
+        return "destructive memory delete is not supported; append suppression or redaction evidence instead"
+    if isinstance(policy, MemoryPolicyV2):
+        if policy.intent == "update":
+            return "destructive memory update is not supported; append new evidence or a supersession relation instead"
+        if policy.intent == "delete_request":
+            return "destructive memory delete is not supported; append suppression or redaction evidence instead"
+        for delta in policy.proposed_deltas:
+            operation = (delta.operation or "").upper()
+            if operation == "UPDATE":
+                return "destructive memory update is not supported; append new evidence or a supersession relation instead"
+            if operation in {"DELETE", "DELETE_REQUEST"}:
+                return "destructive memory delete is not supported; append suppression or redaction evidence instead"
+    return None
+
+
+def _append_only_suppression_result(
+    memory_id: str,
+    operation: str,
+    event_type: str,
+    edge_event: EdgeEvidenceEvent,
+    reason: str,
+) -> dict[str, object]:
+    return {
+        "trace_id": None,
+        "policy_source": "deterministic",
+        "validator_decision": "approved",
+        "executed_actions": [operation],
+        "append_only": True,
+        "edge_evidence_event": edge_event.to_dict(),
+        "mutation_execution_result": {
+            "validated_mutation": {"approved": True, "validator_trace": []},
+            "created_memory_ids": [],
+            "updated_memory_ids": [],
+            "deleted_memory_ids": [],
+            "memory_deltas": [],
+            "graph_deltas": [],
+            "lifecycle_deltas": [{"memory_id": memory_id, "event_type": event_type, "reason": reason, "append_only": True}],
+            "index_deltas": [],
+        },
+    }
+
+
+def _append_only_rejection(memory_id: str | None, reason: str) -> dict[str, object]:
+    return {
+        "trace_id": None,
+        "policy_source": "deterministic",
+        "validator_decision": reason,
+        "rejected_reasons": [reason],
+        "executed_actions": [],
+        "append_only": True,
+        "mutation_execution_result": {
+            "validated_mutation": {
+                "approved": False,
+                "rejected_deltas": [{"operation": "NOOP", "target_memory_id": memory_id, "reason": reason}],
+                "validator_trace": [{"name": "AppendOnlyForgetValidator", "passed": False, "reason": reason}],
+            },
+            "created_memory_ids": [],
+            "updated_memory_ids": [],
+            "deleted_memory_ids": [],
+            "memory_deltas": [],
+            "graph_deltas": [],
+            "lifecycle_deltas": [],
+            "index_deltas": [],
+        },
+    }
 
 
 def _write_config(path: Path, config: RuntimeConfig) -> None:
@@ -1109,7 +1399,7 @@ def _write_config(path: Path, config: RuntimeConfig) -> None:
         return
     values = config.to_dict()
     lines = []
-    for key in ["namespace", "db_path", "traces_path", "agent_id", "mode", "graph_mode", "crystallization_mode", "graph_storage", "version"]:
+    for key in ["namespace", "db_path", "traces_path", "agent_id", "mode", "graph_mode", "crystallization_mode", "graph_storage", "mutation_mode", "version"]:
         lines.append(f'{key} = "{values[key]}"')
     lines.append(f"model_policy_enabled = {str(config.model_policy_enabled).lower()}")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1124,6 +1414,7 @@ def _copy_memory_context(context: MemoryContext) -> MemoryContext:
         timing=dict(context.timing),
         cache=dict(context.cache),
         retrieval_metadata=dict(context.retrieval_metadata),
+        worldview=dict(context.worldview) if context.worldview is not None else None,
     )
 
 
@@ -1142,10 +1433,10 @@ def _int_env(name: str, default: int) -> int:
 
 
 def _graph_commit_env() -> str:
-    value = os.environ.get("NEUROMEM_RETRIEVAL_GRAPH_COMMIT", "async").strip().lower()
-    if value in {"async", "off", "sync"}:
+    value = os.environ.get("NEUROMEM_RETRIEVAL_GRAPH_COMMIT", "trace_only").strip().lower()
+    if value in {"async", "off", "sync", "trace_only"}:
         return value
-    return "async"
+    return "trace_only"
 
 
 __all__ = ["MemoryRuntime"]

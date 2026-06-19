@@ -23,9 +23,10 @@ class RuntimeConfig:
     graph_mode: str = "governed_hybrid"
     crystallization_mode: str = "governed_progressive"
     graph_storage: str = "split"
+    mutation_mode: Literal["append_only_view", "strict_append_only"] = "append_only_view"
     embedding_cache_enabled: bool = True
     retrieval_cache_ttl_seconds: int = 20
-    retrieval_graph_commit: Literal["async", "off", "sync"] = "async"
+    retrieval_graph_commit: Literal["async", "off", "sync", "trace_only"] = "trace_only"
     retrieval_mode: Literal["auto", "full_debug"] = "auto"
     ollama_keep_alive: str = "30m"
     version: str = "0.2.0"
@@ -42,6 +43,7 @@ class RuntimeConfig:
             "graph_mode": self.graph_mode,
             "crystallization_mode": self.crystallization_mode,
             "graph_storage": self.graph_storage,
+            "mutation_mode": self.mutation_mode,
             "embedding_cache_enabled": self.embedding_cache_enabled,
             "retrieval_cache_ttl_seconds": self.retrieval_cache_ttl_seconds,
             "retrieval_graph_commit": self.retrieval_graph_commit,
@@ -99,6 +101,7 @@ class EvidenceBundle:
     trace_id: str | None = None
     event_id: str | None = None
     content_hash: str | None = None
+    impact: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -115,8 +118,13 @@ class MemoryContext:
     timing: dict[str, object] = field(default_factory=dict)
     cache: dict[str, object] = field(default_factory=dict)
     retrieval_metadata: dict[str, object] = field(default_factory=dict)
+    worldview: dict[str, object] | None = None
 
     def to_prompt(self) -> str:
+        if self.worldview and self.worldview.get("prompt"):
+            if self.text:
+                return f"{self.worldview['prompt']}\n\n[Supporting Memory Snippets]\n{self.text}"
+            return str(self.worldview["prompt"])
         return self.text
 
     def to_dict(self) -> dict[str, object]:

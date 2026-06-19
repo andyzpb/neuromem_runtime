@@ -7,9 +7,13 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from sqlite3 import Connection
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 from neuromem_runtime.deltas import MemorySnapshot
+
+if TYPE_CHECKING:
+    from neuromem_runtime.impact import WorldviewImpactAssessment
 
 
 def _now_text() -> str:
@@ -73,6 +77,31 @@ class LedgerEvent:
         payload.pop("ledger_seq", None)
         payload.pop("event_hash", None)
         return payload
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class EdgeEvidenceEvent:
+    namespace: str
+    source_kind: str
+    source_id: str
+    target_kind: str
+    target_id: str
+    relation: str
+    event_type: str
+    evidence_ids: list[str]
+    relation_family: str = "suppression"
+    delta_weight: float = 0.0
+    confidence: float = 0.5
+    proof_obligation: str | None = None
+    outcome: str | None = None
+    valid_from: str | None = None
+    valid_to: str | None = None
+    proposer: str = "deterministic"
+    edge_event_id: str = field(default_factory=lambda: f"edgeevt_{uuid4().hex}")
+    created_at: str = field(default_factory=_now_text)
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -164,6 +193,64 @@ class MemoryLedger:
                     edge_id TEXT NOT NULL,
                     transaction_id TEXT NOT NULL,
                     state_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS edge_evidence_events (
+                    edge_event_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    source_id TEXT NOT NULL,
+                    target_kind TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    relation_family TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    delta_weight REAL NOT NULL DEFAULT 0.0,
+                    confidence REAL NOT NULL DEFAULT 0.5,
+                    evidence_ids_json TEXT NOT NULL,
+                    proof_obligation TEXT,
+                    outcome TEXT,
+                    valid_from TEXT,
+                    valid_to TEXT,
+                    proposer TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS impact_assessments (
+                    impact_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    input_hash TEXT NOT NULL,
+                    impact_score REAL NOT NULL,
+                    impact_type TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    vector_json TEXT NOT NULL,
+                    impacted_slots_json TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS slot_impact_events (
+                    slot_impact_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    slot_key TEXT NOT NULL,
+                    prior_candidates_json TEXT NOT NULL,
+                    posterior_candidates_json TEXT NOT NULL,
+                    belief_delta REAL NOT NULL,
+                    entropy_delta REAL NOT NULL,
+                    top_candidate_changed INTEGER NOT NULL,
+                    contradiction_score REAL NOT NULL,
                     created_at TEXT NOT NULL
                 )
                 """
@@ -295,6 +382,164 @@ class MemoryLedger:
                 ),
             )
         return event
+
+    def record_impact_assessment(self, assessment: WorldviewImpactAssessment, *, conn: Connection | None = None) -> WorldviewImpactAssessment:
+        with self._connection(conn) as active:
+            active.execute(
+                """
+                INSERT OR REPLACE INTO impact_assessments (
+                    impact_id, namespace, event_id, input_hash, impact_score,
+                    impact_type, decision, vector_json, impacted_slots_json, reason, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    assessment.impact_id,
+                    assessment.namespace,
+                    assessment.event_id,
+                    assessment.input_hash,
+                    assessment.impact_score,
+                    assessment.impact_type,
+                    assessment.decision,
+                    _canonical(assessment.vector.to_dict()),
+                    _canonical([slot.to_dict() for slot in assessment.impacted_slots]),
+                    assessment.reason,
+                    _now_text(),
+                ),
+            )
+            for slot in assessment.impacted_slots:
+                active.execute(
+                    """
+                    INSERT INTO slot_impact_events (
+                        slot_impact_id, namespace, event_id, slot_key, prior_candidates_json,
+                        posterior_candidates_json, belief_delta, entropy_delta,
+                        top_candidate_changed, contradiction_score, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"slotimp_{uuid4().hex}",
+                        assessment.namespace,
+                        assessment.event_id,
+                        slot.slot_key,
+                        _canonical(slot.prior_candidates),
+                        _canonical(slot.posterior_candidates),
+                        slot.belief_delta,
+                        slot.entropy_delta,
+                        1 if slot.top_candidate_changed else 0,
+                        slot.contradiction_score,
+                        _now_text(),
+                    ),
+                )
+        return assessment
+
+    def get_impact_assessment(self, event_id: str, *, namespace: str | None = None, conn: Connection | None = None) -> dict[str, object] | None:
+        query = "SELECT * FROM impact_assessments WHERE event_id = ?"
+        params: tuple[object, ...] = (event_id,)
+        if namespace is not None:
+            query += " AND namespace = ?"
+            params = (event_id, namespace)
+        query += " ORDER BY created_at DESC LIMIT 1"
+        with self._connection(conn) as active:
+            row = active.execute(query, params).fetchone()
+        if row is None:
+            return None
+        return {
+            "impact_id": str(row["impact_id"]),
+            "namespace": str(row["namespace"]),
+            "event_id": str(row["event_id"]),
+            "input_hash": str(row["input_hash"]),
+            "impact_score": float(row["impact_score"]),
+            "impact_type": str(row["impact_type"]),
+            "decision": str(row["decision"]),
+            "vector": json.loads(row["vector_json"]),
+            "impacted_slots": json.loads(row["impacted_slots_json"]),
+            "reason": str(row["reason"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    def append_edge_evidence(self, event: EdgeEvidenceEvent, *, conn: Connection | None = None) -> EdgeEvidenceEvent:
+        with self._connection(conn) as active:
+            active.execute(
+                """
+                INSERT OR IGNORE INTO edge_evidence_events (
+                    edge_event_id, namespace, source_kind, source_id, target_kind, target_id,
+                    relation, relation_family, event_type, delta_weight, confidence,
+                    evidence_ids_json, proof_obligation, outcome, valid_from, valid_to,
+                    proposer, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.edge_event_id,
+                    event.namespace,
+                    event.source_kind,
+                    event.source_id,
+                    event.target_kind,
+                    event.target_id,
+                    event.relation,
+                    event.relation_family,
+                    event.event_type,
+                    event.delta_weight,
+                    event.confidence,
+                    _canonical(event.evidence_ids),
+                    event.proof_obligation,
+                    event.outcome,
+                    event.valid_from,
+                    event.valid_to,
+                    event.proposer,
+                    event.created_at,
+                ),
+            )
+        return event
+
+    def edge_evidence_events(self, *, namespace: str | None = None, target_id: str | None = None, event_type: str | None = None, conn: Connection | None = None) -> list[dict[str, object]]:
+        query = "SELECT * FROM edge_evidence_events WHERE 1=1"
+        params: list[object] = []
+        if namespace is not None:
+            query += " AND namespace = ?"
+            params.append(namespace)
+        if target_id is not None:
+            query += " AND target_id = ?"
+            params.append(target_id)
+        if event_type is not None:
+            query += " AND event_type = ?"
+            params.append(event_type)
+        query += " ORDER BY created_at ASC, edge_event_id ASC"
+        with self._connection(conn) as active:
+            rows = active.execute(query, tuple(params)).fetchall()
+        return [
+            {
+                "edge_event_id": str(row["edge_event_id"]),
+                "namespace": str(row["namespace"]),
+                "source_kind": str(row["source_kind"]),
+                "source_id": str(row["source_id"]),
+                "target_kind": str(row["target_kind"]),
+                "target_id": str(row["target_id"]),
+                "relation": str(row["relation"]),
+                "relation_family": str(row["relation_family"]),
+                "event_type": str(row["event_type"]),
+                "delta_weight": float(row["delta_weight"]),
+                "confidence": float(row["confidence"]),
+                "evidence_ids": json.loads(row["evidence_ids_json"]),
+                "proof_obligation": row["proof_obligation"],
+                "outcome": row["outcome"],
+                "valid_from": row["valid_from"],
+                "valid_to": row["valid_to"],
+                "proposer": str(row["proposer"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def active_suppressed_memory_ids(self, namespace: str) -> set[str]:
+        suppressed: set[str] = set()
+        for event in self.edge_evidence_events(namespace=namespace):
+            target_id = str(event["target_id"])
+            if event["target_kind"] != "memory":
+                continue
+            if event["event_type"] in {"inhibit", "suppress", "supersede", "expire"}:
+                suppressed.add(target_id)
+            elif event["event_type"] in {"restore", "reinforce"}:
+                suppressed.discard(target_id)
+        return suppressed
 
     def get_experience(self, event_id: str, *, namespace: str | None = None, conn: Connection | None = None) -> ExperienceEvent | None:
         query = "SELECT * FROM experience_events WHERE event_id = ?"

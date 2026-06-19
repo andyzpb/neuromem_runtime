@@ -25,6 +25,9 @@ def test_public_api_exports() -> None:
     assert nmem.ExecutionDeltaPlan
     assert nmem.MemorySnapshot
     assert nmem.MutationExecutionResult
+    assert nmem.WorldviewImpactAssessment
+    assert nmem.WorldviewPacket
+    assert nmem.EdgeEvidenceEvent
     assert "neuromem_runtime.langgraph" not in sys.modules
     assert "torch" not in sys.modules
     assert "transformers" not in sys.modules
@@ -101,7 +104,9 @@ def test_observe_can_record_experience_without_long_term_mutation(tmp_path) -> N
         assert memory.unsafe_internal_runtime.store is not None
         assert memory.unsafe_internal_runtime.store.list_memories(namespace="demo") == []
         replay = memory.ledger.replay()
-        assert replay[-1]["event_type"] == "experience_observed"
+        assert replay[-1]["event_type"] == "worldview_impact_assessed"
+        assert bundle.impact is not None
+        assert bundle.impact["decision"] in {"ledger_only", "propose_frame", "sleep_priority", "append_evidence", "propose_worldview_candidate"}
 
     asyncio.run(run())
 
@@ -126,15 +131,55 @@ def test_sync_wrapper(tmp_path) -> None:
     bundle = memory.observe_and_commit({"content": "User prefers concise answers.", "type": "user_preference", "evidence": "pref-1"})
     context = memory.query("concise answers")
     assert bundle.memory_id in context.selected_memory_ids
+    assert context.worldview is not None
+    assert "Worldview Snapshot" in context.to_prompt()
 
 
-def test_delete_requires_authorization(tmp_path) -> None:
+def test_observe_and_route_uses_worldview_impact_gate(tmp_path) -> None:
+    async def run() -> None:
+        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
+        first = await memory.observe_and_route({"content": "User prefers concise answers.", "type": "user_preference", "keywords": ["style"]})
+        assert first["impact"]["decision"] in {"propose_frame", "propose_worldview_candidate", "sleep_priority", "append_evidence"}
+        assert first["committed"] is True
+        created_id = first["bundle"]["memory_id"]
+        assert created_id is not None
+
+        duplicate = await memory.observe_and_route({"content": "User prefers concise answers.", "type": "user_preference", "keywords": ["style"]})
+        assert duplicate["impact"]["impact_type"] == "redundant"
+        assert duplicate["decision"] == "ledger_only"
+        assert duplicate["committed"] is False
+
+        changed = await memory.observe_and_route({"content": "Actually, from now on use detailed structured answers instead.", "type": "user_preference", "keywords": ["style"]})
+        assert changed["impact"]["impact_type"] in {"supersession", "conflict", "worldview_update"}
+        assert changed["decision"] in {"propose_worldview_candidate", "ask_clarification"}
+
+    asyncio.run(run())
+
+
+def test_query_returns_worldview_packet_and_trace_only_graph_default(tmp_path) -> None:
+    async def run() -> None:
+        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
+        await memory.observe_and_commit({"content": "User prefers concise answers.", "type": "user_preference", "keywords": ["style"]})
+        await memory.observe_and_commit({"content": "Run pytest after storage schema changes.", "type": "rule", "keywords": ["tests"]})
+
+        context = await memory.query("how should storage schema work be handled", lens="procedural")
+        assert context.worldview is not None
+        assert context.worldview["procedures"]
+        assert "Worldview Snapshot" in context.to_prompt()
+        assert memory.config.retrieval_graph_commit == "trace_only"
+        assert memory.unsafe_internal_runtime.store is not None
+        assert memory.unsafe_internal_runtime.store.list_edges() == []
+
+    asyncio.run(run())
+
+
+def test_delete_is_not_supported_by_append_only_runtime(tmp_path) -> None:
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
         bundle = await memory.observe_and_commit({"content": "Temporary secret should be removed.", "evidence": "trace-1"})
         assert bundle.memory_id is not None
         rejected = await memory.forget(bundle.memory_id, action="delete", reason="test delete")
-        assert "DELETE_REQUEST requires explicit user authorization" in rejected["validator_decision"]
+        assert "destructive memory delete is not supported" in rejected["validator_decision"]
         assert rejected["rejected_reasons"]
         assert rejected["mutation_execution_result"]["validated_mutation"]["approved"] is False
         stored = memory.unsafe_internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[union-attr]
@@ -144,19 +189,25 @@ def test_delete_requires_authorization(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_forget_decay_applies_once_after_validation(tmp_path) -> None:
+def test_forget_appends_suppression_without_mutating_memory_by_default(tmp_path) -> None:
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
         bundle = await memory.observe_and_commit({"content": "Temporary command can decay.", "evidence": "trace-1"})
         assert bundle.memory_id is not None
         before = memory.unsafe_internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[union-attr]
         assert before is not None
-        result = await memory.forget(bundle.memory_id, action="decay", reason="low utility")
+        result = await memory.forget(bundle.memory_id, action="inhibit", reason="low utility")
         after = memory.unsafe_internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[union-attr]
         assert after is not None
-        assert round(after.decay_score - before.decay_score, 3) == 0.2
+        assert after.maturity == before.maturity
+        assert after.inhibition_score == before.inhibition_score
+        assert result["append_only"] is True
         assert result["mutation_execution_result"]["validated_mutation"]["approved"] is True
-        assert memory.ledger.why_written(bundle.memory_id)
+        assert bundle.memory_id in memory.ledger.active_suppressed_memory_ids("demo")
+        current = await memory.query("temporary command", lens="associative")
+        historical = await memory.query("temporary command", lens="historical")
+        assert bundle.memory_id not in current.selected_memory_ids
+        assert bundle.memory_id in historical.selected_memory_ids
 
     asyncio.run(run())
 

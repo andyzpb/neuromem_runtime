@@ -290,7 +290,8 @@ def test_v2_suppress_inhibits_target_memory(tmp_path) -> None:
         assert result["mutation_execution_result"]["validated_mutation"]["approved"] is True
         stored = memory.unsafe_internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[arg-type,union-attr]
         assert stored is not None
-        assert stored.maturity == "inhibited"
+        assert stored.maturity != "inhibited"
+        assert bundle.memory_id in memory.ledger.active_suppressed_memory_ids("demo")
 
     asyncio.run(run())
 
@@ -308,7 +309,7 @@ def test_v2_supersede_rejects_without_partial_mutation(tmp_path) -> None:
         )
         result = await memory.commit(policy)
         assert result["mutation_execution_result"]["validated_mutation"]["approved"] is False
-        assert "supersede requires multi-delta" in result["validator_decision"]
+        assert "destructive memory update is not supported" in result["validator_decision"]
         stored = memory.unsafe_internal_runtime.store.get_memory(bundle.memory_id)  # type: ignore[arg-type,union-attr]
         assert stored is not None
         assert stored.content == "Old current fact."

@@ -217,7 +217,7 @@ def test_automatic_retrieval_graph_builder_uses_bounded_candidates(tmp_path, mon
     asyncio.run(run())
 
 
-def test_default_retrieval_graph_commit_is_queued(tmp_path, monkeypatch) -> None:
+def test_default_retrieval_graph_commit_is_trace_only(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("NEUROMEM_RETRIEVAL_GRAPH_COMMIT", raising=False)
 
     async def run() -> None:
@@ -230,7 +230,7 @@ def test_default_retrieval_graph_commit_is_queued(tmp_path, monkeypatch) -> None
 
         assert replay is not None
         builder = replay["query_plan"]["semantic_graph_builder"]
-        assert builder["status"] == "queued"
+        assert builder["status"] == "trace_only"
 
     asyncio.run(run())
 
