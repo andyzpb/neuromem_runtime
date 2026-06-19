@@ -128,6 +128,12 @@ Dense embeddings, query rewrite, HyDE, alias expansion, and rerankers are opt-in
 
 Retrieval-time graph commit defaults to `trace_only`. Co-retrieval is recorded as trace evidence, but it is not automatically reinforced into the long-term graph. Durable graph reinforcement should come from validated outcome evidence, sleep, or explicit append-only graph proposals.
 
+### Retrieval Performance
+
+`query()` uses a versioned in-memory retrieval cache, so append-only audit events do not force an expensive full cache clear. Durable memory or materialized retrieval graph changes advance the namespace semantic version, and old cached entries age out through TTL/LRU eviction.
+
+Embedding-backed retrieval uses a SQLite embedding cache with WAL mode and batch reads/writes. The cache avoids synchronous `last_accessed_at` writes on every hit, and `LocalVectorIndex` is lock-protected for concurrent reads and batched upserts. `performance_stats()` reports retrieval cache, singleflight, embedding provider, and background job state. `prewarm_embeddings()` can be called at service startup to load a local embedding model before the first user query.
+
 ## Progressive Crystallization
 
 NeuroMem does not turn every event into a logical graph. It uses governed progressive crystallization:

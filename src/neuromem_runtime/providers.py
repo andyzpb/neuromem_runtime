@@ -68,11 +68,17 @@ class OpenAICompatiblePolicyProvider:
                     "content": (
                         "You are NeuroMem Memory PFC. Return JSON only. Prefer MemoryPolicyV2 with keys "
                         "policy_id, proposer, proposal_source, intent, risk_level, evidence_chain, "
-                        "target_selector, proposed_deltas, safety_annotations, temporal_scope, "
+                        "target_selector, grounded_claims, proposed_deltas, safety_annotations, temporal_scope, "
                         "retention_policy, rollback_plan. proposed_deltas must contain operation, "
-                        "target_memory_id, field, value, reason. Use legacy retrieval/write/forget/"
-                        "consolidation/reason only if V2 is impossible. Never request deletion unless "
-                        "the payload explicitly authorizes deletion."
+                        "target_memory_id, field, value, reason. grounded_claims must contain "
+                        "claim_type, canonical_statement, canonical_slot_key, source_kind, "
+                        "commitment_level, confidence, and evidence pointers. Treat user/tool input as "
+                        "truth evidence; assistant text may only be llm_canonicalization or "
+                        "assistant_derivation with derived_from_ids. Do not use UPDATE for product "
+                        "corrections; express corrections as grounded_claims with target_memory_ids or "
+                        "target_candidate_ids plus supersession/inhibition intent. Use legacy retrieval/"
+                        "write/forget/consolidation/reason only if V2 is impossible. Never request "
+                        "deletion unless the payload explicitly authorizes deletion."
                     ),
                 },
                 {"role": "user", "content": json.dumps(dict(payload), sort_keys=True)},
@@ -129,14 +135,14 @@ def extract_policy_payload(value: object) -> dict[str, Any]:
                 continue
             if isinstance(payload, dict):
                 keys = set(payload)
-                if {"policy_id", "proposed_deltas"} & keys or {"retrieval", "write", "forget", "consolidation", "reason"} <= keys:
+                if {"policy_id", "proposed_deltas", "grounded_claims"} & keys or {"retrieval", "write", "forget", "consolidation", "reason"} <= keys:
                     return payload
     raise ValueError("No valid MemoryPolicy JSON payload found")
 
 
 def memory_policy_from_payload(payload: Mapping[str, Any], *, source: str = "small_llm") -> MemoryPolicy | MemoryPolicyV2:
     payload = normalize_policy_payload(payload, source=source)
-    if "policy_id" in payload or "proposed_deltas" in payload:
+    if "policy_id" in payload or "proposed_deltas" in payload or "grounded_claims" in payload:
         return MemoryPolicyV2.model_validate(dict(payload))
     return MemoryPolicy(
         retrieval=RetrievalPlan(**dict(payload["retrieval"])),
@@ -152,9 +158,9 @@ def normalize_policy_payload(payload: Mapping[str, Any], *, source: str = "small
     value = dict(payload)
     if set(value) == {"after_step"} and isinstance(value.get("after_step"), Mapping):
         value = dict(value["after_step"])
-    elif isinstance(value.get("after_step"), Mapping) and not ({"policy_id", "proposed_deltas"} & set(value)):
+    elif isinstance(value.get("after_step"), Mapping) and not ({"policy_id", "proposed_deltas", "grounded_claims"} & set(value)):
         value = dict(value["after_step"])
-    if "policy_id" not in value and "proposed_deltas" not in value:
+    if "policy_id" not in value and "proposed_deltas" not in value and "grounded_claims" not in value:
         return value
 
     value.setdefault("policy_id", f"policy_{abs(hash(json.dumps(value, sort_keys=True, default=str)))}")
@@ -169,6 +175,7 @@ def normalize_policy_payload(payload: Mapping[str, Any], *, source: str = "small
     value["target_selector"] = _normalize_target_selector(value.get("target_selector"))
     value["evidence_chain"] = _normalize_evidence_chain(value.get("evidence_chain"))
     value["proposed_deltas"] = _normalize_proposed_deltas(value.get("proposed_deltas"))
+    value["grounded_claims"] = _normalize_grounded_claims(value.get("grounded_claims"))
     value["safety_annotations"] = dict(value.get("safety_annotations")) if isinstance(value.get("safety_annotations"), Mapping) else {}
     gate = _normalize_write_gate(value.get("write_gate"))
     if gate:
@@ -247,6 +254,38 @@ def _normalize_proposed_deltas(value: object) -> list[dict[str, object]]:
         normalized["value"] = dict(value_obj) if isinstance(value_obj, Mapping) else value_obj
         deltas.append(normalized)
     return deltas
+
+
+def _normalize_grounded_claims(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        return []
+    claims: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        statement = item.get("canonical_statement") or item.get("statement")
+        slot_key = item.get("canonical_slot_key") or item.get("slot_key")
+        if not statement or not slot_key:
+            continue
+        claims.append(
+            {
+                "claim_id": str(item.get("claim_id") or ""),
+                "claim_type": str(item.get("claim_type") or "fact"),
+                "canonical_statement": str(statement),
+                "canonical_slot_key": str(slot_key),
+                "truth_source_event_ids": [str(value) for value in item.get("truth_source_event_ids", [])] if isinstance(item.get("truth_source_event_ids"), list) else [],
+                "proposer": str(item.get("proposer") or "small_llm"),
+                "source_kind": str(item.get("source_kind") or "llm_canonicalization"),
+                "commitment_level": str(item.get("commitment_level") or "candidate_frame"),
+                "confidence": float(item.get("confidence", 0.7) or 0.7),
+                "evidence_ids": [str(value) for value in item.get("evidence_ids", [])] if isinstance(item.get("evidence_ids"), list) else [],
+                "target_memory_ids": [str(value) for value in item.get("target_memory_ids", [])] if isinstance(item.get("target_memory_ids"), list) else [],
+                "target_candidate_ids": [str(value) for value in item.get("target_candidate_ids", [])] if isinstance(item.get("target_candidate_ids"), list) else [],
+                "derived_from_ids": [str(value) for value in item.get("derived_from_ids", [])] if isinstance(item.get("derived_from_ids"), list) else [],
+                "metadata": dict(item.get("metadata", {})) if isinstance(item.get("metadata"), Mapping) else {},
+            }
+        )
+    return claims
 
 
 def _normalize_write_gate(value: object) -> dict[str, object]:

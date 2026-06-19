@@ -146,6 +146,7 @@ class MemoryPolicyV2(BaseModel):
     evidence_chain: list[EvidenceRef] = Field(default_factory=list)
     target_selector: TargetSelector = Field(default_factory=TargetSelector)
     proposed_deltas: list[ProposedDelta] = Field(default_factory=list)
+    grounded_claims: list[dict[str, object]] = Field(default_factory=list)
     frame_deltas: list[FrameDeltaProposal] = Field(default_factory=list)
     associative_deltas: list[AssociativeEdgeProposal] = Field(default_factory=list)
     logic_deltas: list[LogicEdgeProposal] = Field(default_factory=list)

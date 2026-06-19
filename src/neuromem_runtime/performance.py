@@ -5,6 +5,7 @@ import json
 import sqlite3
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -101,6 +102,8 @@ class EmbeddingCache:
         conn = sqlite3.connect(self.db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
     def _init_db(self) -> None:
@@ -121,6 +124,44 @@ class EmbeddingCache:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_embedding_cache_namespace ON embedding_cache(namespace)")
 
     def get(self, *, namespace: str, provider_model: str, text_hash: str) -> list[float] | None:
+        return self.get_many(namespace=namespace, provider_model=provider_model, text_hashes=[text_hash]).get(text_hash)
+
+    def get_many(self, *, namespace: str, provider_model: str, text_hashes: list[str]) -> dict[str, list[float]]:
+        if not text_hashes:
+            return {}
+        keys = {
+            self.cache_key(namespace=namespace, provider_model=provider_model, text_hash=text_hash): text_hash
+            for text_hash in dict.fromkeys(text_hashes)
+        }
+        placeholders = ",".join("?" for _ in keys)
+        result: dict[str, list[float]] = {}
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(f"SELECT cache_key, vector_json FROM embedding_cache WHERE cache_key IN ({placeholders})", tuple(keys)).fetchall()
+            for row in rows:
+                text_hash = keys.get(str(row["cache_key"]))
+                if text_hash is None:
+                    continue
+                vector = json.loads(str(row["vector_json"]))
+                if isinstance(vector, list):
+                    result[text_hash] = [float(value) for value in vector]
+        return result
+
+    def touch_many(self, *, namespace: str, provider_model: str, text_hashes: list[str]) -> None:
+        if not text_hashes:
+            return
+        now = time.time()
+        keys = [self.cache_key(namespace=namespace, provider_model=provider_model, text_hash=text_hash) for text_hash in dict.fromkeys(text_hashes)]
+        with self._lock, self._connect() as conn:
+            conn.executemany("UPDATE embedding_cache SET last_accessed_at = ? WHERE cache_key = ?", [(now, key) for key in keys])
+
+    def flush_touches(self, touches: list[tuple[str, str, str]]) -> None:
+        grouped: dict[tuple[str, str], list[str]] = {}
+        for namespace, provider_model, text_hash in touches:
+            grouped.setdefault((namespace, provider_model), []).append(text_hash)
+        for (namespace, provider_model), text_hashes in grouped.items():
+            self.touch_many(namespace=namespace, provider_model=provider_model, text_hashes=text_hashes)
+
+    def get_legacy(self, *, namespace: str, provider_model: str, text_hash: str) -> list[float] | None:
         key = self.cache_key(namespace=namespace, provider_model=provider_model, text_hash=text_hash)
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT vector_json FROM embedding_cache WHERE cache_key = ?", (key,)).fetchone()
@@ -133,15 +174,23 @@ class EmbeddingCache:
             return [float(value) for value in vector]
 
     def set(self, *, namespace: str, provider_model: str, text_hash: str, vector: list[float]) -> None:
-        key = self.cache_key(namespace=namespace, provider_model=provider_model, text_hash=text_hash)
+        self.set_many(namespace=namespace, provider_model=provider_model, vectors={text_hash: vector})
+
+    def set_many(self, *, namespace: str, provider_model: str, vectors: dict[str, list[float]]) -> None:
+        if not vectors:
+            return
         now = time.time()
+        rows = []
+        for text_hash, vector in vectors.items():
+            key = self.cache_key(namespace=namespace, provider_model=provider_model, text_hash=text_hash)
+            rows.append((key, namespace, provider_model, text_hash, json.dumps(vector), key, now, now))
         with self._lock, self._connect() as conn:
-            conn.execute(
+            conn.executemany(
                 """
                 INSERT OR REPLACE INTO embedding_cache(cache_key, namespace, provider_model, text_hash, vector_json, created_at, last_accessed_at)
                 VALUES (?, ?, ?, ?, ?, COALESCE((SELECT created_at FROM embedding_cache WHERE cache_key = ?), ?), ?)
                 """,
-                (key, namespace, provider_model, text_hash, json.dumps(vector), key, now, now),
+                rows,
             )
 
     @staticmethod
@@ -158,10 +207,11 @@ class RetrievalCacheEntry:
 
 
 class RetrievalCache:
-    def __init__(self, ttl_seconds: int = 20) -> None:
+    def __init__(self, ttl_seconds: int = 20, max_entries: int = 256) -> None:
         self.ttl_seconds = max(0, int(ttl_seconds))
+        self.max_entries = max(1, int(max_entries))
         self._lock = threading.RLock()
-        self._items: dict[str, RetrievalCacheEntry] = {}
+        self._items: OrderedDict[str, RetrievalCacheEntry] = OrderedDict()
         self.hit_count = 0
         self.miss_count = 0
         self.last_miss_reason = "empty"
@@ -184,6 +234,7 @@ class RetrievalCache:
                 self.miss_count += 1
                 self.last_miss_reason = "expired"
                 return None
+            self._items.move_to_end(key)
             self.hit_count += 1
             return entry.value
 
@@ -192,22 +243,61 @@ class RetrievalCache:
             return
         with self._lock:
             self._items[key] = RetrievalCacheEntry(expires_at=time.time() + self.ttl_seconds, value=value, semantic_version=semantic_version, filter_hash=filter_hash)
+            self._items.move_to_end(key)
+            while len(self._items) > self.max_entries:
+                self._items.popitem(last=False)
 
     def invalidate(self, reason: str = "invalidated") -> None:
         with self._lock:
-            self._items.clear()
             self.last_miss_reason = reason
 
     def stats(self) -> dict[str, object]:
         total = self.hit_count + self.miss_count
         return {
             "ttl_seconds": self.ttl_seconds,
+            "max_entries": self.max_entries,
             "entries": len(self._items),
             "hit_count": self.hit_count,
             "miss_count": self.miss_count,
             "hit_rate": round(self.hit_count / total, 4) if total else 0.0,
             "last_miss_reason": self.last_miss_reason,
         }
+
+
+@dataclass(slots=True)
+class SingleFlightHandle:
+    key: str
+    leader: bool
+    event: threading.Event
+
+
+class SingleFlight:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._events: dict[str, threading.Event] = {}
+        self.join_count = 0
+        self.leader_count = 0
+
+    def begin(self, key: str) -> SingleFlightHandle:
+        with self._lock:
+            event = self._events.get(key)
+            if event is not None:
+                self.join_count += 1
+                return SingleFlightHandle(key=key, leader=False, event=event)
+            event = threading.Event()
+            self._events[key] = event
+            self.leader_count += 1
+            return SingleFlightHandle(key=key, leader=True, event=event)
+
+    def finish(self, key: str) -> None:
+        with self._lock:
+            event = self._events.pop(key, None)
+            if event is not None:
+                event.set()
+
+    def stats(self) -> dict[str, object]:
+        with self._lock:
+            return {"inflight": len(self._events), "join_count": self.join_count, "leader_count": self.leader_count}
 
 
 @dataclass(slots=True)

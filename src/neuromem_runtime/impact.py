@@ -22,9 +22,15 @@ ImpactType = Literal[
 ]
 ImpactDecision = Literal[
     "ledger_only",
+    "append_support",
     "append_evidence",
     "propose_frame",
+    "propose_candidate",
     "propose_worldview_candidate",
+    "append_derivation",
+    "append_supersession",
+    "append_contradiction",
+    "append_inhibition",
     "append_suppression",
     "ask_clarification",
     "quarantine",
@@ -93,74 +99,113 @@ class WorldviewImpactMeter:
         worldview_candidates: list[dict[str, object]] | None = None,
         frames: list[MemoryFrame] | None = None,
         edge_events: list[dict[str, object]] | None = None,
+        grounded_claims: list[dict[str, object]] | None = None,
     ) -> WorldviewImpactAssessment:
-        slot_key = _slot_key(event)
-        candidate_rows = _candidate_rows(slot_key, worldview_candidates or [])
-        candidates = _candidate_memories(slot_key, memories)
-        frame_candidates = _candidate_frames(slot_key, frames or [])
-        similarity = max((_jaccard(event.content, memory.content) for memory in memories), default=0.0)
-        slot_similarity = max((_jaccard(event.content, memory.content) for memory in candidates), default=0.0)
-        frame_similarity = max((_jaccard(event.content, frame.content) for frame in frame_candidates), default=0.0)
-        candidate_similarity = max((_jaccard(event.content, str(row.get("statement", ""))) for row in candidate_rows), default=0.0)
-        slot_similarity = max(slot_similarity, frame_similarity, candidate_similarity)
-        contradiction = _contradiction_score(event.content, candidates)
-        contradiction = max(contradiction, _candidate_contradiction_score(event.content, candidate_rows), _edge_contradiction_score(candidate_rows, edge_events or []))
-        supersession = _supersession_score(event.content, candidates, contradiction)
-        supersession = max(supersession, _candidate_supersession_score(event.content, candidate_rows, contradiction))
-        memory_overlap = _memory_overlap(event, memories)
-        novelty = max(0.0, min(1.0, 1.0 - max(similarity, slot_similarity * 0.82, memory_overlap * 0.75)))
-        utility = _utility_score(event)
-        propagation = _propagation_score(event)
-        risk = _risk_score(event.content, event.metadata)
-        source_reliability = _source_reliability(event.source)
-        prior = _candidate_distribution(candidate_rows) if candidate_rows else _distribution(candidates)
-        posterior = _posterior_from_candidates(prior, event.content, contradiction, supersession) if candidate_rows else _posterior(prior, event.content, candidates, contradiction, supersession)
-        belief_delta = _js_divergence([item["score"] for item in prior], [item["score"] for item in posterior])
-        entropy_delta = _entropy([item["score"] for item in prior]) - _entropy([item["score"] for item in posterior])
-        if not candidates and not candidate_rows and novelty > 0.35:
-            belief_delta = max(belief_delta, min(0.65, 0.25 + novelty * 0.35))
+        if grounded_claims:
+            return self._assess_claims(event, grounded_claims)
+        return _assess_unstructured_event(event)
+
+    def _assess_claims(self, event: ExperienceEvent, claims: list[dict[str, object]]) -> WorldviewImpactAssessment:
+        slots: list[SlotImpact] = []
+        max_contradiction = 0.0
+        max_supersession = 0.0
+        max_utility = 0.0
+        has_derivation = False
+        has_candidate = False
+        for claim in claims:
+            slot_key = str(claim.get("canonical_slot_key") or "claim.general")
+            statement = str(claim.get("canonical_statement") or "")
+            confidence = max(0.0, min(1.0, float(claim.get("confidence", 0.5) or 0.5)))
+            target_memory_ids = [str(item) for item in claim.get("target_memory_ids", [])] if isinstance(claim.get("target_memory_ids"), list) else []
+            target_candidate_ids = [str(item) for item in claim.get("target_candidate_ids", [])] if isinstance(claim.get("target_candidate_ids"), list) else []
+            metadata = claim.get("metadata") if isinstance(claim.get("metadata"), dict) else {}
+            is_correction = bool(metadata.get("correction")) or bool(target_memory_ids or target_candidate_ids)
+            is_derivation = str(claim.get("source_kind")) == "assistant_derivation"
+            has_derivation = has_derivation or is_derivation
+            has_candidate = has_candidate or not is_derivation
+            contradiction = 0.86 if is_correction else 0.0
+            supersession = 0.82 if is_correction else 0.0
+            max_contradiction = max(max_contradiction, contradiction)
+            max_supersession = max(max_supersession, supersession)
+            max_utility = max(max_utility, confidence * 0.65)
+            slots.append(
+                SlotImpact(
+                    slot_key=slot_key,
+                    prior_candidates=[{"candidate_id": target, "score": 1.0, "statement": "targeted prior belief"} for target in [*target_memory_ids, *target_candidate_ids]],
+                    posterior_candidates=[{"candidate_id": str(claim.get("claim_id") or "new_claim"), "score": confidence, "statement": statement}],
+                    belief_delta=0.72 if is_correction else 0.38,
+                    entropy_delta=0.0,
+                    top_candidate_changed=is_correction,
+                    contradiction_score=contradiction,
+                )
+            )
         vector = WorldviewImpactVector(
-            novelty=round(novelty, 4),
-            belief_delta=round(belief_delta, 4),
-            entropy_delta=round(entropy_delta, 4),
-            contradiction=round(contradiction, 4),
-            supersession=round(supersession, 4),
-            utility=round(utility, 4),
-            propagation=round(propagation, 4),
-            source_reliability=round(source_reliability, 4),
-            risk=round(risk, 4),
+            novelty=0.0 if not claims else 0.55,
+            belief_delta=max((slot.belief_delta for slot in slots), default=0.0),
+            entropy_delta=0.0,
+            contradiction=max_contradiction,
+            supersession=max_supersession,
+            utility=round(max_utility, 4),
+            propagation=min(1.0, len(claims) / 4.0),
+            source_reliability=_source_reliability(event.source),
+            risk=_risk_score(event.content, event.metadata),
         )
-        raw_score = (
-            0.20 * vector.novelty
-            + 0.25 * vector.belief_delta
-            + 0.15 * abs(vector.entropy_delta)
-            + 0.15 * vector.contradiction
-            + 0.10 * vector.supersession
-            + 0.10 * vector.utility
-            + 0.05 * vector.propagation
-        )
-        effective_score = max(0.0, min(1.0, raw_score * vector.source_reliability))
-        impact_type, decision = _classify(vector, effective_score, candidates, has_worldview_candidates=bool(candidate_rows))
-        slot = SlotImpact(
-            slot_key=slot_key,
-            prior_candidates=prior,
-            posterior_candidates=posterior,
-            belief_delta=vector.belief_delta,
-            entropy_delta=vector.entropy_delta,
-            top_candidate_changed=_top_id(prior) != _top_id(posterior),
-            contradiction_score=vector.contradiction,
-        )
+        if vector.risk >= 0.75:
+            impact_type: ImpactType = "high_risk"
+            decision: ImpactDecision = "quarantine"
+        elif max_supersession > 0:
+            impact_type = "supersession"
+            decision = "append_supersession"
+        elif max_contradiction > 0:
+            impact_type = "conflict"
+            decision = "append_contradiction"
+        elif has_derivation and not has_candidate:
+            impact_type = "worldview_update"
+            decision = "append_derivation"
+        elif claims:
+            impact_type = "worldview_update"
+            decision = "propose_candidate"
+        else:
+            impact_type = "redundant"
+            decision = "ledger_only"
+        score = max(0.0, min(1.0, (0.24 + vector.belief_delta * 0.35 + vector.supersession * 0.25 + vector.utility * 0.16) * vector.source_reliability))
         return WorldviewImpactAssessment(
             event_id=event.event_id,
             namespace=event.namespace,
             input_hash=event.content_hash,
-            impacted_slots=[slot],
+            impacted_slots=slots or [SlotImpact(slot_key="claim.general")],
             vector=vector,
-            impact_score=round(effective_score, 4),
+            impact_score=round(score, 4),
             impact_type=impact_type,
             decision=decision,
-            reason=_reason(impact_type, vector, slot_key),
+            reason=f"{impact_type} from {len(claims)} structured grounded claim(s)",
         )
+
+
+def _assess_unstructured_event(event: ExperienceEvent) -> WorldviewImpactAssessment:
+    risk = _risk_score(event.content, event.metadata)
+    vector = WorldviewImpactVector(source_reliability=_source_reliability(event.source), risk=round(risk, 4))
+    if risk >= 0.75:
+        impact_type: ImpactType = "high_risk"
+        decision: ImpactDecision = "quarantine"
+        score = risk
+        reason = "structured risk metadata requires quarantine"
+    else:
+        impact_type = "redundant"
+        decision = "ledger_only"
+        score = 0.0
+        reason = "raw experience recorded without structured grounded claims"
+    return WorldviewImpactAssessment(
+        event_id=event.event_id,
+        namespace=event.namespace,
+        input_hash=event.content_hash,
+        impacted_slots=[SlotImpact(slot_key="unstructured:ledger_only")],
+        vector=vector,
+        impact_score=round(score, 4),
+        impact_type=impact_type,
+        decision=decision,
+        reason=reason,
+    )
 
 
 def _slot_key(event: ExperienceEvent) -> str:
@@ -169,49 +214,20 @@ def _slot_key(event: ExperienceEvent) -> str:
     if explicit:
         return str(explicit).strip().lower().replace(" ", "_")
     kind = str(metadata.get("type") or "observation").lower()
-    keywords = [str(item).lower() for item in metadata.get("keywords", []) if str(item).strip()] if isinstance(metadata.get("keywords"), list) else []
-    entities = [str(item).lower() for item in metadata.get("entities", []) if str(item).strip()] if isinstance(metadata.get("entities"), list) else []
-    if kind in {"user_preference", "preference"}:
-        return "user_preference:" + (keywords[0] if keywords else "general")
-    if kind in {"rule", "procedure", "procedural"}:
-        return "procedure:" + (keywords[0] if keywords else "general")
-    if kind in {"constraint"}:
-        return "constraint:" + (keywords[0] if keywords else "general")
-    if keywords:
-        return f"{kind}:{keywords[0]}"
-    if entities:
-        return f"{kind}:{entities[0]}"
-    return f"{kind}:general"
+    return f"{kind or 'observation'}:unresolved"
 
 
 def _candidate_memories(slot_key: str, memories: list[MemoryItem]) -> list[MemoryItem]:
-    key_terms = set(slot_key.replace(":", " ").replace("_", " ").split())
-    candidates: list[MemoryItem] = []
-    for memory in memories:
-        haystack = " ".join([memory.type, memory.content, *memory.keywords, *memory.entities, *memory.tags]).lower()
-        if key_terms and key_terms & set(haystack.replace("_", " ").split()):
-            candidates.append(memory)
-    return candidates
+    del slot_key, memories
+    return []
 
 
 def _candidate_frames(slot_key: str, frames: list[MemoryFrame]) -> list[MemoryFrame]:
-    key_terms = set(slot_key.replace(":", " ").replace("_", " ").split())
-    candidates: list[MemoryFrame] = []
-    for frame in frames:
-        haystack = " ".join([frame.frame_type, frame.content, frame.canonical_key]).lower()
-        if key_terms and key_terms & set(haystack.replace("_", " ").split()):
-            candidates.append(frame)
-    return candidates
+    return [frame for frame in frames if frame.canonical_key == slot_key]
 
 
 def _candidate_rows(slot_key: str, rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    key_terms = set(slot_key.replace(":", " ").replace("_", " ").split())
-    candidates: list[dict[str, object]] = []
-    for row in rows:
-        haystack = " ".join([str(row.get("slot_key", "")), str(row.get("slot_kind", "")), str(row.get("statement", ""))]).lower()
-        if str(row.get("slot_key")) == slot_key or (key_terms and key_terms & set(haystack.replace("_", " ").split())):
-            candidates.append(row)
-    return candidates
+    return [row for row in rows if str(row.get("slot_key")) == slot_key]
 
 
 def _candidate_distribution(rows: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -245,21 +261,12 @@ def _posterior_from_candidates(prior: list[dict[str, object]], content: str, con
 
 
 def _candidate_contradiction_score(content: str, rows: list[dict[str, object]]) -> float:
-    text = content.lower()
-    cue_score = min(0.55, 0.14 * sum(1 for cue in ["instead", "no longer", "not anymore", "changed", "stop", "don't", "do not", "现在", "以后", "不要再", "改成", "不再", "不是"] if cue in text))
-    if not rows:
-        return cue_score * 0.5
-    overlap = max((_jaccard(content, str(row.get("statement", ""))) for row in rows), default=0.0)
-    return max(cue_score, min(1.0, cue_score + overlap * 0.35))
+    del content, rows
+    return 0.0
 
 
 def _candidate_supersession_score(content: str, rows: list[dict[str, object]], contradiction: float) -> float:
-    if not rows:
-        return 0.0
-    text = content.lower()
-    cue_count = sum(1 for cue in ["instead", "from now on", "now use", "no longer", "changed to", "以后", "现在", "改成", "替代", "不要再"] if cue in text)
-    if cue_count:
-        return min(1.0, max(0.6, contradiction * 0.55 + 0.18 * cue_count))
+    del content, rows
     return min(1.0, contradiction * 0.55)
 
 
@@ -367,9 +374,7 @@ def _utility_score(event: ExperienceEvent) -> float:
     explicit = metadata.get("future_utility")
     if isinstance(explicit, int | float):
         return max(0.0, min(1.0, float(explicit)))
-    text = event.content.lower()
-    cues = ["always", "prefer", "must", "should", "workflow", "procedure", "run", "test", "记住", "以后", "必须", "不要", "流程"]
-    return min(1.0, 0.12 + 0.12 * sum(1 for cue in cues if cue in text))
+    return 0.0
 
 
 def _propagation_score(event: ExperienceEvent) -> float:
@@ -377,40 +382,24 @@ def _propagation_score(event: ExperienceEvent) -> float:
     tags = metadata.get("tags", [])
     keywords = metadata.get("keywords", [])
     count = (len(tags) if isinstance(tags, list) else 0) + (len(keywords) if isinstance(keywords, list) else 0)
-    text = event.content.lower()
-    if any(cue in text for cue in ["global", "always", "never", "全部", "所有", "以后", "永远"]):
-        count += 3
     return max(0.0, min(1.0, count / 6.0))
 
 
 def _risk_score(content: str, metadata: dict[str, object]) -> float:
+    del content
     explicit = metadata.get("risk")
     if isinstance(explicit, int | float):
         return max(0.0, min(1.0, float(explicit)))
-    text = content.lower()
-    suspicious = ["ignore previous", "override memory", "delete audit", "always trust this unverified", "忽略之前", "删除审计", "永远相信"]
-    sensitive = ["password", "secret", "api key", "token", "private key", "密码", "密钥"]
-    return min(1.0, 0.45 * sum(1 for cue in suspicious if cue in text) + 0.35 * sum(1 for cue in sensitive if cue in text))
+    return 0.0
 
 
 def _contradiction_score(content: str, candidates: list[MemoryItem]) -> float:
-    text = content.lower()
-    cues = ["instead", "no longer", "not anymore", "changed", "stop", "don't", "do not", "现在", "以后", "不要再", "改成", "不再", "不是"]
-    cue_score = min(0.55, 0.14 * sum(1 for cue in cues if cue in text))
-    if not candidates:
-        return cue_score * 0.5
-    overlap = max((_jaccard(content, memory.content) for memory in candidates), default=0.0)
-    return max(cue_score, min(1.0, cue_score + overlap * 0.35))
+    del content, candidates
+    return 0.0
 
 
 def _supersession_score(content: str, candidates: list[MemoryItem], contradiction: float) -> float:
-    text = content.lower()
-    cues = ["instead", "from now on", "now use", "no longer", "changed to", "以后", "现在", "改成", "替代", "不要再"]
-    if not candidates:
-        return 0.0
-    cue_count = sum(1 for cue in cues if cue in text)
-    if cue_count:
-        return min(1.0, max(0.6, contradiction * 0.55 + 0.18 * cue_count))
+    del content, candidates
     return min(1.0, contradiction * 0.55)
 
 

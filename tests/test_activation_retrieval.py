@@ -19,11 +19,11 @@ def _memory(content: str, *, memory_type: str = "episodic", maturity: str = "fre
 
 
 def test_query_plan_v2_routes_intents() -> None:
-    assert build_query_plan_v2("What procedure should fix login redirects?").intent == "procedural_recall"
-    assert build_query_plan_v2("What style does the user prefer?").intent == "preference_recall"
-    assert build_query_plan_v2("What is the latest session rule?").intent == "temporal_current"
-    assert build_query_plan_v2("Why is auth related to redirect?").mode == "drift_activation"
-    assert build_query_plan_v2("Summarize common failures").mode == "global_consolidated"
+    assert build_query_plan_v2("What procedure should fix login redirects?", filters={"query_intent": "procedural_recall"}).intent == "procedural_recall"
+    assert build_query_plan_v2("What style does the user prefer?", filters={"query_intent": "preference_recall"}).intent == "preference_recall"
+    assert build_query_plan_v2("What is the latest session rule?", filters={"query_intent": "temporal_current"}).intent == "temporal_current"
+    assert build_query_plan_v2("Why is auth related to redirect?", filters={"query_intent": "multi_hop"}).mode == "drift_activation"
+    assert build_query_plan_v2("Summarize common failures", filters={"query_intent": "summary"}).mode == "global_consolidated"
 
 
 def test_sqlite_fts_card_index_retrieves_symbols_and_multilingual_terms(tmp_path) -> None:
@@ -72,4 +72,3 @@ def test_lifecycle_gate_suppresses_inhibited_without_historical(tmp_path) -> Non
 
     assert [candidate.memory.id for candidate in result.selected] == [active.id]
     assert result.ledger_record.suppressed_ids[inhibited.id] == "lifecycle_suppressed:inhibited"
-

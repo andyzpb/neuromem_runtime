@@ -51,7 +51,7 @@ def consolidate(memories: list[MemoryItem]) -> ConsolidationReport:
         if item.type == "semantic" and item.consolidation_count >= 1:
             item.maturity = "core"
         if item.type == "episodic" and item.maturity != "obsolete":
-            key = " ".join(sorted(set((item.keywords or []) + (item.tags or [])))) or item.content.lower()[:48]
+            key = " ".join(sorted(set((item.keywords or []) + (item.tags or [])))) or item.id
             replay_groups.setdefault(key, []).append(item)
         if item.type in {"working", "provisional"} and item.decay_score >= 0.8:
             item.maturity = "archived"

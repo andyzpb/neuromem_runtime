@@ -138,20 +138,52 @@ def test_sync_wrapper(tmp_path) -> None:
 def test_observe_and_route_uses_worldview_impact_gate(tmp_path) -> None:
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
-        first = await memory.observe_and_route({"content": "User prefers concise answers.", "type": "user_preference", "keywords": ["style"]})
-        assert first["impact"]["decision"] in {"propose_frame", "propose_worldview_candidate", "sleep_priority", "append_evidence"}
+        first = await memory.observe_and_route(
+            {
+                "content": "User prefers concise answers.",
+                "type": "user_preference",
+                "grounded_claims": [
+                    {
+                        "claim_type": "preference",
+                        "canonical_statement": "The user prefers concise answers.",
+                        "canonical_slot_key": "user.preference.answer_style",
+                        "source_kind": "llm_canonicalization",
+                        "commitment_level": "candidate_frame",
+                        "confidence": 0.86,
+                    }
+                ],
+            }
+        )
+        assert first["impact"]["decision"] == "propose_candidate"
         assert first["committed"] is False
         assert first["bundle"]["memory_id"] is None
-        assert first.get("frame_id") or first.get("edge_evidence_events") or first.get("sleep_priority")
+        assert first.get("candidate_events")
 
-        duplicate = await memory.observe_and_route({"content": "User prefers concise answers.", "type": "user_preference", "keywords": ["style"]})
+        duplicate = await memory.observe_and_route({"content": "User prefers concise answers.", "type": "user_preference"})
         assert duplicate["impact"]["impact_type"] == "redundant"
         assert duplicate["decision"] == "ledger_only"
         assert duplicate["committed"] is False
 
-        changed = await memory.observe_and_route({"content": "Actually, from now on use detailed structured answers instead.", "type": "user_preference", "keywords": ["style"]})
-        assert changed["impact"]["impact_type"] in {"supersession", "conflict", "worldview_update"}
-        assert changed["decision"] in {"propose_worldview_candidate", "ask_clarification"}
+        changed = await memory.observe_and_route(
+            {
+                "content": "Actually, from now on use detailed structured answers instead.",
+                "type": "user_preference",
+                "grounded_claims": [
+                    {
+                        "claim_type": "preference",
+                        "canonical_statement": "The user prefers detailed structured answers.",
+                        "canonical_slot_key": "user.preference.answer_style",
+                        "source_kind": "llm_canonicalization",
+                        "commitment_level": "candidate_frame",
+                        "confidence": 0.88,
+                        "target_candidate_ids": [first["grounded_claims"][0]["claim_id"]],
+                        "metadata": {"correction": True},
+                    }
+                ],
+            }
+        )
+        assert changed["impact"]["impact_type"] == "supersession"
+        assert changed["decision"] == "append_supersession"
 
     asyncio.run(run())
 

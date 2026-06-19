@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 from neuromem.core.models import MemoryEdge, MemoryItem
@@ -14,12 +15,13 @@ class ReconsolidationDecision:
 
 class Reconsolidator:
     def judge(self, memory: MemoryItem, evidence: str) -> ReconsolidationDecision:
-        text = evidence.lower()
-        if any(term in text for term in ["obsolete", "supersede", "replaced", "now says", "changed to"]):
+        del memory
+        relation = _structured_relation(evidence)
+        if relation in {"contradicted", "superseded", "inhibited"}:
             return ReconsolidationDecision("contradicted", "new evidence supersedes this memory")
-        if any(term in text for term in ["confirmed", "reinforced", "supports", "repeated"]):
+        if relation in {"reinforced", "supported"}:
             return ReconsolidationDecision("reinforced", "new evidence reinforces this memory")
-        if any(term in text for term in ["generalize", "rule", "workflow"]):
+        if relation in {"generalized", "compiled"}:
             return ReconsolidationDecision("generalized", "new evidence suggests a reusable rule")
         return ReconsolidationDecision("touched", "memory retrieved with neutral evidence")
 
@@ -42,3 +44,13 @@ class Reconsolidator:
             return memory, None
         return memory, None
 
+
+def _structured_relation(evidence: str) -> str:
+    try:
+        payload = json.loads(evidence)
+    except Exception:
+        payload = None
+    if not isinstance(payload, dict):
+        return ""
+    value = payload.get("relation") or payload.get("event_type") or payload.get("lifecycle_relation")
+    return str(value or "").strip().lower()

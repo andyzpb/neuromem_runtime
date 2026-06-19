@@ -26,15 +26,14 @@ class SalienceVector:
 
 def compute_salience(event: dict[str, object], context: dict[str, object] | None = None) -> dict[str, float]:
     context = context or {}
-    text = " ".join(str(value) for value in event.values())
     vector = SalienceVector(
-        novelty=0.9 if event.get("type") in {"failure", "update", "user_preference"} else 0.4,
-        surprise=0.8 if "unexpected" in text.lower() else 0.3,
-        task_value=0.7 if context.get("task") else 0.4,
-        failure_cost=0.9 if event.get("outcome") == "failure" else 0.2,
-        user_feedback=0.8 if event.get("source") == "user" else 0.1,
-        recurrence=0.7 if event.get("repeat", False) else 0.2,
-        conflict=0.8 if event.get("conflict", False) else 0.1,
+        novelty=_score(event, "novelty", default=0.9 if event.get("type") in {"failure", "update", "user_preference"} else 0.4),
+        surprise=_score(event, "surprise", default=0.3),
+        task_value=_score(event, "task_value", default=0.7 if context.get("task") else 0.4),
+        failure_cost=_score(event, "failure_cost", default=0.9 if event.get("outcome") == "failure" else 0.2),
+        user_feedback=_score(event, "user_feedback", default=0.8 if event.get("source") == "user" else 0.1),
+        recurrence=_score(event, "recurrence", default=0.7 if event.get("repeat", False) else 0.2),
+        conflict=_score(event, "conflict", default=0.8 if event.get("conflict", False) else 0.1),
     )
     return vector.as_dict()
 
@@ -62,3 +61,13 @@ def salience_vector(salience: dict[str, float]) -> SalienceVector:
         recurrence=salience.get("recurrence", 0.0),
         conflict=salience.get("conflict", 0.0),
     )
+
+
+def _score(event: dict[str, object], key: str, *, default: float) -> float:
+    value = event.get(key)
+    if isinstance(value, int | float):
+        return max(0.0, min(1.0, float(value)))
+    vector = event.get("salience")
+    if isinstance(vector, dict) and isinstance(vector.get(key), int | float):
+        return max(0.0, min(1.0, float(vector[key])))
+    return default

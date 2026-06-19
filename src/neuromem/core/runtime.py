@@ -92,9 +92,7 @@ class NeuroMemRuntime:
         content = str(trace.get("content") or outcome.get("patch_summary") or task)
         confidence = float(outcome.get("confidence", 0.75) or 0.75)
         salience_estimate = float(outcome.get("salience", 0.65) or 0.65)
-        memory_type = "episodic"
-        if status == "success" and any(term in content.lower() for term in ["must", "always", "rule", "procedure"]):
-            memory_type = "procedural"
+        memory_type = str(outcome.get("memory_type") or trace.get("memory_type") or "episodic")
         return MemoryPolicy(
             retrieval=RetrievalPlan(enabled=False, query=task),
             write=WritePlan(
@@ -613,18 +611,24 @@ class NeuroMemRuntime:
 
     def _mark_contradictions(self, task: str, trace: dict[str, object], outcome: dict[str, object], memory_ids: list[str]) -> None:
         assert self.store is not None
-        content = f"{task} {trace.get('content', '')} {outcome.get('content', '')}".lower()
-        if not any(term in content for term in ["now", "current", "instead", "replaces", "supersedes", "contradict", "obsolete"]):
+        del task
+        targeted_ids = set()
+        for source in (trace, outcome):
+            for key in ("contradicts_memory_ids", "supersedes_memory_ids", "inhibits_memory_ids", "obsolete_memory_ids"):
+                values = source.get(key)
+                if isinstance(values, list):
+                    targeted_ids.update(str(value) for value in values if str(value))
+        if not targeted_ids:
             return
         for memory_id in memory_ids:
+            if memory_id not in targeted_ids:
+                continue
             memory = self.store.get_memory(memory_id)
             if memory is None or memory.maturity in {"deleted", "obsolete", "inhibited"}:
                 continue
-            memory_text = memory.content.lower()
-            if any(term in memory_text for term in ["old", "deprecated"]) or any(term in content for term in ["replaces", "instead", "supersedes", "obsolete"]):
-                obsolete(memory, reason=f"contradicted by trace {trace.get('id') or trace.get('trace_id') or task}")
-                self.store.upsert_memory(memory)
-                self.memory_tap.emit("forget", operation="INVALIDATE", memory_id=memory.id, reason="contradictory update")
+            obsolete(memory, reason=f"contradicted by trace {trace.get('id') or trace.get('trace_id') or 'structured_evidence'}")
+            self.store.upsert_memory(memory)
+            self.memory_tap.emit("forget", operation="INVALIDATE", memory_id=memory.id, reason="structured contradictory evidence")
 
     def replay_trace(self, trace_id: str) -> dict[str, object] | None:
         trace = self.traces.get(trace_id)

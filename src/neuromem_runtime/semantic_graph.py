@@ -156,9 +156,6 @@ class GraphCandidateGenerator:
                     lexical = _jaccard(left.content, right.content)
                     if lexical >= 0.18:
                         add_pair(left.id, right.id, "lexical_overlap", lexical * 0.4, ["associated_with", "same_as"])
-                if _looks_like_supersession(left.content, right.content):
-                    add_pair(left.id, right.id, "same_failure_pattern", 0.48, ["supersedes", "contradicts"])
-
         candidates = sorted(
             [candidate for candidate in pairs.values() if candidate.score >= self.min_score and candidate.evidence_ids],
             key=lambda candidate: (-candidate.score, candidate.source_memory_id, candidate.target_memory_id),
@@ -327,10 +324,6 @@ def _apply_endpoint_lists(store: MemoryStore, proposal: GraphDeltaProposal) -> N
 def _choose_relation(candidate: GraphRelationCandidate, by_id: dict[str, MemoryItem]) -> str | None:
     suggestions = candidate.suggested_relations
     if "same_canonical_fact_key" in candidate.candidate_sources:
-        source = by_id.get(candidate.source_memory_id)
-        target = by_id.get(candidate.target_memory_id)
-        if source and target and _looks_like_supersession(source.content, target.content):
-            return "supersedes"
         if "same_as" in suggestions:
             return "same_as"
     for preferred in ["derived_from", "evidence_for", "procedure_for", "generalizes", "supports", "retrieved_with", "coactivated_with", "precedes", "contradicts", "supersedes"]:
@@ -498,11 +491,6 @@ def _normalize_vector(vector: list[float]) -> list[float]:
 
 def _cosine(left: list[float], right: list[float]) -> float:
     return sum(l * r for l, r in zip(left, right, strict=False))
-
-
-def _looks_like_supersession(left: str, right: str) -> bool:
-    text = f"{left} {right}".lower()
-    return any(term in text for term in ["now", "current", "instead", "replaces", "replaced", "supersedes", "obsolete", "deprecated", "contradict"])
 
 
 __all__ = [

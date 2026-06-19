@@ -142,7 +142,9 @@ class WorldviewMaterializer:
             self._write_materialized_edges(store, aggregations)
         self._ledger.clear_worldview_materialization(namespace)
         suppressed = self._suppressed_memory_ids(events)
-        candidates = self._materialize_candidates(namespace=namespace, memories=memory_items, frames=frame_items, events=events, suppressed_memory_ids=suppressed)
+        suppressed_claims = self._suppressed_claim_ids(events)
+        claim_candidates = self._materialize_claim_candidates(namespace=namespace, claims=self._ledger.grounded_claims(namespace=namespace), events=events, suppressed_claim_ids=suppressed_claims)
+        candidates = claim_candidates + self._materialize_candidates(namespace=namespace, memories=memory_items, frames=frame_items, events=events, suppressed_memory_ids=suppressed)
         return MaterializedWorldview(
             namespace=namespace,
             edge_count=len([item for item in aggregations if abs(item.weight) > 0.001]),
@@ -284,10 +286,56 @@ class WorldviewMaterializer:
             count += 1
         return count
 
+    def _materialize_claim_candidates(
+        self,
+        *,
+        namespace: str,
+        claims: list[dict[str, object]],
+        events: list[dict[str, object]],
+        suppressed_claim_ids: set[str],
+    ) -> int:
+        count = 0
+        event_index = _event_index(events)
+        for claim in claims:
+            slot_kind = _slot_kind_for_claim(claim)
+            slot_key = str(claim.get("canonical_slot_key") or "claim.general")
+            slot = self._ledger.upsert_worldview_slot(WorldviewSlotRecord(namespace=namespace, key=slot_key, kind=slot_kind, scope="global"))
+            status = _candidate_status_for_claim(claim, suppressed_claim_ids)
+            score_components = _score_components_for_claim(claim, event_index, suppressed=status in {"suppressed", "historical", "rejected"})
+            candidate = WorldviewCandidateRecord(
+                namespace=namespace,
+                slot_id=slot.slot_id,
+                candidate_id=str(claim["claim_id"]),
+                statement=str(claim.get("canonical_statement") or ""),
+                value=json.dumps({"claim": claim}, ensure_ascii=False, sort_keys=True),
+                status=status,
+                confidence=float(claim.get("confidence", 0.5) or 0.5),
+                source_frame_ids=[],
+                source_memory_ids=[str(item) for item in claim.get("target_memory_ids", [])],
+                evidence_ids=[str(item) for item in claim.get("evidence_ids", [])],
+                score=_candidate_score(score_components),
+                score_components=score_components,
+            )
+            self._ledger.upsert_worldview_candidate(candidate)
+            count += 1
+        return count
+
     def _suppressed_memory_ids(self, events: list[dict[str, object]]) -> set[str]:
         suppressed: set[str] = set()
         for event in events:
             if event.get("target_kind") != "memory":
+                continue
+            target_id = str(event["target_id"])
+            if event["event_type"] in {"inhibit", "suppress", "supersede", "expire"}:
+                suppressed.add(target_id)
+            elif event["event_type"] in {"restore", "reinforce"}:
+                suppressed.discard(target_id)
+        return suppressed
+
+    def _suppressed_claim_ids(self, events: list[dict[str, object]]) -> set[str]:
+        suppressed: set[str] = set()
+        for event in events:
+            if event["target_kind"] != "claim":
                 continue
             target_id = str(event["target_id"])
             if event["event_type"] in {"inhibit", "suppress", "supersede", "expire"}:
@@ -357,6 +405,40 @@ def _score_components_for_memory(memory: MemoryItem, event_index: dict[str, dict
     }
 
 
+def _score_components_for_claim(claim: dict[str, object], event_index: dict[str, dict[str, float]], *, suppressed: bool) -> dict[str, object]:
+    scores = _target_scores(event_index, str(claim.get("claim_id") or ""))
+    confidence = _clamp(float(claim.get("confidence", 0.5) or 0.5))
+    source_kind = str(claim.get("source_kind") or "")
+    commitment = str(claim.get("commitment_level") or "")
+    evidence_ids = [str(item) for item in claim.get("evidence_ids", [])] if isinstance(claim.get("evidence_ids"), list) else []
+    derived_from_ids = [str(item) for item in claim.get("derived_from_ids", [])] if isinstance(claim.get("derived_from_ids"), list) else []
+    source_reliability = {
+        "observed_user_fact": 0.82,
+        "tool_fact": 0.9,
+        "llm_canonicalization": 0.68,
+        "assistant_derivation": 0.42,
+    }.get(source_kind, 0.5)
+    lifecycle = {
+        "raw_experience": 0.04,
+        "candidate_frame": 0.08,
+        "durable_memory": 0.2,
+        "validated_logic": 0.3,
+        "compiled_schema": 0.34,
+    }.get(commitment, 0.08)
+    return {
+        "support_strength": min(1.0, confidence * source_reliability * 0.62 + scores["support"]),
+        "provenance_strength": min(1.0, 0.18 * len(set(evidence_ids)) + 0.08 * len(set(derived_from_ids))),
+        "recency_validity": 0.85 if not suppressed else 0.2,
+        "utility_success": min(1.0, scores["utility_success"]),
+        "lifecycle_commitment": lifecycle,
+        "user_confirmation": 0.18 if source_kind == "observed_user_fact" else 0.0,
+        "contradiction": min(1.0, scores["contradiction"]),
+        "inhibition": min(1.0, scores["inhibition"] + (0.65 if suppressed else 0.0)),
+        "supersession": min(1.0, scores["supersession"]),
+        "staleness": min(1.0, scores["decay"]),
+    }
+
+
 def _candidate_score(components: dict[str, object]) -> float:
     positive = (
         0.24 * float(components["support_strength"])
@@ -405,17 +487,31 @@ def _slot_kind_for_memory(memory: MemoryItem) -> str:
     return "hypothesis" if memory.type in {"working", "provisional"} else "fact"
 
 
+def _slot_kind_for_claim(claim: dict[str, object]) -> str:
+    kind = str(claim.get("claim_type") or "fact").lower()
+    if kind in {"fact", "preference", "constraint", "procedure", "schema", "hypothesis", "suppression"}:
+        return kind
+    if kind in {"procedural", "rule"}:
+        return "procedure"
+    if kind in {"claim", "episode", "episodic", "entity"}:
+        return "fact"
+    return "hypothesis"
+
+
 def _slot_key_for_memory(memory: MemoryItem, kind: str) -> str:
     if memory.keywords:
         return f"{kind}:{memory.keywords[0].lower()}"
     if memory.entities:
         return f"{kind}:{memory.entities[0].lower()}"
-    return _canonical_key(memory.summary or memory.content, kind)
+    return f"{kind}:memory_{memory.id}"
 
 
 def _canonical_key(content: str, kind: str) -> str:
-    terms = [term.strip(".,:;!?()[]{}\"'").lower() for term in content.split() if len(term.strip(".,:;!?()[]{}\"'")) > 3]
-    return f"{kind}:{'_'.join(terms[:4]) or 'general'}"
+    return f"{kind}:hash_{_stable_key_hash({'kind': kind, 'content': content})[:16]}"
+
+
+def _stable_key_hash(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 def _candidate_status_for_frame(frame: MemoryFrame) -> str:
@@ -424,6 +520,20 @@ def _candidate_status_for_frame(frame: MemoryFrame) -> str:
     if frame.lifecycle_state == "superseded":
         return "historical"
     if frame.commitment_level in {"validated_logic", "compiled_schema"} and frame.lifecycle_state in {"validated", "compiled", "mature"}:
+        return "active"
+    return "provisional"
+
+
+def _candidate_status_for_claim(claim: dict[str, object], suppressed_claim_ids: set[str]) -> str:
+    claim_id = str(claim.get("claim_id") or "")
+    if claim_id in suppressed_claim_ids:
+        return "suppressed"
+    source_kind = str(claim.get("source_kind") or "")
+    commitment = str(claim.get("commitment_level") or "")
+    metadata = claim.get("metadata") if isinstance(claim.get("metadata"), dict) else {}
+    if source_kind == "assistant_derivation" and not bool(metadata.get("eligible_for_normal_prompt")) and commitment not in {"validated_logic", "compiled_schema"}:
+        return "rejected"
+    if commitment in {"validated_logic", "compiled_schema", "durable_memory"}:
         return "active"
     return "provisional"
 

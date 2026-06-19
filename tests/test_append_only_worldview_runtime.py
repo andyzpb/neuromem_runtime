@@ -9,11 +9,26 @@ import neuromem_runtime as nmem
 def test_route_proposes_candidate_without_durable_memory_and_query_returns_worldview(tmp_path) -> None:
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
-        routed = await memory.observe_and_route({"content": "User prefers brief direct answers.", "type": "user_preference", "keywords": ["style"]})
+        routed = await memory.observe_and_route(
+            {
+                "content": "User prefers brief direct answers.",
+                "type": "user_preference",
+                "grounded_claims": [
+                    {
+                        "claim_type": "preference",
+                        "canonical_statement": "The user prefers brief direct answers.",
+                        "canonical_slot_key": "user.preference.answer_style",
+                        "source_kind": "llm_canonicalization",
+                        "commitment_level": "candidate_frame",
+                        "confidence": 0.84,
+                    }
+                ],
+            }
+        )
 
         assert routed["committed"] is False
         assert routed["bundle"]["memory_id"] is None
-        assert routed["decision"] in {"propose_frame", "propose_worldview_candidate", "append_evidence", "sleep_priority"}
+        assert routed["decision"] == "propose_candidate"
 
         packet = await memory.resolve_worldview("style", lens="audit")
         assert packet["slots"]
@@ -81,6 +96,7 @@ def test_sleep_compiles_frames_without_mutating_source_memories(tmp_path) -> Non
         first = await memory.observe_and_commit({"content": "When login redirect fails, refresh the session first.", "type": "rule", "keywords": ["login", "redirect"]})
         second = await memory.observe_and_commit({"content": "For redirect validation, check the session freshness.", "type": "rule", "keywords": ["login", "redirect"]})
         assert first.memory_id and second.memory_id
+        await memory.query("login redirect session", top_k=2)
 
         store = memory.unsafe_internal_runtime.store
         before = {item.id: item.to_record() for item in store.list_memories(namespace="demo")}  # type: ignore[union-attr]

@@ -22,12 +22,16 @@ class WriteDecision:
 
 class PFCController:
     def plan_retrieval(self, query: str, state: dict[str, object] | None = None, budget_tokens: int = 1500) -> RetrievalPlan:
-        text = f"{query} {state or ''}".lower()
-        memory_types: list[str] = []
-        if any(term in text for term in ["bug", "failure", "error", "regression"]):
-            memory_types.extend(["episodic", "procedural"])
-        if any(term in text for term in ["preference", "current", "fact", "command", "test", "testing"]):
-            memory_types.extend(["semantic", "preference", "procedural", "episodic"])
+        del query
+        state = state or {}
+        explicit_types = state.get("memory_types") or state.get("retrieval_memory_types")
+        memory_types = [str(item) for item in explicit_types] if isinstance(explicit_types, list) else []
+        intent = str(state.get("query_intent") or state.get("intent") or "")
+        if not memory_types and intent:
+            if intent == "task_outcome":
+                memory_types = ["episodic", "procedural"]
+            elif intent == "worldview":
+                memory_types = ["semantic", "preference", "procedural", "episodic"]
         return RetrievalPlan(memory_types=list(dict.fromkeys(memory_types)), context_budget_tokens=budget_tokens)
 
     def decide_write(self, salience_score: float, event: dict[str, object]) -> WriteDecision:

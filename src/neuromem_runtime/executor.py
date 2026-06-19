@@ -405,6 +405,7 @@ class PolicyExecutor:
         gate = policy.write_gate.model_dump(mode="json") if policy.write_gate is not None else policy.safety_annotations.get("write_gate")
         if isinstance(gate, dict):
             legacy.write_gate = dict(gate)
+            legacy.write_gate.setdefault("risk_level", policy.risk_level)
 
     def _unsupported_v2_reason(self, policy: MemoryPolicyV2) -> str | None:
         if policy.intent == "supersede" and not (policy.graph_deltas or policy.logic_deltas):

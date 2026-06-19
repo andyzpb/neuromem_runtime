@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import threading
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -17,6 +18,11 @@ from neuromem.retrieval.activation import (
 
 class EmbeddingProvider(Protocol):
     def embed(self, texts: list[str]) -> list[list[float]]:
+        raise NotImplementedError
+
+
+class AsyncEmbeddingProvider(Protocol):
+    async def aembed(self, texts: list[str]) -> list[list[float]]:
         raise NotImplementedError
 
 
@@ -75,15 +81,19 @@ class LocalVectorIndex:
 
     def __init__(self) -> None:
         self._vectors: dict[str, tuple[str, list[float]]] = {}
+        self._lock = threading.RLock()
 
     def upsert(self, items: dict[str, list[float]], *, namespace: str = "default") -> None:
-        for memory_id, vector in items.items():
-            self._vectors[memory_id] = (namespace, _normalize(vector))
+        with self._lock:
+            for memory_id, vector in items.items():
+                self._vectors[memory_id] = (namespace, _normalize(vector))
 
     def search(self, vector: list[float], *, namespace: str | None = None, top_k: int = 8) -> list[tuple[str, float]]:
         query = _normalize(vector)
+        with self._lock:
+            snapshot = list(self._vectors.items())
         scored: list[tuple[str, float]] = []
-        for memory_id, (item_namespace, item_vector) in self._vectors.items():
+        for memory_id, (item_namespace, item_vector) in snapshot:
             if namespace is not None and item_namespace != namespace:
                 continue
             score = sum(left * right for left, right in zip(query, item_vector, strict=False))
@@ -92,8 +102,9 @@ class LocalVectorIndex:
         return sorted(scored, key=lambda item: (-item[1], item[0]))[:top_k]
 
     def delete(self, ids: list[str]) -> None:
-        for memory_id in ids:
-            self._vectors.pop(memory_id, None)
+        with self._lock:
+            for memory_id in ids:
+                self._vectors.pop(memory_id, None)
 
 
 class QueryRewriteProvider(Protocol):
@@ -113,22 +124,7 @@ class EntityAliasResolver(Protocol):
 
 class StaticEntityAliasResolver:
     def __init__(self, aliases: dict[str, list[str]] | None = None) -> None:
-        self.aliases = aliases or {
-            "auth": ["authentication", "login", "登录认证", "认证"],
-            "login": ["auth", "authentication", "登录", "登录跳转"],
-            "session": ["session refresh", "refresh token", "会话", "会话刷新"],
-            "redirect": ["redirect loop", "跳转", "跳转循环"],
-            "pytest": ["test command", "unit test", "单元测试命令"],
-            "japan": ["日本", "Japan"],
-            "tokyo": ["东京", "Tokyo"],
-            "ginza": ["银座", "Ginza"],
-            "osaka": ["大阪", "Osaka"],
-            "travel": ["旅游", "旅行", "trip", "travel"],
-            "sushi": ["寿司", "sushi"],
-            "wasabi": ["芥末", "wasabi"],
-            "habit": ["癖好", "习惯", "preference", "quirk", "habit"],
-            "ben": ["Ben", "ben"],
-        }
+        self.aliases = aliases or {}
 
     def expand(self, query: str, namespace: str) -> list[str]:
         del namespace
@@ -147,6 +143,7 @@ def _normalize(vector: list[float]) -> list[float]:
 
 __all__ = [
     "ActivationResult",
+    "AsyncEmbeddingProvider",
     "DeterministicEmbeddingProvider",
     "EmbeddingProvider",
     "EntityAliasResolver",

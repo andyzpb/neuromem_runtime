@@ -26,6 +26,18 @@ QueryIntent = Literal[
     "summary",
     "unknown",
 ]
+QUERY_INTENTS = {
+    "fact_lookup",
+    "procedural_recall",
+    "preference_recall",
+    "episodic_debug",
+    "temporal_current",
+    "temporal_history",
+    "multi_hop",
+    "conflict_check",
+    "summary",
+    "unknown",
+}
 
 
 class RerankProvider(Protocol):
@@ -370,9 +382,11 @@ class ActivationRetrievalEngine:
         cached_vectors: dict[str, list[float]] = {}
         missing_ids: list[str] = []
         missing_texts: list[str] = []
+        text_hashes = {memory_id: _text_hash(card.retrieval_text) for memory_id, card in cards.items()}
+        cached_by_hash = _cache_get_many(cache, namespace=namespace, provider_label=provider_label, text_hashes=list(text_hashes.values()))
         for memory_id, card in cards.items():
-            text_hash = _text_hash(card.retrieval_text)
-            vector = _cache_get(cache, namespace=namespace, provider_label=provider_label, text_hash=text_hash)
+            text_hash = text_hashes[memory_id]
+            vector = cached_by_hash.get(text_hash)
             if vector is None:
                 missing_ids.append(memory_id)
                 missing_texts.append(card.retrieval_text)
@@ -387,7 +401,12 @@ class ActivationRetrievalEngine:
             for memory_id, text, vector in zip(missing_ids, missing_texts, vectors, strict=True):
                 vector_list = [float(value) for value in vector]
                 cached_vectors[memory_id] = vector_list
-                _cache_set(cache, namespace=namespace, provider_label=provider_label, text_hash=_text_hash(text), vector=vector_list)
+            _cache_set_many(
+                cache,
+                namespace=namespace,
+                provider_label=provider_label,
+                vectors={_text_hash(text): [float(value) for value in vector] for text, vector in zip(missing_texts, vectors, strict=True)},
+            )
         if cached_vectors:
             upsert(cached_vectors, namespace=namespace)
         _add_timing(timing, "index_sync_ms", started)
@@ -436,9 +455,11 @@ class ActivationRetrievalEngine:
         provider_label = str(filters.get("_embedding_provider_label") or embedding_provider.__class__.__name__)
         vectors: list[list[float]] = []
         missing: list[tuple[int, str]] = []
+        query_hashes = [_text_hash(query_text) for query_text in queries]
+        cached_by_hash = _cache_get_many(cache, namespace=namespace, provider_label=provider_label, text_hashes=query_hashes)
         for index, query_text in enumerate(queries):
-            text_hash = _text_hash(query_text)
-            cached = _cache_get(cache, namespace=namespace, provider_label=provider_label, text_hash=text_hash)
+            text_hash = query_hashes[index]
+            cached = cached_by_hash.get(text_hash)
             if cached is None:
                 missing.append((index, query_text))
                 vectors.append([])
@@ -453,7 +474,12 @@ class ActivationRetrievalEngine:
             for (index, query_text), vector in zip(missing, embedded, strict=True):
                 vector_list = [float(value) for value in vector]
                 vectors[index] = vector_list
-                _cache_set(cache, namespace=namespace, provider_label=provider_label, text_hash=_text_hash(query_text), vector=vector_list)
+            _cache_set_many(
+                cache,
+                namespace=namespace,
+                provider_label=provider_label,
+                vectors={_text_hash(query_text): [float(value) for value in vector] for (_, query_text), vector in zip(missing, embedded, strict=True)},
+            )
         for vector in vectors:
             for memory_id, score in search(vector, namespace=namespace, top_k=max(50, config.max_items * 8)):
                 scores[str(memory_id)] = max(scores.get(str(memory_id), 0.0), float(score))
@@ -591,28 +617,10 @@ class ActivationRetrievalEngine:
 def build_query_plan_v2(query: str, *, filters: dict[str, object] | None = None, config: RetrievalConfig | None = None) -> QueryPlanV2:
     filters = filters or {}
     config = config or RetrievalConfig()
-    lowered = query.lower()
     entities = sorted(set(_query_entities(query)) | set(_string_list(filters.get("entities"))))
-    fact_keys = sorted(set(_infer_fact_keys(lowered)) | set(_string_list(filters.get("fact_keys"))))
-    intent: QueryIntent = "unknown"
-    if any(term in lowered for term in ["current", "latest", "now", "confirmed", "哪里", "哪儿", "谁", "什么时候"]):
-        intent = "temporal_current"
-    elif any(term in lowered for term in ["procedure", "workflow", "how should", "steps", "fix pattern", "rule"]):
-        intent = "procedural_recall"
-    elif any(term in lowered for term in ["prefer", "preference", "style", "likes"]):
-        intent = "preference_recall"
-    elif any(term in lowered for term in ["old", "previous", "historical", "before"]):
-        intent = "temporal_history"
-    elif any(term in lowered for term in ["why", "chain", "related", "multi-hop", "multi hop"]):
-        intent = "multi_hop"
-    elif any(term in lowered for term in ["conflict", "contradict", "supersede", "replaced"]):
-        intent = "conflict_check"
-    elif any(term in lowered for term in ["summary", "patterns", "lessons", "common failures"]):
-        intent = "summary"
-    elif fact_keys or any(term in lowered for term in ["where", "who", "when", "location", "travel", "trip", "日本", "东京", "银座", "大阪", "旅游"]):
-        intent = "fact_lookup"
-    elif any(term in lowered for term in ["bug", "error", "trace", "debug", "fix"]):
-        intent = "episodic_debug"
+    fact_keys = sorted(set(_string_list(filters.get("fact_keys"))))
+    explicit_intent = str(filters.get("intent") or filters.get("query_intent") or "unknown")
+    intent: QueryIntent = explicit_intent if explicit_intent in QUERY_INTENTS else "unknown"  # type: ignore[assignment]
     mode: RetrievalMode = "local_activation"
     if intent == "summary":
         mode = "global_consolidated"
@@ -817,21 +825,6 @@ def _query_entities(query: str) -> set[str]:
     return {term for term in _terms(query) if len(term) > 2 and term not in stop}
 
 
-def _infer_fact_keys(lowered_query: str) -> list[str]:
-    keys = []
-    if any(term in lowered_query for term in ["pytest", "test command", "docker command"]):
-        keys.append("pytest_q")
-    if any(term in lowered_query for term in ["redirect", "session", "login", "auth"]):
-        keys.append("refresh_order")
-    if any(term in lowered_query for term in ["style", "concise", "preference"]):
-        keys.append("user_style")
-    if any(term in lowered_query for term in ["japan", "tokyo", "ginza", "osaka", "travel", "trip", "日本", "东京", "银座", "大阪", "旅游"]):
-        keys.append("travel_location")
-    if any(term in lowered_query for term in ["sushi", "wasabi", "ben", "寿司", "芥末", "癖好"]):
-        keys.append("ben_sushi_preference")
-    return keys
-
-
 def _text_hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
@@ -849,6 +842,23 @@ def _cache_get(cache: object, *, namespace: str, provider_label: str, text_hash:
     return [float(item) for item in value]
 
 
+def _cache_get_many(cache: object, *, namespace: str, provider_label: str, text_hashes: list[str]) -> dict[str, list[float]]:
+    get_many = getattr(cache, "get_many", None)
+    if get_many is not None:
+        try:
+            values = get_many(namespace=namespace, provider_model=provider_label, text_hashes=text_hashes)
+        except Exception:
+            values = {}
+        if isinstance(values, dict):
+            return {str(key): [float(item) for item in value] for key, value in values.items() if isinstance(value, list)}
+    result: dict[str, list[float]] = {}
+    for text_hash in text_hashes:
+        value = _cache_get(cache, namespace=namespace, provider_label=provider_label, text_hash=text_hash)
+        if value is not None:
+            result[text_hash] = value
+    return result
+
+
 def _cache_set(cache: object, *, namespace: str, provider_label: str, text_hash: str, vector: list[float]) -> None:
     set_value = getattr(cache, "set", None)
     if set_value is None:
@@ -857,6 +867,18 @@ def _cache_set(cache: object, *, namespace: str, provider_label: str, text_hash:
         set_value(namespace=namespace, provider_model=provider_label, text_hash=text_hash, vector=vector)
     except Exception:
         return
+
+
+def _cache_set_many(cache: object, *, namespace: str, provider_label: str, vectors: dict[str, list[float]]) -> None:
+    set_many = getattr(cache, "set_many", None)
+    if set_many is not None:
+        try:
+            set_many(namespace=namespace, provider_model=provider_label, vectors=vectors)
+            return
+        except Exception:
+            return
+    for text_hash, vector in vectors.items():
+        _cache_set(cache, namespace=namespace, provider_label=provider_label, text_hash=text_hash, vector=vector)
 
 
 def _add_timing(timing: object, field_name: str, started: float) -> None:
@@ -870,12 +892,10 @@ def _add_timing(timing: object, field_name: str, started: float) -> None:
 
 
 def _canonical_fact_key(item: MemoryItem) -> str:
-    text = " ".join([item.content, *item.tags, *item.keywords]).lower()
-    keys = _infer_fact_keys(text)
-    if keys:
-        return keys[0]
     if item.tags:
         return item.tags[0].lower().replace(" ", "_")
+    if item.keywords:
+        return item.keywords[0].lower().replace(" ", "_")
     return ""
 
 

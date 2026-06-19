@@ -113,9 +113,9 @@ class DeterministicCrystallizationPlanner:
                 FrameDeltaProposal(
                     operation="promote_frame",
                     frame_id=f"frame_sleep_{_short_hash(context.namespace, str(index), *source_memory_ids)}",
-                    frame_type="procedure" if _looks_procedural(content) else "schema",
+                    frame_type="procedure" if any(memory.type == "procedural" for memory in memories) else "schema",
                     content=content,
-                    canonical_key=_canonical_from_terms([term for memory in memories for term in [*memory.entities, *memory.keywords]]) or f"sleep_cluster_{index}",
+                    canonical_key=_canonical_from_terms([term for memory in memories for term in [*memory.entities, *memory.keywords]]) or f"sleep_cluster_{_short_hash(context.namespace, str(index), *source_memory_ids)}",
                     payload={"cluster_size": len(memories), "source_types": sorted({memory.type for memory in memories})},
                     source_memory_ids=source_memory_ids,
                     source_event_ids=source_event_ids,
@@ -291,16 +291,13 @@ def logic_edge_from_proposal(proposal: LogicEdgeProposal, *, namespace: str) -> 
 
 
 def infer_frame_type(memory: MemoryItem) -> str:
-    text = memory.content.lower()
-    if memory.type == "procedural" or any(term in text for term in ["always", "workflow", "procedure", "step", "rule:"]):
+    if memory.type == "procedural":
         return "procedure"
-    if memory.type == "preference" or any(term in text for term in ["prefers", "preference"]):
+    if memory.type == "preference":
         return "preference"
-    if memory.type == "constraint" or any(term in text for term in ["must", "must not", "constraint", "policy"]):
+    if memory.type == "constraint":
         return "constraint"
-    if any(term in text for term in ["failed", "failure", "bug", "regression", "error"]):
-        return "failure_pattern"
-    if memory.type == "semantic" or any(term in text for term in [" is ", " are ", "current", "now"]):
+    if memory.type == "semantic":
         return "fact"
     if memory.type == "schema":
         return "schema"
@@ -312,7 +309,7 @@ def frame_id_for_memory(memory: MemoryItem, frame_type: str) -> str:
 
 
 def canonical_key_for_memory(memory: MemoryItem) -> str:
-    return _canonical_from_terms([*memory.entities, *memory.keywords]) or _canonical_from_terms([memory.content]) or memory.id
+    return _canonical_from_terms([*memory.entities, *memory.keywords]) or memory.id
 
 
 def provenance_hash(value: object) -> str:
@@ -324,11 +321,6 @@ def _compile_cluster_content(memories: list[MemoryItem]) -> str:
     prefix = f"Repeated pattern for {terms}: " if terms else "Repeated experience pattern: "
     snippets = [memory.summary or memory.content for memory in memories[:3]]
     return prefix + " | ".join(snippet.strip() for snippet in snippets if snippet.strip())
-
-
-def _looks_procedural(content: str) -> bool:
-    lowered = content.lower()
-    return any(term in lowered for term in ["fix", "run", "before", "after", "workflow", "procedure", "step", "rule"])
 
 
 def _canonical_from_terms(terms: list[str]) -> str:

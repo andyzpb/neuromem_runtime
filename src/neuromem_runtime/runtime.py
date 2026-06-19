@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import asyncio
 import time
 import tomllib
 from dataclasses import replace
@@ -13,6 +14,7 @@ from neuromem.core.models import MemoryItem
 from neuromem.core.runtime import NeuroMemRuntime
 from neuromem.stores.sqlite_store import SQLiteMemoryStore
 
+from neuromem_runtime.claims import GroundedClaim, GroundedClaimExtractor
 from neuromem_runtime.crystallization import (
     DeterministicCrystallizationPlanner,
     DeterministicFrameExtractor,
@@ -27,7 +29,7 @@ from neuromem_runtime.ledger import EdgeEvidenceEvent, ExperienceEvent, LedgerEv
 from neuromem_runtime.materializer import EdgeEvidenceAppender, WorldviewMaterializer
 from neuromem_runtime.policy_v2 import EvidenceRef, FrameDeltaProposal, LogicEdgeProposal, MemoryPolicyV2
 from neuromem_runtime.providers import DeterministicPolicyProvider, PolicyProvider
-from neuromem_runtime.performance import BackgroundJobQueue, EmbeddingCache, RetrievalCache, RuntimeTiming, TimingSpan, stable_hash
+from neuromem_runtime.performance import BackgroundJobQueue, EmbeddingCache, RetrievalCache, RuntimeTiming, SingleFlight, TimingSpan, stable_hash
 from neuromem_runtime.retrieval import (
     EmbeddingProvider,
     EntityAliasResolver,
@@ -91,6 +93,7 @@ class MemoryRuntime:
         self._worldview_materializer = WorldviewMaterializer(self._ledger)
         self._impact_meter = WorldviewImpactMeter()
         self._worldview_resolver = WorldviewResolver()
+        self._claim_extractor = GroundedClaimExtractor()
         self._sleep_planner = SleepPlanner()
         self._graph_mode = graph_mode
         self._embedding_provider = embedding_provider
@@ -105,6 +108,8 @@ class MemoryRuntime:
         self._crystallization_planner = DeterministicCrystallizationPlanner()
         self._retrieval_cache = RetrievalCache(ttl_seconds=config.retrieval_cache_ttl_seconds)
         self._retrieval_cache_fingerprints: dict[str, tuple[str, str]] = {}
+        self._retrieval_singleflight = SingleFlight()
+        self._semantic_versions: dict[str, int] = {config.namespace: 0}
         self._embedding_cache = EmbeddingCache(config.db_path) if config.embedding_cache_enabled and embedding_provider is not None else None
         self._background_jobs = BackgroundJobQueue()
 
@@ -239,6 +244,23 @@ class MemoryRuntime:
                 audit={"experience_event": experience.to_dict(), "auto_commit": auto_commit},
             )
         )
+        claims = self._claim_extractor.extract(experience)
+        if claims:
+            self._ledger.record_grounded_claims(claims)
+            self._ledger.append(
+                LedgerEvent(
+                    transaction_id=f"txn_claims_{experience.event_id}",
+                    namespace=self.config.namespace,
+                    agent_id=self.config.agent_id,
+                    phase="AUDITED",
+                    event_type="grounded_claims_recorded",
+                    operation="RECORD_CLAIMS",
+                    proposer="deterministic",
+                    evidence=[experience.to_dict()],
+                    targets=[claim.claim_id for claim in claims],
+                    audit={"grounded_claims": [claim.to_dict() for claim in claims], "append_only": True},
+                )
+            )
         impact = self._assess_experience(experience)
         self._ledger.record_impact_assessment(impact)
         self._ledger.append(
@@ -371,6 +393,56 @@ class MemoryRuntime:
         self._ledger.record_impact_assessment(assessment)
         return assessment.to_dict()
 
+    async def apply_grounded_claims(self, event_id: str, claims: list[dict[str, object]]) -> dict[str, object]:
+        experience = self._ledger.get_experience(event_id, namespace=self.config.namespace)
+        if experience is None:
+            raise ValueError(f"experience event not found: {event_id}")
+        normalized = []
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            value = self._claim_extractor.from_mapping(experience, claim)
+            if value is not None:
+                normalized.append(value)
+        if not normalized:
+            return {"event_id": event_id, "decision": "ledger_only", "grounded_claims": [], "committed": False}
+        self._ledger.record_grounded_claims(normalized)
+        self._ledger.append(
+            LedgerEvent(
+                transaction_id=f"txn_claims_{event_id}_{uuid4().hex[:8]}",
+                namespace=experience.namespace,
+                agent_id=self.config.agent_id,
+                phase="AUDITED",
+                event_type="grounded_claims_recorded",
+                operation="RECORD_CLAIMS",
+                proposer="policy_provider",
+                evidence=[experience.to_dict()],
+                targets=[claim.claim_id for claim in normalized],
+                audit={"grounded_claims": [claim.to_dict() for claim in normalized], "append_only": True},
+            )
+        )
+        assessment = self._assess_experience(experience)
+        self._ledger.record_impact_assessment(assessment)
+        self._ledger.append(
+            LedgerEvent(
+                transaction_id=f"txn_impact_claims_{event_id}_{uuid4().hex[:8]}",
+                namespace=experience.namespace,
+                agent_id=self.config.agent_id,
+                phase="AUDITED",
+                event_type="worldview_impact_assessed",
+                operation="ASSESS_IMPACT",
+                proposer="deterministic",
+                evidence=[experience.to_dict()],
+                audit={"impact_assessment": assessment.to_dict(), "claim_aware": True},
+            )
+        )
+        impact = assessment.to_dict()
+        decision = str(impact.get("decision") or "ledger_only")
+        if decision in {"propose_candidate", "append_derivation", "append_supersession", "append_contradiction", "append_inhibition"}:
+            route = self._route_grounded_claims(experience, impact, decision=decision)
+            return {"event_id": event_id, "decision": decision, "impact": impact, "committed": False, **route}
+        return {"event_id": event_id, "decision": decision, "impact": impact, "grounded_claims": [claim.to_dict() for claim in normalized], "committed": False}
+
     async def observe_and_route(self, event: MemoryEvent | dict[str, object]) -> dict[str, object]:
         observed = await self.observe(event, auto_commit=False)
         if observed.event_id is None:
@@ -380,6 +452,9 @@ class MemoryRuntime:
         experience = self._ledger.get_experience(observed.event_id, namespace=self.config.namespace)
         if experience is None:
             raise RuntimeError("observe_and_route() could not reload experience")
+        if decision in {"propose_candidate", "append_derivation", "append_supersession", "append_contradiction", "append_inhibition"}:
+            route = self._route_grounded_claims(experience, impact, decision=decision)
+            return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False, **route}
         if decision == "ledger_only":
             return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False}
         if decision == "ask_clarification":
@@ -395,7 +470,7 @@ class MemoryRuntime:
             payload = {"event_id": experience.event_id, "reason": impact.get("reason"), "risk": (impact.get("vector") or {}).get("risk") if isinstance(impact.get("vector"), dict) else None}
             self._append_route_audit(experience, decision, payload)
             return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False, "quarantine": payload}
-        if decision == "append_evidence":
+        if decision in {"append_evidence", "append_support"}:
             evidence_events = self._append_support_evidence(experience, impact)
             materialized = await self.materialize_worldview()
             return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False, "edge_evidence_events": evidence_events, "materialized": materialized}
@@ -453,9 +528,32 @@ class MemoryRuntime:
                 "miss_reason": None,
             }
             return cached_context
+        flight = self._retrieval_singleflight.begin(cache_key)
+        if not flight.leader:
+            flight.event.wait()
+            cached_after_wait = self._retrieval_cache.get(cache_key)
+            if isinstance(cached_after_wait, MemoryContext):
+                self._retrieval_cache_fingerprints[cache_probe_key] = (store_version, filter_hash)
+                cached_context = _copy_memory_context(cached_after_wait)
+                cached_context.cache = {
+                    **cached_after_wait.cache,
+                    "retrieval_cache": "hit",
+                    "retrieval_cache_stats": self._retrieval_cache.stats(),
+                    "singleflight_joined": True,
+                    "singleflight_stats": self._retrieval_singleflight.stats(),
+                    "cache_key_version": store_version[:12],
+                    "semantic_version_short": store_version[:12],
+                    "filter_hash": filter_hash[:12],
+                    "miss_reason": None,
+                }
+                return cached_context
         before_states = self._memory_states()
-        with TimingSpan(timing, "retrieval_ms"):
-            results, trace = self._runtime.retrieve_with_trace(query_obj.query, filters=query_obj.filters, budget_tokens=query_obj.budget_tokens, task_id=query_obj.query)
+        try:
+            with TimingSpan(timing, "retrieval_ms"):
+                results, trace = self._runtime.retrieve_with_trace(query_obj.query, filters=query_obj.filters, budget_tokens=query_obj.budget_tokens, task_id=query_obj.query)
+        finally:
+            if not flight.leader:
+                self._retrieval_singleflight.finish(cache_key)
         results = self._apply_retrieval_lens(results, resolved_lens)
         if resolved_lens not in {"historical", "audit"}:
             suppressed = self._ledger.active_suppressed_memory_ids(namespace_value)
@@ -526,6 +624,7 @@ class MemoryRuntime:
             "retrieval_cache": "miss",
             "retrieval_cache_stats": self._retrieval_cache.stats(),
             "embedding_cache": dict(embedding_cache_stats),
+            "singleflight_stats": self._retrieval_singleflight.stats(),
             "cache_key_version": store_version[:12],
             "semantic_version_short": store_version[:12],
             "filter_hash": filter_hash[:12],
@@ -601,6 +700,8 @@ class MemoryRuntime:
         )
         self._retrieval_cache.set(cache_key, context, semantic_version=store_version, filter_hash=filter_hash)
         self._retrieval_cache_fingerprints[cache_probe_key] = (store_version, filter_hash)
+        self._retrieval_singleflight.finish(cache_key)
+        context.cache["singleflight_stats"] = self._retrieval_singleflight.stats()
         return context
 
     async def propose(self, value: str | dict[str, object]) -> MemoryPolicy | MemoryPolicyV2:
@@ -611,6 +712,9 @@ class MemoryRuntime:
         legacy_policy = self._executor._coerce_policy(policy)  # noqa: SLF001 - public facade needs task derivation for both policy generations.
         destructive_reason = _destructive_policy_reason(policy, legacy_policy)
         if destructive_reason is not None:
+            correction = await self._append_only_correction_from_policy(policy, destructive_reason)
+            if correction is not None:
+                return correction
             return _append_only_rejection(legacy_policy.write.target_memory_id or legacy_policy.forget.target_memory_id, destructive_reason)
         suppression = self._append_only_suppression_from_policy(legacy_policy)
         if suppression is not None:
@@ -644,6 +748,45 @@ class MemoryRuntime:
         if structural_evidence is not None:
             value["append_only_structural_evidence"] = structural_evidence
         return value
+
+    async def _append_only_correction_from_policy(self, policy: MemoryPolicy | MemoryPolicyV2, destructive_reason: str) -> dict[str, object] | None:
+        if not isinstance(policy, MemoryPolicyV2) or not policy.grounded_claims:
+            return None
+        event_id = _event_id_from_policy(policy)
+        if not event_id:
+            return None
+        try:
+            route = await self.apply_grounded_claims(event_id, list(policy.grounded_claims))
+        except Exception as exc:
+            return _append_only_rejection(None, f"{destructive_reason}; append-only correction repair failed: {exc}")
+        transaction_id = f"txn_repair_{uuid4().hex}"
+        self._ledger.append(
+            LedgerEvent(
+                transaction_id=transaction_id,
+                namespace=self.config.namespace,
+                agent_id=self.config.agent_id,
+                phase="COMMITTED",
+                event_type="destructive_update_repaired",
+                operation="REPAIR_UPDATE_AS_CLAIMS",
+                proposer=policy.proposer,
+                validator_decision="approved",
+                evidence=[event_id],
+                targets=[str(item.get("claim_id") or "") for item in policy.grounded_claims if isinstance(item, dict)],
+                audit={"reason": destructive_reason, "claim_route": route, "append_only": True},
+            )
+        )
+        return {
+            "trace_id": None,
+            "ledger_transaction_id": transaction_id,
+            "mutation_execution_result": {
+                "approved": True,
+                "created_memory_ids": [],
+                "updated_memory_ids": [],
+                "append_only_repair": True,
+                "reason": destructive_reason,
+            },
+            "append_only_correction": route,
+        }
 
     def _append_only_suppression_from_policy(self, policy: MemoryPolicy) -> dict[str, object] | None:
         if policy.forget.operation not in {"DECAY", "INHIBIT", "INVALIDATE", "ARCHIVE"}:
@@ -1251,6 +1394,101 @@ class MemoryRuntime:
             "materialized": materialized,
         }
 
+    def _route_grounded_claims(self, experience: ExperienceEvent, impact: dict[str, object], *, decision: str) -> dict[str, object]:
+        claims = self._ledger.grounded_claims(namespace=experience.namespace, event_id=experience.event_id)
+        candidate_events: list[dict[str, object]] = []
+        edge_events: list[dict[str, object]] = []
+        for claim in claims:
+            slot_kind = _slot_kind_from_claim_type(str(claim.get("claim_type") or "fact"))
+            slot = self._ledger.upsert_worldview_slot(
+                WorldviewSlotRecord(
+                    namespace=experience.namespace,
+                    key=str(claim.get("canonical_slot_key") or "claim.general"),
+                    kind=slot_kind,
+                    scope="global",
+                )
+            )
+            candidate_event = WorldviewCandidateEvent(
+                namespace=experience.namespace,
+                slot_id=slot.slot_id,
+                candidate_id=str(claim["claim_id"]),
+                event_type=decision,
+                evidence_ids=[str(item) for item in claim.get("evidence_ids", [])],
+                payload={"claim": claim, "impact": impact},
+                proposer=str(claim.get("proposer") or "deterministic"),
+            )
+            self._ledger.append_worldview_candidate_event(candidate_event)
+            candidate_events.append(candidate_event.to_dict())
+            support = EdgeEvidenceEvent(
+                namespace=experience.namespace,
+                source_kind="event",
+                source_id=experience.event_id,
+                target_kind="claim",
+                target_id=str(claim["claim_id"]),
+                relation="supports",
+                relation_family="worldview",
+                event_type="support",
+                delta_weight=0.36,
+                confidence=float(claim.get("confidence", 0.7) or 0.7),
+                evidence_ids=[str(item) for item in claim.get("evidence_ids", [])],
+                proof_obligation="structured grounded claim is supported by truth-source evidence",
+                proposer=str(claim.get("proposer") or "deterministic"),
+            )
+            self._edge_appender.append(support)
+            edge_events.append(support.to_dict())
+            for target_id in [str(item) for item in claim.get("target_memory_ids", [])]:
+                for relation, event_type, weight in [
+                    ("contradicts", "contradict", -0.62),
+                    ("supersedes", "supersede", -0.74),
+                    ("inhibits", "inhibit", -0.66),
+                ]:
+                    edge_event = EdgeEvidenceEvent(
+                        namespace=experience.namespace,
+                        source_kind="claim",
+                        source_id=str(claim["claim_id"]),
+                        target_kind="memory",
+                        target_id=target_id,
+                        relation=relation,
+                        relation_family="worldview",
+                        event_type=event_type,
+                        delta_weight=weight,
+                        confidence=float(claim.get("confidence", 0.7) or 0.7),
+                        evidence_ids=[str(item) for item in claim.get("evidence_ids", [])],
+                        proof_obligation="structured correction claim targets prior memory",
+                        proposer=str(claim.get("proposer") or "deterministic"),
+                    )
+                    self._edge_appender.append(edge_event)
+                    edge_events.append(edge_event.to_dict())
+            for target_id in [str(item) for item in claim.get("target_candidate_ids", [])]:
+                edge_event = EdgeEvidenceEvent(
+                    namespace=experience.namespace,
+                    source_kind="claim",
+                    source_id=str(claim["claim_id"]),
+                    target_kind="claim",
+                    target_id=target_id,
+                    relation="supersedes",
+                    relation_family="worldview",
+                    event_type="supersede",
+                    delta_weight=-0.74,
+                    confidence=float(claim.get("confidence", 0.7) or 0.7),
+                    evidence_ids=[str(item) for item in claim.get("evidence_ids", [])],
+                    proof_obligation="structured correction claim targets prior worldview candidate",
+                    proposer=str(claim.get("proposer") or "deterministic"),
+                )
+                self._edge_appender.append(edge_event)
+                edge_events.append(edge_event.to_dict())
+        materialized = self._materialize_worldview_sync(experience.namespace)
+        audit = {"grounded_claims": claims, "candidate_events": candidate_events, "edge_evidence_events": edge_events, "materialized": materialized}
+        self._append_route_audit(experience, decision, audit)
+        if edge_events or candidate_events:
+            self._invalidate_retrieval_cache()
+        return {
+            "grounded_claims": claims,
+            "candidate_events": candidate_events,
+            "edge_evidence_events": edge_events,
+            "materialized": materialized,
+        }
+
     def _append_sleep_priority_marker(self, experience: ExperienceEvent, impact: dict[str, object]) -> dict[str, object]:
         self._ledger.append(
             LedgerEvent(
@@ -1390,7 +1628,8 @@ class MemoryRuntime:
         worldview_candidates = self._ledger.worldview_candidates(namespace=experience.namespace)
         frames = self._runtime.store.list_logic_nodes(namespace=experience.namespace) if self._runtime.store is not None else []
         edge_events = self._ledger.edge_evidence_events(namespace=experience.namespace)
-        return self._impact_meter.assess(experience, memories, worldview_candidates=worldview_candidates, frames=frames, edge_events=edge_events)
+        claims = self._ledger.grounded_claims(namespace=experience.namespace, event_id=experience.event_id)
+        return self._impact_meter.assess(experience, memories, worldview_candidates=worldview_candidates, frames=frames, edge_events=edge_events, grounded_claims=claims)
 
     def _memory_states(self) -> dict[str, dict[str, object]]:
         if self._runtime.store is None:
@@ -1402,15 +1641,7 @@ class MemoryRuntime:
             if lens not in {"associative", "logical", "procedural", "historical", "audit"}:
                 raise ValueError(f"unsupported retrieval lens: {lens}")
             return lens
-        lowered = query.lower()
-        if any(term in lowered for term in ["why", "audit", "ledger", "evidence", "trusted", "written"]):
-            return "audit"
-        if any(term in lowered for term in ["history", "historical", "previous", "old", "superseded", "changed"]):
-            return "historical"
-        if any(term in lowered for term in ["how", "procedure", "workflow", "steps", "fix", "run"]):
-            return "procedural"
-        if any(term in lowered for term in ["current", "fact", "preference", "constraint", "should", "must"]):
-            return "logical"
+        del query
         return "associative"
 
     def _apply_retrieval_lens(self, results: list[object], lens: str) -> list[object]:
@@ -1540,33 +1771,11 @@ class MemoryRuntime:
         return stable_hash({"lens": resolved_lens, "budget_tokens": query.budget_tokens, "filters": filters})
 
     def _store_version(self, namespace: str) -> str:
-        if self._runtime.store is None:
-            return "empty"
-        memories = self._runtime.store.list_memories(namespace=namespace)
-        semantic_records: list[dict[str, object]] = []
-        for memory in memories:
-            semantic_records.append(
-                {
-                    "id": memory.id,
-                    "namespace": memory.namespace,
-                    "type": memory.type,
-                    "content": memory.content,
-                    "summary": memory.summary,
-                    "evidence": sorted(memory.evidence),
-                    "entities": sorted(memory.entities),
-                    "keywords": sorted(memory.keywords),
-                    "tags": sorted(memory.tags),
-                    "maturity": memory.maturity,
-                    "valid_from": memory.valid_from.isoformat() if memory.valid_from else None,
-                    "valid_to": memory.valid_to.isoformat() if memory.valid_to else None,
-                    "privacy_level": memory.privacy_level,
-                    "acl": sorted(memory.acl),
-                    "deletion_policy": memory.deletion_policy,
-                }
-            )
-        return stable_hash({"namespace": namespace, "memories": semantic_records})[:16]
+        return f"{namespace}:{self._semantic_versions.get(namespace, 0)}"
 
     def _invalidate_retrieval_cache(self, reason: str = "invalidated_by_mutation") -> None:
+        namespace = self.config.namespace
+        self._semantic_versions[namespace] = self._semantic_versions.get(namespace, 0) + 1
         self._retrieval_cache.invalidate(reason)
 
     def _embedding_provider_label(self) -> str:
@@ -1584,6 +1793,8 @@ class MemoryRuntime:
         embedding_stats = provider_stats() if callable(provider_stats) else {}
         return {
             "retrieval_cache": self._retrieval_cache.stats(),
+            "retrieval_singleflight": self._retrieval_singleflight.stats(),
+            "semantic_versions": dict(self._semantic_versions),
             "embedding_cache_enabled": self._embedding_cache is not None,
             "embedding_provider": self._embedding_provider_label(),
             "embedding_provider_stats": embedding_stats,
@@ -1591,6 +1802,28 @@ class MemoryRuntime:
             "retrieval_graph_commit": self.config.retrieval_graph_commit,
             "retrieval_mode": self.config.retrieval_mode,
         }
+
+    async def prewarm_embeddings(self, texts: list[str] | None = None) -> dict[str, object]:
+        if self._embedding_provider is None:
+            return {"status": "disabled"}
+        values = texts or ["NeuroMem embedding warmup"]
+        started = time.perf_counter()
+        aembed = getattr(self._embedding_provider, "aembed", None)
+        if callable(aembed):
+            vectors = await aembed(values)
+        else:
+            embed = getattr(self._embedding_provider, "embed", None)
+            if not callable(embed):
+                return {"status": "unsupported"}
+            vectors = await asyncio.to_thread(embed, values)
+        if self._embedding_cache is not None:
+            provider_label = self._embedding_provider_label()
+            self._embedding_cache.set_many(
+                namespace=self.config.namespace,
+                provider_model=provider_label,
+                vectors={stable_hash({"warmup": index, "text": text}): [float(item) for item in vector] for index, (text, vector) in enumerate(zip(values, vectors, strict=True))},
+            )
+        return {"status": "ok", "text_count": len(values), "timing_ms": round((time.perf_counter() - started) * 1000.0, 3)}
 
     def _commit_retrieval_graph(self, trace: object) -> dict[str, object] | None:
         selected = [str(memory_id) for memory_id in getattr(trace, "selected_memory_ids", [])]
@@ -1967,9 +2200,7 @@ def _lifecycle_delta_from_dict(delta: dict[str, object]) -> LifecycleDelta:
 def _fallback_sleep_clusters(memories: list[MemoryItem]) -> list[list[str]]:
     groups: dict[str, list[str]] = {}
     for memory in memories:
-        terms = [term.lower() for term in [*memory.entities, *memory.keywords] if len(term) > 2]
-        if not terms:
-            terms = [term.strip(".,:;()[]`'\"?").lower() for term in memory.content.split() if len(term.strip(".,:;()[]`'\"?")) > 4]
+        terms = [term.lower() for term in [*memory.entities, *memory.keywords, *memory.tags] if len(term) > 2]
         for term in sorted(set(terms))[:4]:
             groups.setdefault(term, []).append(memory.id)
     clusters = []
@@ -1992,27 +2223,42 @@ def _impact_slot_key(impact: dict[str, object]) -> str | None:
     return None
 
 
+def _event_id_from_policy(policy: MemoryPolicyV2) -> str:
+    for ref in policy.evidence_chain:
+        if ref.event_id:
+            return ref.event_id
+    for claim in policy.grounded_claims:
+        if not isinstance(claim, dict):
+            continue
+        for key in ("truth_source_event_ids", "evidence_ids"):
+            values = claim.get(key)
+            if isinstance(values, list):
+                for value in values:
+                    text = str(value)
+                    if text:
+                        return text
+    return ""
+
+
 def _slot_key_from_experience(experience: ExperienceEvent) -> str:
     explicit = experience.metadata.get("slot_key") or experience.metadata.get("canonical_key")
     if explicit:
         return str(explicit).strip().lower().replace(" ", "_")
     kind = _slot_kind_from_frame_type(_frame_type_from_experience(experience))
-    return _slot_key_from_text(experience.content, kind)
+    return f"{kind}:event_{experience.event_id}"
 
 
 def _slot_key_from_text(content: str, kind: str) -> str:
-    terms = [term.strip(".,:;!?()[]{}\"'").lower() for term in content.split() if len(term.strip(".,:;!?()[]{}\"'")) > 3]
-    return f"{kind}:{'_'.join(terms[:4]) or 'general'}"
+    return f"{kind}:hash_{stable_hash({'kind': kind, 'content': content})[:16]}"
 
 
 def _frame_type_from_experience(experience: ExperienceEvent) -> str:
-    kind = str(experience.metadata.get("type") or "").lower()
-    text = experience.content.lower()
-    if kind in {"user_preference", "preference"} or any(cue in text for cue in ["prefer", "喜欢", "偏好"]):
+    kind = str(experience.metadata.get("frame_type") or experience.metadata.get("claim_type") or experience.metadata.get("type") or "").lower()
+    if kind in {"user_preference", "preference"}:
         return "preference"
-    if kind in {"constraint"} or any(cue in text for cue in ["must", "never", "不要", "必须"]):
+    if kind in {"constraint"}:
         return "constraint"
-    if kind in {"rule", "procedure", "procedural"} or any(cue in text for cue in ["workflow", "procedure", "steps", "run", "流程"]):
+    if kind in {"rule", "procedure", "procedural"}:
         return "procedure"
     if kind in {"schema"}:
         return "schema"
@@ -2030,6 +2276,17 @@ def _slot_kind_from_frame_type(frame_type: str) -> str:
         return frame_type
     if frame_type == "failure_pattern":
         return "procedure"
+    return "hypothesis"
+
+
+def _slot_kind_from_claim_type(claim_type: str) -> str:
+    normalized = claim_type.lower()
+    if normalized in {"fact", "preference", "constraint", "procedure", "schema", "hypothesis", "suppression"}:
+        return normalized
+    if normalized in {"procedural", "rule"}:
+        return "procedure"
+    if normalized in {"claim", "episode", "episodic", "entity"}:
+        return "fact"
     return "hypothesis"
 
 

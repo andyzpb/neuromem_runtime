@@ -87,8 +87,11 @@ class ConflictValidator(MutationValidator):
     name = "ConflictValidator"
 
     def validate(self, policy: MemoryPolicy, context: ValidationContext) -> ValidationStep:
-        content = (policy.write.content or "").lower()
-        if policy.write.operation in {"ADD", "UPDATE"} and "contradicts" in content and "supersede" not in policy.reason.lower():
+        del context
+        gate = _write_gate(policy)
+        conflict = bool(gate.get("conflict") or gate.get("contradiction"))
+        has_supersession = bool(gate.get("supersedes") or gate.get("target_memory_ids") or gate.get("target_candidate_ids"))
+        if policy.write.operation in {"ADD", "UPDATE"} and conflict and not has_supersession:
             return ValidationStep(name=self.name, passed=False, reason="contradictory write requires supersede/invalidate rationale")
         return ValidationStep(name=self.name, passed=True)
 
@@ -142,10 +145,16 @@ class PoisoningRiskValidator(MutationValidator):
     name = "PoisoningRiskValidator"
 
     def validate(self, policy: MemoryPolicy, context: ValidationContext) -> ValidationStep:
-        content = (policy.write.content or "").lower()
-        suspicious = ["ignore previous", "override memory", "always trust this unverified", "delete audit"]
-        if any(term in content for term in suspicious):
-            return ValidationStep(name=self.name, passed=False, reason="possible memory poisoning instruction")
+        del context
+        risk = policy.write_gate.get("risk_score") if isinstance(policy.write_gate, dict) else None
+        if isinstance(risk, int | float) and float(risk) >= 0.75:
+            return ValidationStep(name=self.name, passed=False, reason="structured risk_score blocks write")
+        if isinstance(policy.write_gate, dict) and (
+            policy.write_gate.get("risk") == "poisoning"
+            or policy.write_gate.get("quarantine") is True
+            or policy.write_gate.get("risk_level") in {"high", "critical"}
+        ):
+            return ValidationStep(name=self.name, passed=False, reason="structured risk metadata blocks write")
         return ValidationStep(name=self.name, passed=True)
 
 
@@ -176,8 +185,6 @@ class WriteGateConsistencyValidator(MutationValidator):
                 return ValidationStep(name=self.name, passed=False, reason="write_gate commit requires evidence ids")
         if decision in {"noop", "defer"} and writes:
             return ValidationStep(name=self.name, passed=False, reason="write_gate noop/defer conflicts with durable write mutation")
-        if not writes and _claims_durable_value(rationale):
-            return ValidationStep(name=self.name, passed=False, reason="write rationale claims durable value but policy is NOOP")
         return ValidationStep(name=self.name, passed=True)
 
 
@@ -283,28 +290,3 @@ __all__ = [
 def _write_gate(policy: MemoryPolicy) -> dict[str, object]:
     value = policy.write_gate
     return dict(value) if isinstance(value, dict) else {}
-
-
-def _claims_durable_value(rationale: str) -> bool:
-    lowered = rationale.lower()
-    negated = [
-        "no durable",
-        "not durable",
-        "not a durable",
-        "not new durable",
-        "no long-term",
-        "not long-term",
-        "no future",
-        "low future",
-        "not useful",
-        "no reusable",
-        "not reusable",
-        "没有长期",
-        "不需要长期",
-        "不值得记住",
-        "不用记住",
-    ]
-    if any(phrase in lowered for phrase in negated):
-        return False
-    durable_words = ["durable", "useful", "future", "reuse", "should be remembered", "long-term", "长期", "记住", "复用", "有用"]
-    return any(word in lowered for word in durable_words)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import asdict, dataclass, field
 
 from neuromem.core.models import AssociativeEdge, LogicEdge, MemoryFrame, MemoryItem
@@ -431,12 +432,11 @@ def _memory_slot_key(memory: MemoryItem, kind: str) -> str:
         return f"{kind}:{memory.keywords[0].lower()}"
     if memory.entities:
         return f"{kind}:{memory.entities[0].lower()}"
-    return _slot_key(memory.summary or memory.content, kind)
+    return f"{kind}:memory_{memory.id}"
 
 
 def _slot_key(content: str, kind: str) -> str:
-    terms = [term.strip(".,:;!?()[]{}\"'").lower() for term in content.split() if len(term.strip(".,:;!?()[]{}\"'")) > 3]
-    return f"{kind}:{'_'.join(terms[:4]) or 'general'}"
+    return f"{kind}:hash_{hashlib.sha256(content.encode('utf-8')).hexdigest()[:16]}"
 
 
 def _memory_score(memory: MemoryItem, *, suppressed: bool) -> float:

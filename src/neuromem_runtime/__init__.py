@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from neuromem.core.policy import MemoryPolicy, MemoryTrace
 from neuromem.core.models import AssociativeEdge, LogicEdge, MemoryFrame
+from neuromem_runtime.claims import GroundedClaim, GroundedClaimExtractor
 from neuromem_runtime.crystallization import (
     CrystallizationPlanner,
     DefaultFrameValidator,
@@ -19,10 +20,12 @@ from neuromem_runtime.deltas import ExecutionDeltaPlan, GraphDelta, IndexDelta, 
 from neuromem_runtime.impact import SlotImpact, WorldviewImpactAssessment, WorldviewImpactMeter, WorldviewImpactVector
 from neuromem_runtime.ledger import EdgeEvidenceEvent, ExperienceEvent, LedgerEvent, MemoryLedger, WorldviewCandidateEvent, WorldviewCandidateRecord, WorldviewSlotRecord
 from neuromem_runtime.lifecycle import LifecycleStateMachine
+from neuromem_runtime.performance import EmbeddingCache
 from neuromem_runtime.policy_v2 import AssociativeEdgeProposal, FrameDeltaProposal, GraphDeltaProposal, LogicEdgeProposal, MemoryPolicyV2, ValidatedMutation, WriteGate
 from neuromem_runtime.plasticity import PlasticityEngine
 from neuromem_runtime.retrieval import (
     ActivationResult,
+    AsyncEmbeddingProvider,
     DeterministicEmbeddingProvider,
     EmbeddingProvider,
     EntityAliasResolver,
@@ -68,6 +71,8 @@ __all__ = [
     "MemoryTransaction",
     "MemoryTrace",
     "ExperienceEvent",
+    "GroundedClaim",
+    "GroundedClaimExtractor",
     "EdgeEvidenceEvent",
     "WorldviewImpactVector",
     "WorldviewImpactAssessment",
@@ -109,6 +114,8 @@ __all__ = [
     "LifecycleStateMachine",
     "ValidatorStack",
     "EmbeddingProvider",
+    "AsyncEmbeddingProvider",
+    "EmbeddingCache",
     "EntityAliasResolver",
     "HyDEProvider",
     "LocalVectorIndex",

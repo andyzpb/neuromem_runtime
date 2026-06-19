@@ -276,6 +276,32 @@ class MemoryLedger:
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS grounded_claims (
+                    claim_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    claim_type TEXT NOT NULL,
+                    canonical_statement TEXT NOT NULL,
+                    canonical_slot_key TEXT NOT NULL,
+                    truth_source_event_ids_json TEXT NOT NULL,
+                    proposer TEXT NOT NULL,
+                    source_kind TEXT NOT NULL,
+                    commitment_level TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    evidence_ids_json TEXT NOT NULL,
+                    target_memory_ids_json TEXT NOT NULL,
+                    target_candidate_ids_json TEXT NOT NULL,
+                    derived_from_ids_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_grounded_claims_namespace ON grounded_claims(namespace)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_grounded_claims_event ON grounded_claims(namespace, event_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_grounded_claims_slot ON grounded_claims(namespace, canonical_slot_key)")
+            conn.execute(
+                """
                 CREATE TABLE IF NOT EXISTS impact_assessments (
                     impact_id TEXT PRIMARY KEY,
                     namespace TEXT NOT NULL,
@@ -486,6 +512,82 @@ class MemoryLedger:
                 ),
             )
         return event
+
+    def record_grounded_claims(self, claims: list[object], *, conn: Connection | None = None) -> list[object]:
+        with self._connection(conn) as active:
+            for claim in claims:
+                data = claim.to_dict() if hasattr(claim, "to_dict") else dict(claim)  # type: ignore[arg-type]
+                active.execute(
+                    """
+                    INSERT OR IGNORE INTO grounded_claims (
+                        claim_id, namespace, event_id, claim_type, canonical_statement,
+                        canonical_slot_key, truth_source_event_ids_json, proposer, source_kind,
+                        commitment_level, confidence, evidence_ids_json, target_memory_ids_json,
+                        target_candidate_ids_json, derived_from_ids_json, metadata_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        str(data["claim_id"]),
+                        str(data["namespace"]),
+                        str(data["event_id"]),
+                        str(data["claim_type"]),
+                        str(data["canonical_statement"]),
+                        str(data["canonical_slot_key"]),
+                        _canonical(data.get("truth_source_event_ids", [])),
+                        str(data.get("proposer") or "deterministic"),
+                        str(data.get("source_kind") or "observed_user_fact"),
+                        str(data.get("commitment_level") or "candidate_frame"),
+                        float(data.get("confidence", 0.5) or 0.5),
+                        _canonical(data.get("evidence_ids", [])),
+                        _canonical(data.get("target_memory_ids", [])),
+                        _canonical(data.get("target_candidate_ids", [])),
+                        _canonical(data.get("derived_from_ids", [])),
+                        _canonical(data.get("metadata", {})),
+                        str(data.get("created_at") or _now_text()),
+                    ),
+                )
+        return claims
+
+    def grounded_claims(
+        self,
+        *,
+        namespace: str | None = None,
+        event_id: str | None = None,
+        conn: Connection | None = None,
+    ) -> list[dict[str, object]]:
+        query = "SELECT * FROM grounded_claims WHERE 1=1"
+        params: list[object] = []
+        if namespace is not None:
+            query += " AND namespace = ?"
+            params.append(namespace)
+        if event_id is not None:
+            query += " AND event_id = ?"
+            params.append(event_id)
+        query += " ORDER BY created_at ASC, claim_id ASC"
+        with self._connection(conn) as active:
+            rows = active.execute(query, tuple(params)).fetchall()
+        return [
+            {
+                "claim_id": str(row["claim_id"]),
+                "namespace": str(row["namespace"]),
+                "event_id": str(row["event_id"]),
+                "claim_type": str(row["claim_type"]),
+                "canonical_statement": str(row["canonical_statement"]),
+                "canonical_slot_key": str(row["canonical_slot_key"]),
+                "truth_source_event_ids": json.loads(row["truth_source_event_ids_json"]),
+                "proposer": str(row["proposer"]),
+                "source_kind": str(row["source_kind"]),
+                "commitment_level": str(row["commitment_level"]),
+                "confidence": float(row["confidence"]),
+                "evidence_ids": json.loads(row["evidence_ids_json"]),
+                "target_memory_ids": json.loads(row["target_memory_ids_json"]),
+                "target_candidate_ids": json.loads(row["target_candidate_ids_json"]),
+                "derived_from_ids": json.loads(row["derived_from_ids_json"]),
+                "metadata": json.loads(row["metadata_json"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
 
     def record_impact_assessment(self, assessment: WorldviewImpactAssessment, *, conn: Connection | None = None) -> WorldviewImpactAssessment:
         with self._connection(conn) as active:
