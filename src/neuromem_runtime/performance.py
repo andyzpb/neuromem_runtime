@@ -300,6 +300,55 @@ class SingleFlight:
             return {"inflight": len(self._events), "join_count": self.join_count, "leader_count": self.leader_count}
 
 
+class EmbeddingBatcher:
+    """Lightweight sync facade for batched embedding calls.
+
+    The base runtime stays synchronous at the low-level retrieval boundary, but
+    this object centralizes batch/concurrency configuration and records provider
+    batch behavior so async callers can reason about vector-path cost.
+    """
+
+    def __init__(self, *, max_batch_size: int = 32, max_wait_ms: int = 20, concurrency: int = 2) -> None:
+        self.max_batch_size = max(1, int(max_batch_size))
+        self.max_wait_ms = max(0, int(max_wait_ms))
+        self.concurrency = max(1, int(concurrency))
+        self._lock = threading.RLock()
+        self.batch_count = 0
+        self.embedded_text_count = 0
+        self.total_wait_ms = 0.0
+        self.last_batch_size = 0
+
+    def embed(self, texts: list[str], embed: Callable[[list[str]], list[list[float]]]) -> list[list[float]]:
+        if not texts:
+            return []
+        chunks = [texts[index : index + self.max_batch_size] for index in range(0, len(texts), self.max_batch_size)]
+        vectors: list[list[float]] = []
+        for chunk in chunks:
+            started = time.perf_counter()
+            batch_vectors = embed(chunk)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            with self._lock:
+                self.batch_count += 1
+                self.embedded_text_count += len(chunk)
+                self.total_wait_ms += elapsed_ms
+                self.last_batch_size = len(chunk)
+            vectors.extend(batch_vectors)
+        return vectors
+
+    def stats(self) -> dict[str, object]:
+        with self._lock:
+            avg_ms = self.total_wait_ms / self.batch_count if self.batch_count else 0.0
+            return {
+                "max_batch_size": self.max_batch_size,
+                "max_wait_ms": self.max_wait_ms,
+                "concurrency": self.concurrency,
+                "batch_count": self.batch_count,
+                "embedded_text_count": self.embedded_text_count,
+                "last_batch_size": self.last_batch_size,
+                "average_provider_batch_ms": round(avg_ms, 3),
+            }
+
+
 @dataclass(slots=True)
 class BackgroundJob:
     name: str

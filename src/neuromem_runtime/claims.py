@@ -11,6 +11,8 @@ from neuromem_runtime.ledger import ExperienceEvent
 
 ClaimSourceKind = Literal["observed_user_fact", "tool_fact", "llm_canonicalization", "assistant_derivation"]
 ClaimCommitment = Literal["raw_experience", "candidate_frame", "durable_memory", "validated_logic", "compiled_schema"]
+TRUTH_CLAIM_SOURCE_CHANNELS = frozenset({"current_user_message", "user_message", "tool_result"})
+TRUTH_CLAIM_SOURCE_KINDS = frozenset({"observed_user_fact", "tool_fact", "llm_canonicalization"})
 
 
 def _now_text() -> str:
@@ -164,4 +166,49 @@ def _dedupe_claims(claims: list[GroundedClaim]) -> list[GroundedClaim]:
     return values
 
 
-__all__ = ["GroundedClaim", "GroundedClaimExtractor"]
+def claim_source_channel(claim: GroundedClaim | dict[str, object]) -> str:
+    metadata = claim.metadata if isinstance(claim, GroundedClaim) else claim.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    return str(metadata.get("source_channel") or "")
+
+
+def claim_source_kind(claim: GroundedClaim | dict[str, object]) -> str:
+    if isinstance(claim, GroundedClaim):
+        return str(claim.source_kind)
+    return str(claim.get("source_kind") or "")
+
+
+def is_durable_truth_claim(claim: GroundedClaim | dict[str, object]) -> bool:
+    return claim_source_channel(claim) in TRUTH_CLAIM_SOURCE_CHANNELS and claim_source_kind(claim) in TRUTH_CLAIM_SOURCE_KINDS
+
+
+def durable_truth_claims(claims: list[GroundedClaim | dict[str, object]]) -> list[GroundedClaim | dict[str, object]]:
+    return [claim for claim in claims if is_durable_truth_claim(claim)]
+
+
+def durable_truth_claim_rejection_reason(claims: list[GroundedClaim | dict[str, object]]) -> str | None:
+    if durable_truth_claims(claims):
+        return None
+    if not claims:
+        return "durable mutation requires grounded claims from current user message or tool result"
+    channels = sorted({claim_source_channel(claim) or "missing" for claim in claims})
+    kinds = sorted({claim_source_kind(claim) or "missing" for claim in claims})
+    return (
+        "durable mutation requires at least one grounded claim with "
+        f"metadata.source_channel in {sorted(TRUTH_CLAIM_SOURCE_CHANNELS)} and "
+        f"source_kind in {sorted(TRUTH_CLAIM_SOURCE_KINDS)}; got channels={channels}, kinds={kinds}"
+    )
+
+
+__all__ = [
+    "GroundedClaim",
+    "GroundedClaimExtractor",
+    "TRUTH_CLAIM_SOURCE_CHANNELS",
+    "TRUTH_CLAIM_SOURCE_KINDS",
+    "claim_source_channel",
+    "claim_source_kind",
+    "durable_truth_claim_rejection_reason",
+    "durable_truth_claims",
+    "is_durable_truth_claim",
+]

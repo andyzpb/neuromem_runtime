@@ -2,7 +2,17 @@ from __future__ import annotations
 
 from neuromem.core.policy import MemoryPolicy, MemoryTrace
 from neuromem.core.models import AssociativeEdge, LogicEdge, MemoryFrame
-from neuromem_runtime.claims import GroundedClaim, GroundedClaimExtractor
+from neuromem_runtime.claims import (
+    GroundedClaim,
+    GroundedClaimExtractor,
+    TRUTH_CLAIM_SOURCE_CHANNELS,
+    TRUTH_CLAIM_SOURCE_KINDS,
+    claim_source_channel,
+    claim_source_kind,
+    durable_truth_claim_rejection_reason,
+    durable_truth_claims,
+    is_durable_truth_claim,
+)
 from neuromem_runtime.crystallization import (
     CrystallizationPlanner,
     DefaultFrameValidator,
@@ -20,7 +30,7 @@ from neuromem_runtime.deltas import ExecutionDeltaPlan, GraphDelta, IndexDelta, 
 from neuromem_runtime.impact import SlotImpact, WorldviewImpactAssessment, WorldviewImpactMeter, WorldviewImpactVector
 from neuromem_runtime.ledger import EdgeEvidenceEvent, ExperienceEvent, LedgerEvent, MemoryLedger, WorldviewCandidateEvent, WorldviewCandidateRecord, WorldviewSlotRecord
 from neuromem_runtime.lifecycle import LifecycleStateMachine
-from neuromem_runtime.performance import EmbeddingCache
+from neuromem_runtime.performance import EmbeddingBatcher, EmbeddingCache
 from neuromem_runtime.policy_v2 import AssociativeEdgeProposal, FrameDeltaProposal, GraphDeltaProposal, LogicEdgeProposal, MemoryPolicyV2, ValidatedMutation, WriteGate
 from neuromem_runtime.plasticity import PlasticityEngine
 from neuromem_runtime.retrieval import (
@@ -73,6 +83,13 @@ __all__ = [
     "ExperienceEvent",
     "GroundedClaim",
     "GroundedClaimExtractor",
+    "TRUTH_CLAIM_SOURCE_CHANNELS",
+    "TRUTH_CLAIM_SOURCE_KINDS",
+    "claim_source_channel",
+    "claim_source_kind",
+    "durable_truth_claim_rejection_reason",
+    "durable_truth_claims",
+    "is_durable_truth_claim",
     "EdgeEvidenceEvent",
     "WorldviewImpactVector",
     "WorldviewImpactAssessment",
@@ -116,6 +133,7 @@ __all__ = [
     "EmbeddingProvider",
     "AsyncEmbeddingProvider",
     "EmbeddingCache",
+    "EmbeddingBatcher",
     "EntityAliasResolver",
     "HyDEProvider",
     "LocalVectorIndex",

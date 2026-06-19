@@ -48,6 +48,18 @@ class FakeRewrite:
         return ["auth session redirect fix", "登录 跳转 会话 修复"]
 
 
+def _truth_claim(event_id: str, statement: str, slot_key: str = "test.graph.claim") -> dict[str, object]:
+    return {
+        "claim_type": "fact",
+        "canonical_statement": statement,
+        "canonical_slot_key": slot_key,
+        "truth_source_event_ids": [event_id],
+        "evidence_ids": [event_id],
+        "source_kind": "llm_canonicalization",
+        "metadata": {"source_channel": "current_user_message"},
+    }
+
+
 def test_semantic_recall_cross_lingual_and_hyde_trace(tmp_path) -> None:
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(
@@ -155,6 +167,7 @@ def test_graph_delta_policy_commits_edge_and_rejects_missing_evidence(tmp_path) 
         policy = nmem.MemoryPolicyV2(
             intent="link",
             evidence_chain=[EvidenceRef(event_id=evidence.event_id, source="test")],
+            grounded_claims=[_truth_claim(evidence.event_id, "Trace shows the episode supports the rule.")],
             graph_deltas=[
                 {
                     "operation": "add_edge",
@@ -177,6 +190,7 @@ def test_graph_delta_policy_commits_edge_and_rejects_missing_evidence(tmp_path) 
         rejected = await memory.commit(
             nmem.MemoryPolicyV2(
                 intent="link",
+                grounded_claims=[_truth_claim(evidence.event_id, "Trace shows the episode supports the rule.")],
                 graph_deltas=[
                     {
                         "operation": "add_edge",

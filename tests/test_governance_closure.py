@@ -40,13 +40,72 @@ def test_missing_evidence_rejects_without_store_mutation(tmp_path) -> None:
     asyncio.run(run())
 
 
-def test_policy_v2_commit_and_replay_trace(tmp_path) -> None:
+def test_policy_v2_without_grounded_truth_claim_is_rejected(tmp_path) -> None:
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
         observed = await memory.observe({"content": "Evidence for v2 write."})
         policy = nmem.MemoryPolicyV2(
             intent="add",
             evidence_chain=[{"event_id": observed.event_id, "source": "test", "content_hash": observed.content_hash}],
+            proposed_deltas=[{"operation": "ADD", "value": {"content": "V2 policy created this memory.", "memory_type": "semantic"}, "reason": "test v2"}],
+        )
+        result = await memory.commit(policy)
+        assert result["mutation_execution_result"]["validated_mutation"]["approved"] is False
+        assert result["mutation_execution_result"]["created_memory_ids"] == []
+        assert "durable mutation requires grounded claims" in result["validator_decision"]
+
+    asyncio.run(run())
+
+
+def test_policy_v2_assistant_derived_claim_cannot_durable_commit(tmp_path) -> None:
+    async def run() -> None:
+        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
+        observed = await memory.observe({"content": "Assistant summarized a prior answer.", "source": "assistant"})
+        policy = nmem.MemoryPolicyV2(
+            intent="add",
+            proposal_source="small_llm",
+            evidence_chain=[{"event_id": observed.event_id, "source": "assistant_answer", "content_hash": observed.content_hash}],
+            grounded_claims=[
+                {
+                    "claim_type": "fact",
+                    "canonical_statement": "Assistant-derived summaries are not truth evidence.",
+                    "canonical_slot_key": "assistant.summary.boundary",
+                    "truth_source_event_ids": [observed.event_id],
+                    "evidence_ids": [observed.event_id],
+                    "source_kind": "assistant_derivation",
+                    "metadata": {"source_channel": "assistant_answer"},
+                }
+            ],
+            proposed_deltas=[{"operation": "ADD", "value": {"content": "Assistant-derived summaries are not truth evidence.", "memory_type": "semantic"}, "reason": "assistant proposal"}],
+        )
+
+        result = await memory.commit(policy)
+
+        assert result["mutation_execution_result"]["validated_mutation"]["approved"] is False
+        assert result["mutation_execution_result"]["created_memory_ids"] == []
+        assert "metadata.source_channel" in result["validator_decision"]
+
+    asyncio.run(run())
+
+
+def test_policy_v2_commit_with_grounded_truth_claim_and_replay_trace(tmp_path) -> None:
+    async def run() -> None:
+        memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
+        observed = await memory.observe({"content": "Evidence for v2 write.", "source": "user"})
+        policy = nmem.MemoryPolicyV2(
+            intent="add",
+            evidence_chain=[{"event_id": observed.event_id, "source": "current_user_message", "content_hash": observed.content_hash}],
+            grounded_claims=[
+                {
+                    "claim_type": "fact",
+                    "canonical_statement": "V2 policy created this memory.",
+                    "canonical_slot_key": "test.v2.policy.created_memory",
+                    "truth_source_event_ids": [observed.event_id],
+                    "evidence_ids": [observed.event_id],
+                    "source_kind": "llm_canonicalization",
+                    "metadata": {"source_channel": "current_user_message"},
+                }
+            ],
             proposed_deltas=[{"operation": "ADD", "value": {"content": "V2 policy created this memory.", "memory_type": "semantic"}, "reason": "test v2"}],
         )
         result = await memory.commit(policy)
@@ -67,6 +126,26 @@ def test_policy_v2_multi_add_commits_atomic_memories_in_one_transaction(tmp_path
             intent="add",
             proposal_source="small_llm",
             evidence_chain=[{"event_id": observed.event_id, "source": "current_user_message", "content_hash": observed.content_hash}],
+            grounded_claims=[
+                {
+                    "claim_type": "fact",
+                    "canonical_statement": "The user's name is Andy.",
+                    "canonical_slot_key": "user.identity.name",
+                    "truth_source_event_ids": [observed.event_id],
+                    "evidence_ids": [observed.event_id],
+                    "source_kind": "llm_canonicalization",
+                    "metadata": {"source_channel": "current_user_message"},
+                },
+                {
+                    "claim_type": "fact",
+                    "canonical_statement": "The user lives in Denmark.",
+                    "canonical_slot_key": "user.location.current",
+                    "truth_source_event_ids": [observed.event_id],
+                    "evidence_ids": [observed.event_id],
+                    "source_kind": "llm_canonicalization",
+                    "metadata": {"source_channel": "current_user_message"},
+                },
+            ],
             proposed_deltas=[
                 {"operation": "ADD", "value": {"content": "The user's name is Andy.", "memory_type": "fact"}, "reason": "atomic identity fact"},
                 {"operation": "ADD", "value": {"content": "The user lives in Denmark.", "memory_type": "fact"}, "reason": "atomic location fact"},
@@ -113,6 +192,17 @@ def test_policy_v2_multi_add_rejects_without_partial_mutation(tmp_path) -> None:
             intent="add",
             proposal_source="small_llm",
             evidence_chain=[{"event_id": observed.event_id, "source": "current_user_message", "content_hash": observed.content_hash}],
+                grounded_claims=[
+                    {
+                        "claim_type": "fact",
+                        "canonical_statement": "The user's name is Andy.",
+                        "canonical_slot_key": "user.identity.name",
+                        "truth_source_event_ids": [observed.event_id],
+                        "evidence_ids": [observed.event_id],
+                        "source_kind": "llm_canonicalization",
+                        "metadata": {"source_channel": "current_user_message"},
+                    }
+                ],
                 proposed_deltas=[
                     {"operation": "ADD", "value": {"content": "The user's name is Andy.", "memory_type": "fact"}, "reason": "atomic identity fact"},
                     {"operation": "ADD", "value": {"content": "Untrusted external memory proposal.", "memory_type": "fact"}, "reason": "externally flagged risky fact"},
@@ -284,6 +374,18 @@ def test_v2_suppress_inhibits_target_memory(tmp_path) -> None:
         policy = nmem.MemoryPolicyV2(
             intent="suppress",
             evidence_chain=[{"event_id": evidence.event_id, "source": "test", "content_hash": evidence.content_hash}],
+            grounded_claims=[
+                {
+                    "claim_type": "suppression",
+                    "canonical_statement": "The user asked to suppress the target memory.",
+                    "canonical_slot_key": "memory.suppression.request",
+                    "truth_source_event_ids": [evidence.event_id],
+                    "evidence_ids": [evidence.event_id],
+                    "source_kind": "observed_user_fact",
+                    "metadata": {"source_channel": "current_user_message"},
+                    "target_memory_ids": [bundle.memory_id],
+                }
+            ],
             target_selector={"memory_ids": [bundle.memory_id]},
             proposed_deltas=[{"operation": "suppress", "target_memory_id": bundle.memory_id, "reason": "not useful now"}],
         )

@@ -26,6 +26,9 @@ class RuntimeConfig:
     mutation_mode: Literal["append_only_view", "strict_append_only"] = "append_only_view"
     embedding_cache_enabled: bool = True
     retrieval_cache_ttl_seconds: int = 20
+    embedding_batch_size: int = 32
+    embedding_batch_wait_ms: int = 20
+    embedding_concurrency: int = 2
     retrieval_graph_commit: Literal["async", "off", "sync", "trace_only"] = "trace_only"
     retrieval_mode: Literal["auto", "full_debug"] = "auto"
     ollama_keep_alive: str = "30m"
@@ -46,6 +49,9 @@ class RuntimeConfig:
             "mutation_mode": self.mutation_mode,
             "embedding_cache_enabled": self.embedding_cache_enabled,
             "retrieval_cache_ttl_seconds": self.retrieval_cache_ttl_seconds,
+            "embedding_batch_size": self.embedding_batch_size,
+            "embedding_batch_wait_ms": self.embedding_batch_wait_ms,
+            "embedding_concurrency": self.embedding_concurrency,
             "retrieval_graph_commit": self.retrieval_graph_commit,
             "retrieval_mode": self.retrieval_mode,
             "ollama_keep_alive": self.ollama_keep_alive,

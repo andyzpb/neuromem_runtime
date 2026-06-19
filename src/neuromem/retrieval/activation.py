@@ -402,7 +402,11 @@ class ActivationRetrievalEngine:
                 stats["memory_hits"] = int(stats.get("memory_hits", 0)) + 1
         if missing_texts:
             embed_started = time.perf_counter()
-            vectors = embed(missing_texts)
+            batcher = query.filters.get("_embedding_batcher")
+            if batcher is not None and hasattr(batcher, "embed"):
+                vectors = getattr(batcher, "embed")(missing_texts, embed)
+            else:
+                vectors = embed(missing_texts)
             _add_timing(timing, "embedding_ms", embed_started)
             for memory_id, text, vector in zip(missing_ids, missing_texts, vectors, strict=True):
                 vector_list = [float(value) for value in vector]
@@ -475,7 +479,12 @@ class ActivationRetrievalEngine:
                 stats["query_hits"] = int(stats.get("query_hits", 0)) + 1
         if missing:
             embed_started = time.perf_counter()
-            embedded = embed([text for _, text in missing])
+            missing_texts = [text for _, text in missing]
+            batcher = filters.get("_embedding_batcher")
+            if batcher is not None and hasattr(batcher, "embed"):
+                embedded = getattr(batcher, "embed")(missing_texts, embed)
+            else:
+                embedded = embed(missing_texts)
             _add_timing(timing, "embedding_ms", embed_started)
             for (index, query_text), vector in zip(missing, embedded, strict=True):
                 vector_list = [float(value) for value in vector]

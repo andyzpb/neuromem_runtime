@@ -14,7 +14,7 @@ from neuromem.core.models import MemoryItem
 from neuromem.core.runtime import NeuroMemRuntime
 from neuromem.stores.sqlite_store import SQLiteMemoryStore
 
-from neuromem_runtime.claims import GroundedClaim, GroundedClaimExtractor
+from neuromem_runtime.claims import GroundedClaim, GroundedClaimExtractor, durable_truth_claim_rejection_reason
 from neuromem_runtime.crystallization import (
     DeterministicCrystallizationPlanner,
     DeterministicFrameExtractor,
@@ -29,7 +29,7 @@ from neuromem_runtime.ledger import EdgeEvidenceEvent, ExperienceEvent, LedgerEv
 from neuromem_runtime.materializer import EdgeEvidenceAppender, WorldviewMaterializer
 from neuromem_runtime.policy_v2 import EvidenceRef, FrameDeltaProposal, LogicEdgeProposal, MemoryPolicyV2
 from neuromem_runtime.providers import DeterministicPolicyProvider, PolicyProvider
-from neuromem_runtime.performance import BackgroundJobQueue, EmbeddingCache, RetrievalCache, RuntimeTiming, SingleFlight, TimingSpan, stable_hash
+from neuromem_runtime.performance import BackgroundJobQueue, EmbeddingBatcher, EmbeddingCache, RetrievalCache, RuntimeTiming, SingleFlight, TimingSpan, stable_hash
 from neuromem_runtime.retrieval import (
     EmbeddingProvider,
     EntityAliasResolver,
@@ -110,6 +110,12 @@ class MemoryRuntime:
         self._retrieval_cache_fingerprints: dict[str, tuple[str, str]] = {}
         self._retrieval_singleflight = SingleFlight()
         self._semantic_versions: dict[str, int] = {config.namespace: 0}
+        self._worldview_versions: dict[str, int] = {config.namespace: 0}
+        self._embedding_batcher = EmbeddingBatcher(
+            max_batch_size=config.embedding_batch_size,
+            max_wait_ms=config.embedding_batch_wait_ms,
+            concurrency=config.embedding_concurrency,
+        )
         self._embedding_cache = EmbeddingCache(config.db_path) if config.embedding_cache_enabled and embedding_provider is not None else None
         self._background_jobs = BackgroundJobQueue()
 
@@ -155,6 +161,9 @@ class MemoryRuntime:
             mutation_mode=mutation_mode,  # type: ignore[arg-type]
             embedding_cache_enabled=_bool_env("NEUROMEM_EMBEDDING_CACHE", True),
             retrieval_cache_ttl_seconds=_int_env("NEUROMEM_RETRIEVAL_CACHE_TTL_SECONDS", 20),
+            embedding_batch_size=_int_env("NEUROMEM_EMBEDDING_BATCH_SIZE", 32),
+            embedding_batch_wait_ms=_int_env("NEUROMEM_EMBEDDING_BATCH_WAIT_MS", 20),
+            embedding_concurrency=_int_env("NEUROMEM_EMBEDDING_CONCURRENCY", 2),
             retrieval_graph_commit=_graph_commit_env(),
             retrieval_mode="full_debug" if os.environ.get("NEUROMEM_CHAT_RETRIEVAL_MODE", "").strip().lower() == "full" else "auto",
             ollama_keep_alive=os.environ.get("NEUROMEM_OLLAMA_KEEP_ALIVE", "30m"),
@@ -506,6 +515,7 @@ class MemoryRuntime:
             query_obj.filters["namespace"] = namespace
         namespace_value = str(query_obj.filters.get("namespace") or self.config.namespace)
         store_version = self._store_version(namespace_value)
+        cache_versions = self._cache_versions(namespace_value)
         filter_hash = self._retrieval_filter_hash(query_obj, resolved_lens=resolved_lens)
         cache_key = self._retrieval_cache_key(query_obj, resolved_lens=resolved_lens, store_version=store_version, filter_hash=filter_hash)
         cache_probe_key = self._retrieval_cache_probe_key(query_obj, resolved_lens=resolved_lens)
@@ -522,15 +532,15 @@ class MemoryRuntime:
                 **cached.cache,
                 "retrieval_cache": "hit",
                 "retrieval_cache_stats": self._retrieval_cache.stats(),
-                "cache_key_version": store_version[:12],
-                "semantic_version_short": store_version[:12],
-                "filter_hash": filter_hash[:12],
+                **cache_versions,
+                "store_version": store_version,
+                "filter_hash": filter_hash,
                 "miss_reason": None,
             }
             return cached_context
         flight = self._retrieval_singleflight.begin(cache_key)
         if not flight.leader:
-            flight.event.wait()
+            await asyncio.to_thread(flight.event.wait)
             cached_after_wait = self._retrieval_cache.get(cache_key)
             if isinstance(cached_after_wait, MemoryContext):
                 self._retrieval_cache_fingerprints[cache_probe_key] = (store_version, filter_hash)
@@ -541,19 +551,25 @@ class MemoryRuntime:
                     "retrieval_cache_stats": self._retrieval_cache.stats(),
                     "singleflight_joined": True,
                     "singleflight_stats": self._retrieval_singleflight.stats(),
-                    "cache_key_version": store_version[:12],
-                    "semantic_version_short": store_version[:12],
-                    "filter_hash": filter_hash[:12],
+                    **cache_versions,
+                    "store_version": store_version,
+                    "filter_hash": filter_hash,
                     "miss_reason": None,
                 }
                 return cached_context
         before_states = self._memory_states()
         try:
             with TimingSpan(timing, "retrieval_ms"):
-                results, trace = self._runtime.retrieve_with_trace(query_obj.query, filters=query_obj.filters, budget_tokens=query_obj.budget_tokens, task_id=query_obj.query)
-        finally:
-            if not flight.leader:
-                self._retrieval_singleflight.finish(cache_key)
+                results, trace = await asyncio.to_thread(
+                    self._runtime.retrieve_with_trace,
+                    query_obj.query,
+                    filters=query_obj.filters,
+                    budget_tokens=query_obj.budget_tokens,
+                    task_id=query_obj.query,
+                )
+        except Exception:
+            self._retrieval_singleflight.finish(cache_key)
+            raise
         results = self._apply_retrieval_lens(results, resolved_lens)
         if resolved_lens not in {"historical", "audit"}:
             suppressed = self._ledger.active_suppressed_memory_ids(namespace_value)
@@ -625,9 +641,9 @@ class MemoryRuntime:
             "retrieval_cache_stats": self._retrieval_cache.stats(),
             "embedding_cache": dict(embedding_cache_stats),
             "singleflight_stats": self._retrieval_singleflight.stats(),
-            "cache_key_version": store_version[:12],
-            "semantic_version_short": store_version[:12],
-            "filter_hash": filter_hash[:12],
+            **cache_versions,
+            "store_version": store_version,
+            "filter_hash": filter_hash,
             "miss_reason": diagnostic_miss_reason or self._retrieval_cache.last_miss_reason,
         }
         retrieval_metadata = dict(trace.query_plan.get("retrieval_metadata", {})) if isinstance(trace.query_plan.get("retrieval_metadata", {}), dict) else {}
@@ -716,6 +732,9 @@ class MemoryRuntime:
             if correction is not None:
                 return correction
             return _append_only_rejection(legacy_policy.write.target_memory_id or legacy_policy.forget.target_memory_id, destructive_reason)
+        source_rejection = self._durable_source_rejection(policy)
+        if source_rejection is not None:
+            return _append_only_rejection(legacy_policy.write.target_memory_id or legacy_policy.forget.target_memory_id, source_rejection)
         suppression = self._append_only_suppression_from_policy(legacy_policy)
         if suppression is not None:
             return suppression
@@ -752,6 +771,9 @@ class MemoryRuntime:
     async def _append_only_correction_from_policy(self, policy: MemoryPolicy | MemoryPolicyV2, destructive_reason: str) -> dict[str, object] | None:
         if not isinstance(policy, MemoryPolicyV2) or not policy.grounded_claims:
             return None
+        source_rejection = self._durable_source_rejection(policy)
+        if source_rejection is not None:
+            return _append_only_rejection(None, f"{destructive_reason}; append-only correction repair rejected: {source_rejection}")
         event_id = _event_id_from_policy(policy)
         if not event_id:
             return None
@@ -787,6 +809,13 @@ class MemoryRuntime:
             },
             "append_only_correction": route,
         }
+
+    def _durable_source_rejection(self, policy: MemoryPolicy | MemoryPolicyV2) -> str | None:
+        if not isinstance(policy, MemoryPolicyV2):
+            return None
+        if not _policy_v2_requests_durable_mutation(policy):
+            return None
+        return durable_truth_claim_rejection_reason(list(policy.grounded_claims))
 
     def _append_only_suppression_from_policy(self, policy: MemoryPolicy) -> dict[str, object] | None:
         if policy.forget.operation not in {"DECAY", "INHIBIT", "INVALIDATE", "ARCHIVE"}:
@@ -1381,6 +1410,7 @@ class MemoryRuntime:
                     self._edge_appender.append(edge_event)
                     supersession_events.append(edge_event.to_dict())
         materialized = self._materialize_worldview_sync(experience.namespace)
+        self._bump_worldview_version(experience.namespace)
         self._append_route_audit(
             experience,
             "propose_worldview_candidate" if worldview_candidate else "propose_frame",
@@ -1478,10 +1508,11 @@ class MemoryRuntime:
                 self._edge_appender.append(edge_event)
                 edge_events.append(edge_event.to_dict())
         materialized = self._materialize_worldview_sync(experience.namespace)
+        self._bump_worldview_version(experience.namespace)
         audit = {"grounded_claims": claims, "candidate_events": candidate_events, "edge_evidence_events": edge_events, "materialized": materialized}
         self._append_route_audit(experience, decision, audit)
         if edge_events or candidate_events:
-            self._invalidate_retrieval_cache()
+            self._invalidate_retrieval_cache(namespace=experience.namespace)
         return {
             "grounded_claims": claims,
             "candidate_events": candidate_events,
@@ -1673,6 +1704,7 @@ class MemoryRuntime:
             filters["_vector_index"] = self._vector_index
             filters["_embedding_provider_label"] = self._embedding_provider_label()
             filters["_embedding_cache"] = self._embedding_cache
+            filters["_embedding_batcher"] = self._embedding_batcher
             filters.setdefault("retrieval_channels", ("fts5", "bm25", "dense", "rewrite", "hyde", "lexical", "entity", "recent_current", "procedural_preference", "canonical_fact", "graph_seed"))
         if self._query_rewrite_provider is not None:
             filters["_query_rewrite_provider"] = self._query_rewrite_provider
@@ -1771,12 +1803,24 @@ class MemoryRuntime:
         return stable_hash({"lens": resolved_lens, "budget_tokens": query.budget_tokens, "filters": filters})
 
     def _store_version(self, namespace: str) -> str:
-        return f"{namespace}:{self._semantic_versions.get(namespace, 0)}"
+        versions = self._cache_versions(namespace)
+        return f"{namespace}:semantic:{versions['semantic_version']}:worldview:{versions['worldview_version']}"
 
-    def _invalidate_retrieval_cache(self, reason: str = "invalidated_by_mutation") -> None:
-        namespace = self.config.namespace
+    def _cache_versions(self, namespace: str) -> dict[str, object]:
+        return {
+            "namespace": namespace,
+            "semantic_version": int(self._semantic_versions.get(namespace, 0)),
+            "worldview_version": int(self._worldview_versions.get(namespace, 0)),
+        }
+
+    def _invalidate_retrieval_cache(self, reason: str = "invalidated_by_mutation", *, namespace: str | None = None) -> None:
+        namespace = namespace or self.config.namespace
         self._semantic_versions[namespace] = self._semantic_versions.get(namespace, 0) + 1
         self._retrieval_cache.invalidate(reason)
+
+    def _bump_worldview_version(self, namespace: str | None = None) -> None:
+        namespace_value = namespace or self.config.namespace
+        self._worldview_versions[namespace_value] = self._worldview_versions.get(namespace_value, 0) + 1
 
     def _embedding_provider_label(self) -> str:
         provider = self._embedding_provider
@@ -1795,9 +1839,13 @@ class MemoryRuntime:
             "retrieval_cache": self._retrieval_cache.stats(),
             "retrieval_singleflight": self._retrieval_singleflight.stats(),
             "semantic_versions": dict(self._semantic_versions),
+            "worldview_versions": dict(self._worldview_versions),
+            "cache_versions": {namespace: self._cache_versions(namespace) for namespace in sorted({*self._semantic_versions, *self._worldview_versions})},
+            "embedding_batcher": self._embedding_batcher.stats(),
             "embedding_cache_enabled": self._embedding_cache is not None,
             "embedding_provider": self._embedding_provider_label(),
             "embedding_provider_stats": embedding_stats,
+            "llm_provider": {},
             "background_jobs": self._background_jobs.recent(),
             "retrieval_graph_commit": self.config.retrieval_graph_commit,
             "retrieval_mode": self.config.retrieval_mode,
@@ -2238,6 +2286,16 @@ def _event_id_from_policy(policy: MemoryPolicyV2) -> str:
                     if text:
                         return text
     return ""
+
+
+def _policy_v2_requests_durable_mutation(policy: MemoryPolicyV2) -> bool:
+    if policy.intent in {"add", "update", "link", "suppress", "supersede", "consolidate", "delete_request"}:
+        return True
+    durable_delta_ops = {"ADD", "LINK", "SUPPRESS", "INHIBIT", "INVALIDATE", "ARCHIVE", "DECAY", "UPDATE", "DELETE_REQUEST"}
+    if any(str(delta.operation).upper() in durable_delta_ops for delta in policy.proposed_deltas):
+        return True
+    structural_deltas = [*policy.frame_deltas, *policy.associative_deltas, *policy.logic_deltas, *policy.graph_deltas]
+    return bool(structural_deltas)
 
 
 def _slot_key_from_experience(experience: ExperienceEvent) -> str:

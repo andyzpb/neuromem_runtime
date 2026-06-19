@@ -6,6 +6,18 @@ import sqlite3
 import neuromem_runtime as nmem
 
 
+def _truth_claim(event_id: str, statement: str, slot_key: str = "test.graph.claim") -> dict[str, object]:
+    return {
+        "claim_type": "fact",
+        "canonical_statement": statement,
+        "canonical_slot_key": slot_key,
+        "truth_source_event_ids": [event_id],
+        "evidence_ids": [event_id],
+        "source_kind": "llm_canonicalization",
+        "metadata": {"source_channel": "current_user_message"},
+    }
+
+
 def test_split_graph_storage_is_new_baseline(tmp_path) -> None:
     async def run() -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
@@ -18,6 +30,7 @@ def test_split_graph_storage_is_new_baseline(tmp_path) -> None:
             nmem.MemoryPolicyV2(
                 intent="link",
                 evidence_chain=[{"event_id": evidence.event_id, "source": "test"}],
+                grounded_claims=[_truth_claim(evidence.event_id, "Both memories were co-retrieved during the same query.")],
                 associative_deltas=[
                     {
                         "source_memory_id": first.memory_id,
@@ -56,6 +69,7 @@ def test_logic_edge_requires_existing_frame_endpoints(tmp_path) -> None:
             nmem.MemoryPolicyV2(
                 intent="link",
                 evidence_chain=[{"event_id": evidence.event_id, "source": "test"}],
+                grounded_claims=[_truth_claim(evidence.event_id, "Trace proves the episode supports the rule.")],
                 logic_deltas=[
                     {
                         "source_frame_id": "missing-source",
@@ -97,6 +111,7 @@ def test_logic_edge_requires_existing_frame_endpoints(tmp_path) -> None:
             nmem.MemoryPolicyV2(
                 intent="link",
                 evidence_chain=[{"event_id": evidence.event_id, "source": "test"}],
+                grounded_claims=[_truth_claim(evidence.event_id, "Trace proves the episode supports the rule.")],
                 frame_deltas=[source_frame, target_frame],
                 logic_deltas=[
                     {
@@ -131,6 +146,7 @@ def test_candidate_frame_does_not_enter_logical_lens(tmp_path) -> None:
             nmem.MemoryPolicyV2(
                 intent="link",
                 evidence_chain=[{"event_id": evidence.event_id, "source": "test"}],
+                grounded_claims=[_truth_claim(evidence.event_id, "Candidate extraction evidence.")],
                 frame_deltas=[
                     {
                         "frame_id": "candidate-test-command",
@@ -153,6 +169,7 @@ def test_candidate_frame_does_not_enter_logical_lens(tmp_path) -> None:
             nmem.MemoryPolicyV2(
                 intent="link",
                 evidence_chain=[{"event_id": evidence.event_id, "source": "test"}],
+                grounded_claims=[_truth_claim(evidence.event_id, "Candidate extraction evidence.")],
                 frame_deltas=[
                     {
                         "frame_id": "validated-test-command",

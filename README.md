@@ -62,6 +62,8 @@ asyncio.run(main())
 
 For uncertain input, use `observe_and_route()`. It records the event, computes a Worldview Impact assessment, and routes append-only evidence. Novel input can propose a candidate Frame or worldview candidate without creating durable memory. Explicit long-term memory creation remains `observe_and_commit()`.
 
+Durable V2 mutations are source-gated at the runtime boundary. `ADD`, `LINK`, `SUPPRESS`, `SUPERSEDE`, and append-only correction repairs require at least one structured grounded claim whose `metadata.source_channel` is `current_user_message`, `user_message`, or `tool_result`. Claims derived only from `assistant_answer`, `retrieved_memory`, or `short_term_context` can be routed as derivations or audit evidence, but they cannot create durable memory by themselves.
+
 ## CLI
 
 ```bash
@@ -130,9 +132,11 @@ Retrieval-time graph commit defaults to `trace_only`. Co-retrieval is recorded a
 
 ### Retrieval Performance
 
-`query()` uses a versioned in-memory retrieval cache, so append-only audit events do not force an expensive full cache clear. Durable memory or materialized retrieval graph changes advance the namespace semantic version, and old cached entries age out through TTL/LRU eviction.
+`query()` uses a versioned in-memory retrieval cache, so append-only audit events do not force an expensive full cache clear. Durable memory or materialized retrieval graph changes advance the namespace semantic version, worldview materialization advances the worldview version, and old cached entries age out through TTL/LRU eviction. Cache diagnostics expose `namespace`, numeric `semantic_version`, numeric `worldview_version`, `filter_hash`, and `miss_reason`.
 
-Embedding-backed retrieval uses a SQLite embedding cache with WAL mode and batch reads/writes. The cache avoids synchronous `last_accessed_at` writes on every hit, and `LocalVectorIndex` is lock-protected for concurrent reads and batched upserts. `performance_stats()` reports retrieval cache, singleflight, embedding provider, and background job state. `prewarm_embeddings()` can be called at service startup to load a local embedding model before the first user query.
+Embedding-backed retrieval uses a SQLite embedding cache with WAL mode and batch reads/writes. The cache avoids synchronous `last_accessed_at` writes on every hit, and `LocalVectorIndex` is lock-protected for concurrent reads and batched upserts. Async runtime queries offload blocking retrieval and embedding provider work to worker threads when needed, while singleflight coalesces identical retrieval misses. `performance_stats()` reports retrieval cache, singleflight, cache versions, embedding batcher, embedding provider, and background job state. `prewarm_embeddings()` can be called at service startup to load a local embedding model before the first user query.
+
+NeuroMem intentionally does not cache natural-language LLM answers. It caches retrieval/context/vector work only, so answers are generated against the latest resolved Worldview and supporting memories.
 
 ## Progressive Crystallization
 

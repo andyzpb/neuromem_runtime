@@ -218,6 +218,10 @@ def test_retrieval_cache_uses_semantic_store_version(tmp_path) -> None:
         second = await memory.query("cache behavior", top_k=3)
 
         assert first.cache["retrieval_cache"] == "miss"
+        assert first.cache["namespace"] == "demo"
+        assert isinstance(first.cache["semantic_version"], int)
+        assert isinstance(first.cache["worldview_version"], int)
+        assert "semantic_version_short" not in first.cache
         assert version_after_access == version_before
         assert second.cache["retrieval_cache"] == "hit"
 
@@ -258,6 +262,8 @@ def test_retrieval_cache_keeps_old_entries_after_version_bump(tmp_path) -> None:
         assert second.cache["retrieval_cache"] == "miss"
         assert stats_after_second["entries"] >= stats_after_first["entries"]
         assert memory.performance_stats()["semantic_versions"]["demo"] >= 2
+        assert memory.performance_stats()["cache_versions"]["demo"]["semantic_version"] >= 2
+        assert "embedding_batcher" in memory.performance_stats()
 
     import asyncio
 
@@ -337,6 +343,17 @@ def test_write_gate_validator_rejects_inconsistent_policies(tmp_path) -> None:
         consistent = nmem.MemoryPolicyV2(
             intent="add",
             evidence_chain=evidence,
+            grounded_claims=[
+                {
+                    "claim_type": "fact",
+                    "canonical_statement": "Neutral reusable implementation detail.",
+                    "canonical_slot_key": "implementation.detail.reusable",
+                    "truth_source_event_ids": [event.event_id],
+                    "evidence_ids": [event.event_id],
+                    "source_kind": "llm_canonicalization",
+                    "metadata": {"source_channel": "current_user_message"},
+                }
+            ],
             proposed_deltas=[
                 {
                     "operation": "ADD",
