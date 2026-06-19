@@ -17,10 +17,12 @@ Long-running agents need more than recall. They need to know when a memory was w
 NeuroMem gives you that local runtime:
 
 - `observe` records immutable experience events.
+- `observe_and_route` records an event, measures Worldview Impact, and routes it to ledger-only, support evidence, candidate Frame, candidate worldview update, clarification, quarantine, or sleep priority.
 - `commit` validates append-only memory transactions before they touch storage.
 - `query` returns a Worldview Snapshot plus prompt-ready supporting context, reasons, trace ids, and an optional retrieval lens.
 - `forget` appends suppression, expiry, decay, or archive evidence. It does not overwrite or physically delete memories.
-- `sleep` consolidates repeated experience into more useful memory and compiled frames.
+- `sleep` replays high-impact/conflicted/repeated clusters into compiled Frames, Procedures, Schemas, and evidence links without rewriting source memories.
+- `after_turn` appends success/failure outcome evidence for retrieved memories; it does not directly mutate edge weights.
 - `replay_trace` and the ledger explain what happened.
 
 Base install is SQLite + trace files. No Docker, API key, hosted store, vector database, LangGraph import, or model call is required.
@@ -58,7 +60,7 @@ asyncio.run(main())
 
 `observe()` alone is stricter: it records an immutable event and does not create long-term memory. Use `observe_and_commit()` only when you explicitly want the runtime to validate and persist a memory from that event.
 
-For uncertain input, use `observe_and_route()`. It records the event, computes a Worldview Impact assessment, and only commits durable evidence when the input has enough novelty, belief delta, utility, or conflict value to justify write pressure.
+For uncertain input, use `observe_and_route()`. It records the event, computes a Worldview Impact assessment, and routes append-only evidence. Novel input can propose a candidate Frame or worldview candidate without creating durable memory. Explicit long-term memory creation remains `observe_and_commit()`.
 
 ## CLI
 
@@ -92,9 +94,19 @@ append-only evidence + Frames + edge evidence + lifecycle records
         -> Worldview Snapshot + supporting memories
 ```
 
-Every observation is assessed with a vector that includes novelty, belief delta, entropy delta, contradiction, supersession, utility, propagation, source reliability, and risk. Low-impact input can remain ledger-only. Higher-impact input can become candidate memory, support evidence, suppression evidence, a conflict, or sleep priority.
+Every observation is assessed with a vector that includes novelty, belief delta, entropy delta, contradiction, supersession, utility, propagation, source reliability, and risk. The prior distribution comes from materialized worldview slots and candidates when available, then falls back to active memories and Frames. Low-impact input can remain ledger-only. Higher-impact input can append support evidence, propose a candidate Frame, propose a worldview candidate, request clarification, quarantine risky input, or mark sleep priority.
 
-`query()` returns normal retrieval results and also attaches `MemoryContext.worldview`. `MemoryContext.to_prompt()` includes a compact Worldview Snapshot before the supporting memory snippets.
+`query()` returns normal retrieval results and also attaches `MemoryContext.worldview`, `MemoryContext.worldview_trace`, and `MemoryContext.prompt_sections`. `MemoryContext.to_prompt()` includes a compact Worldview Snapshot before the supporting memory snippets.
+
+The runtime stores worldview projection data in additive SQLite tables:
+
+- `worldview_slots`
+- `worldview_candidates`
+- `worldview_candidate_events`
+- `edge_evidence_events`
+- `impact_assessments`
+
+`associative_edges` and `logic_edges` are materialized caches. They can be cleared and rebuilt from edge evidence and worldview records with `rebuild_materialized_views()`.
 
 ## Retrieval
 
@@ -130,12 +142,15 @@ SQLite stores the associative graph, logic nodes, and logic edges in separate ta
 
 The ledger also stores append-only edge evidence events and impact assessments. Suppression, supersession, contradiction, decay, and expiry are evidence events that change the materialized current view without rewriting the original memory record.
 
+Supported edge evidence event types are `support`, `contradict`, `supersede`, `inhibit`, `reinforce`, `decay`, `expire`, `restore`, `generalize`, and `derive`.
+
 ## Safety Model
 
 - LLMs propose memory policies; they do not directly rewrite memory.
 - Every product-surface mutation goes through `PolicyExecutor`.
 - Writes require evidence.
 - Destructive updates and physical deletes are not supported by the product runtime.
+- `UPDATE`, `DELETE_REQUEST`, and physical delete are rejected on product APIs, even with authorization.
 - Corrections are represented by appending new evidence, supersession relations, or suppression evidence.
 - Forgetting suppresses or expires memories from the current view while preserving audit history.
 - Unsafe access to the bundled core runtime requires explicit `allow_unsafe_internal=True` opt-in.

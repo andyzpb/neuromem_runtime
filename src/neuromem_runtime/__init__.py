@@ -17,7 +17,7 @@ from neuromem_runtime.crystallization import (
 from neuromem_runtime.runtime import MemoryRuntime
 from neuromem_runtime.deltas import ExecutionDeltaPlan, GraphDelta, IndexDelta, LifecycleDelta, MemoryDelta, MemorySnapshot, MutationExecutionResult
 from neuromem_runtime.impact import SlotImpact, WorldviewImpactAssessment, WorldviewImpactMeter, WorldviewImpactVector
-from neuromem_runtime.ledger import EdgeEvidenceEvent, ExperienceEvent, LedgerEvent, MemoryLedger
+from neuromem_runtime.ledger import EdgeEvidenceEvent, ExperienceEvent, LedgerEvent, MemoryLedger, WorldviewCandidateEvent, WorldviewCandidateRecord, WorldviewSlotRecord
 from neuromem_runtime.lifecycle import LifecycleStateMachine
 from neuromem_runtime.policy_v2 import AssociativeEdgeProposal, FrameDeltaProposal, GraphDeltaProposal, LogicEdgeProposal, MemoryPolicyV2, ValidatedMutation, WriteGate
 from neuromem_runtime.plasticity import PlasticityEngine
@@ -52,7 +52,8 @@ from neuromem_runtime.sleep import SleepPlanner, SleepReport
 from neuromem_runtime.types import EvidenceBundle, MemoryContext, MemoryEvent, MemoryQuery, MemoryTransaction, RuntimeConfig
 from neuromem_runtime.validators import ValidatorStack
 from neuromem_runtime.providers import DeepSeekPolicyProvider, DeterministicPolicyProvider, OpenAICompatiblePolicyProvider, PolicyProvider
-from neuromem_runtime.worldview import ResolvedWorldviewSlot, WorldviewPacket, WorldviewResolver
+from neuromem_runtime.materializer import EdgeEvidenceAppender, EdgeWeightAggregator, MaterializedWorldview, WorldviewMaterializer
+from neuromem_runtime.worldview import ResolvedWorldviewCandidate, ResolvedWorldviewSlot, WorldviewConflict, WorldviewEvidenceChain, WorldviewPacket, WorldviewResolver
 
 __version__ = "0.2.0"
 
@@ -73,8 +74,18 @@ __all__ = [
     "WorldviewImpactMeter",
     "SlotImpact",
     "WorldviewPacket",
+    "ResolvedWorldviewCandidate",
     "ResolvedWorldviewSlot",
+    "WorldviewConflict",
+    "WorldviewEvidenceChain",
     "WorldviewResolver",
+    "WorldviewSlotRecord",
+    "WorldviewCandidateRecord",
+    "WorldviewCandidateEvent",
+    "EdgeEvidenceAppender",
+    "EdgeWeightAggregator",
+    "MaterializedWorldview",
+    "WorldviewMaterializer",
     "MemoryPolicyV2",
     "WriteGate",
     "FrameDeltaProposal",

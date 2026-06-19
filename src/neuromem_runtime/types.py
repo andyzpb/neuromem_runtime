@@ -119,12 +119,22 @@ class MemoryContext:
     cache: dict[str, object] = field(default_factory=dict)
     retrieval_metadata: dict[str, object] = field(default_factory=dict)
     worldview: dict[str, object] | None = None
+    worldview_trace: dict[str, object] | None = None
+    prompt_sections: dict[str, str] = field(default_factory=dict)
 
     def to_prompt(self) -> str:
-        if self.worldview and self.worldview.get("prompt"):
-            if self.text:
-                return f"{self.worldview['prompt']}\n\n[Supporting Memory Snippets]\n{self.text}"
-            return str(self.worldview["prompt"])
+        sections: list[str] = []
+        if self.prompt_sections:
+            for key in ["worldview", "facts", "preferences", "constraints", "procedures", "suppressions", "conflicts", "supporting_memories"]:
+                value = self.prompt_sections.get(key)
+                if value:
+                    sections.append(value)
+        elif self.worldview and self.worldview.get("prompt"):
+            sections.append(str(self.worldview["prompt"]))
+        if self.text:
+            sections.append(f"[Supporting Memory Snippets]\n{self.text}")
+        if sections:
+            return "\n\n".join(sections)
         return self.text
 
     def to_dict(self) -> dict[str, object]:

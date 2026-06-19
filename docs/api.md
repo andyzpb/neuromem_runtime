@@ -7,10 +7,10 @@ NeuroMem Runtime is a local-first Memory Mutation Runtime for long-running LLM a
 The runtime separates three things:
 
 - **Experience events**: immutable observations recorded through `observe()`.
-- **Memory mutations**: writes, updates, forgetting, consolidation, graph updates, and access effects.
+- **Memory mutations**: explicit writes, candidate Frames, edge evidence, forgetting evidence, replay compilation, graph materialization, and access effects.
 - **Ledger records**: hash-linked transaction events that explain and replay memory effects.
 
-The product rule is simple: durable memory changes go through `PolicyExecutor`, deterministic validation, atomic SQLite commit or rollback, delta capture, version snapshots, and ledger events.
+The product rule is simple: durable memory changes go through `PolicyExecutor`, deterministic validation, atomic SQLite commit or rollback, delta capture, version snapshots, and ledger events. Destructive `UPDATE`, `DELETE_REQUEST`, and physical delete are not product behavior; corrections are represented by new evidence, supersession, suppression, or archival evidence.
 
 ## Workspace
 
@@ -27,7 +27,7 @@ This creates:
   traces/
 ```
 
-The SQLite database stores memories, memory cards, associative edges, logic nodes, logic edges, experience events, ledger events, memory versions, and split graph/frame versions.
+The SQLite database stores memories, memory cards, candidate Frames, edge evidence events, worldview slots, worldview candidates, worldview candidate events, impact assessments, associative edge caches, logic node/edge caches, experience events, ledger events, memory versions, and split graph/frame versions.
 
 ## Public Actions
 
@@ -35,15 +35,20 @@ The SQLite database stores memories, memory cards, associative edges, logic node
 | --- | --- |
 | `observe(event)` | Record only an immutable `ExperienceEvent`; no long-term memory is written. |
 | `observe_and_commit(event)` | Explicitly validate and commit a long-term memory from an event. |
+| `observe_and_route(event)` | Measure Worldview Impact and route the event to ledger-only, support evidence, candidate Frame, worldview candidate, clarification, quarantine, or sleep priority. |
 | `query(query, budget_tokens=800, lens="auto")` | Return a prompt-ready `MemoryContext` through a deterministic retrieval lens. |
 | `propose(input)` | Produce a structured `MemoryPolicy` or `MemoryPolicyV2` with the configured provider. |
 | `commit(policy)` | Validate and apply governed memory changes. |
 | `mutate(policy)` | Alias for `commit(policy)`. |
-| `sleep()` | Run governed replay consolidation and lifecycle updates. |
+| `sleep()` | Replay high-impact/conflicted/repeated clusters into compiled Frames and evidence links without mutating source memories. |
+| `after_turn(trace_id, outcome, feedback=None)` | Append success/failure outcome evidence for selected memories from a trace. |
 | `forget(memory_id, action="inhibit")` | Apply governed forgetting. |
+| `resolve_worldview(query=None, lens="auto", namespace=None, as_of=None)` | Resolve the current Worldview Packet directly. |
+| `materialize_worldview(namespace=None)` | Rebuild worldview slots/candidates and materialized edge caches from append-only journals. |
+| `rebuild_materialized_views(namespace=None)` | Alias for rebuilding materialized worldview/edge caches. |
 | `replay_trace(trace_id)` | Return trace plus ledger-backed deltas and replay data. |
 
-Physical deletion requires `authorize_delete=True`.
+Physical deletion is unsupported on the product runtime. Use `forget(..., action="inhibit" | "decay" | "invalidate" | "archive" | "compress")` to append lifecycle evidence while preserving audit history.
 
 ## Strict Observation
 
@@ -67,7 +72,17 @@ bundle = await memory.observe_and_commit({
 })
 ```
 
-`observe_and_commit()` still goes through evidence validation, `PolicyExecutor`, ledger phases, and memory version snapshots.
+`observe_and_commit()` still goes through evidence validation, `PolicyExecutor`, ledger phases, memory version snapshots, impact audit, and support edge evidence.
+
+`observe_and_route()` is the default write-pressure gate for uncertain input. It always records the immutable experience event and impact assessment, then chooses one append-only route:
+
+- `ledger_only`: keep only the experience event and impact assessment.
+- `append_evidence`: append support evidence to existing worldview candidates; no durable memory is created.
+- `propose_frame`: append a candidate Frame from the event.
+- `propose_worldview_candidate`: append a candidate Frame, candidate event, and possible supersession evidence.
+- `ask_clarification`: return a structured clarification payload; no long-term memory is written.
+- `quarantine`: append an audit event; the input does not enter the active worldview.
+- `sleep_priority`: append a replay priority marker.
 
 ## Commit Path
 
@@ -157,6 +172,55 @@ nmem ledger diff TXN_A TXN_B
 nmem retrieval explain TRACE_ID
 ```
 
+## Worldview Runtime
+
+The current worldview is a projection, not a mutable truth table:
+
+```text
+append-only evidence + Frames + edge evidence + lifecycle records
+        -> Worldview Impact Meter
+        -> Worldview Resolver
+        -> Worldview Snapshot + supporting memories
+```
+
+SQLite uses additive tables for this projection:
+
+- `edge_evidence_events`
+- `impact_assessments`
+- `worldview_slots`
+- `worldview_candidates`
+- `worldview_candidate_events`
+
+`associative_edges` and `logic_edges` are materialized caches. They are rebuilt from edge evidence by `materialize_worldview()` / `rebuild_materialized_views()`. Clearing those cache tables does not erase source evidence.
+
+Worldview slot kinds are fixed:
+
+- `fact`
+- `preference`
+- `constraint`
+- `procedure`
+- `schema`
+- `hypothesis`
+- `suppression`
+
+Candidate scoring combines support strength, provenance strength, recency validity, utility success, lifecycle commitment, and user confirmation, then subtracts contradiction, inhibition, supersession, and staleness. A slot is conflicted when the two top candidates differ by less than `0.12`, or when active `contradict` evidence is present. Active `supersede` evidence moves the older candidate out of the normal prompt while keeping it visible in `historical` and `audit` lenses.
+
+Resolver lenses:
+
+- `logical`: validated/current facts, preferences, and constraints
+- `procedural`: procedures, schemas, and failure patterns
+- `historical`: includes suppressed and superseded candidates
+- `audit`: includes evidence chains and rejected candidates
+- `associative`: active worldview plus lower-commitment memory support
+
+`MemoryContext` includes:
+
+- `worldview`
+- `worldview_trace`
+- `prompt_sections`
+
+`MemoryContext.to_prompt()` renders the Worldview Snapshot first, then supporting memory snippets.
+
 ## Activation Retrieval
 
 Base retrieval is local and deterministic:
@@ -244,18 +308,20 @@ Supported actions:
 - `compress`
 - `delete`
 
-Deletion is rejected unless `authorize_delete=True`. Normal forgetting keeps audit history and uses lifecycle transitions before destructive behavior.
+`delete` is rejected. The other actions append lifecycle/edge evidence only; the source memory record remains unchanged. Normal retrieval hides suppressed memories, while `historical` and `audit` lenses keep them visible for review.
 
 ## Sleep
 
-`sleep()` runs replay consolidation and writes a governed sleep transaction. The report includes:
+`sleep()` runs append-only replay compilation and writes a governed sleep transaction. It does not call the legacy mutable `neuro_sleep()` path by default, and it does not rewrite source memory maturity, summaries, tags, or provenance. The report includes:
 
 - processed memory count
 - replay clusters
-- promoted/compressed/archived memory ids
-- memory/lifecycle deltas
+- compiled Frame ids and source links
+- empty source memory/lifecycle deltas unless a future policy explicitly adds append-only suggestions
 - graph candidates, approved graph deltas, frame candidates, validated frames, logic promotions, compiled schemas, rejected crystallizations, and suppressed stale paths
 - ledger transaction ids
+
+Replay cluster selection prioritizes high-impact events, active conflict/supersession/inhibition evidence, recently selected trace memories, and repeated keyword/entity patterns.
 
 ## Policy Providers
 

@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Literal
 from uuid import uuid4
 
-from neuromem.core.models import MemoryItem
+from neuromem.core.models import MemoryFrame, MemoryItem
 from neuromem_runtime.ledger import ExperienceEvent
 
 
@@ -85,23 +85,39 @@ class WorldviewImpactAssessment:
 class WorldviewImpactMeter:
     """Deterministic write-pressure estimate over current namespace memory."""
 
-    def assess(self, event: ExperienceEvent, memories: list[MemoryItem]) -> WorldviewImpactAssessment:
+    def assess(
+        self,
+        event: ExperienceEvent,
+        memories: list[MemoryItem],
+        *,
+        worldview_candidates: list[dict[str, object]] | None = None,
+        frames: list[MemoryFrame] | None = None,
+        edge_events: list[dict[str, object]] | None = None,
+    ) -> WorldviewImpactAssessment:
         slot_key = _slot_key(event)
+        candidate_rows = _candidate_rows(slot_key, worldview_candidates or [])
         candidates = _candidate_memories(slot_key, memories)
+        frame_candidates = _candidate_frames(slot_key, frames or [])
         similarity = max((_jaccard(event.content, memory.content) for memory in memories), default=0.0)
         slot_similarity = max((_jaccard(event.content, memory.content) for memory in candidates), default=0.0)
+        frame_similarity = max((_jaccard(event.content, frame.content) for frame in frame_candidates), default=0.0)
+        candidate_similarity = max((_jaccard(event.content, str(row.get("statement", ""))) for row in candidate_rows), default=0.0)
+        slot_similarity = max(slot_similarity, frame_similarity, candidate_similarity)
         contradiction = _contradiction_score(event.content, candidates)
+        contradiction = max(contradiction, _candidate_contradiction_score(event.content, candidate_rows), _edge_contradiction_score(candidate_rows, edge_events or []))
         supersession = _supersession_score(event.content, candidates, contradiction)
-        novelty = max(0.0, min(1.0, 1.0 - max(similarity, slot_similarity * 0.8)))
+        supersession = max(supersession, _candidate_supersession_score(event.content, candidate_rows, contradiction))
+        memory_overlap = _memory_overlap(event, memories)
+        novelty = max(0.0, min(1.0, 1.0 - max(similarity, slot_similarity * 0.82, memory_overlap * 0.75)))
         utility = _utility_score(event)
         propagation = _propagation_score(event)
         risk = _risk_score(event.content, event.metadata)
         source_reliability = _source_reliability(event.source)
-        prior = _distribution(candidates)
-        posterior = _posterior(prior, event.content, candidates, contradiction, supersession)
+        prior = _candidate_distribution(candidate_rows) if candidate_rows else _distribution(candidates)
+        posterior = _posterior_from_candidates(prior, event.content, contradiction, supersession) if candidate_rows else _posterior(prior, event.content, candidates, contradiction, supersession)
         belief_delta = _js_divergence([item["score"] for item in prior], [item["score"] for item in posterior])
         entropy_delta = _entropy([item["score"] for item in prior]) - _entropy([item["score"] for item in posterior])
-        if not candidates and novelty > 0.35:
+        if not candidates and not candidate_rows and novelty > 0.35:
             belief_delta = max(belief_delta, min(0.65, 0.25 + novelty * 0.35))
         vector = WorldviewImpactVector(
             novelty=round(novelty, 4),
@@ -124,7 +140,7 @@ class WorldviewImpactMeter:
             + 0.05 * vector.propagation
         )
         effective_score = max(0.0, min(1.0, raw_score * vector.source_reliability))
-        impact_type, decision = _classify(vector, effective_score, candidates)
+        impact_type, decision = _classify(vector, effective_score, candidates, has_worldview_candidates=bool(candidate_rows))
         slot = SlotImpact(
             slot_key=slot_key,
             prior_candidates=prior,
@@ -178,6 +194,101 @@ def _candidate_memories(slot_key: str, memories: list[MemoryItem]) -> list[Memor
     return candidates
 
 
+def _candidate_frames(slot_key: str, frames: list[MemoryFrame]) -> list[MemoryFrame]:
+    key_terms = set(slot_key.replace(":", " ").replace("_", " ").split())
+    candidates: list[MemoryFrame] = []
+    for frame in frames:
+        haystack = " ".join([frame.frame_type, frame.content, frame.canonical_key]).lower()
+        if key_terms and key_terms & set(haystack.replace("_", " ").split()):
+            candidates.append(frame)
+    return candidates
+
+
+def _candidate_rows(slot_key: str, rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    key_terms = set(slot_key.replace(":", " ").replace("_", " ").split())
+    candidates: list[dict[str, object]] = []
+    for row in rows:
+        haystack = " ".join([str(row.get("slot_key", "")), str(row.get("slot_kind", "")), str(row.get("statement", ""))]).lower()
+        if str(row.get("slot_key")) == slot_key or (key_terms and key_terms & set(haystack.replace("_", " ").split())):
+            candidates.append(row)
+    return candidates
+
+
+def _candidate_distribution(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    if not rows:
+        return [{"candidate_id": "none", "score": 1.0, "statement": "no current candidate"}]
+    weights = [max(0.03, min(1.0, float(row.get("score", 0.0)) or float(row.get("confidence", 0.5)))) for row in rows]
+    total = sum(weights) or 1.0
+    return [
+        {"candidate_id": str(row.get("candidate_id")), "score": round(weight / total, 4), "statement": str(row.get("statement", ""))[:240]}
+        for row, weight in zip(rows, weights, strict=False)
+    ]
+
+
+def _posterior_from_candidates(prior: list[dict[str, object]], content: str, contradiction: float, supersession: float) -> list[dict[str, object]]:
+    adjusted: list[float] = []
+    for item in prior:
+        score = float(item["score"])
+        similarity = _jaccard(content, str(item.get("statement", "")))
+        score += similarity * 0.22
+        score -= contradiction * 0.28
+        score -= supersession * 0.38
+        adjusted.append(max(0.01, score))
+    adjusted.append(max(0.01, 0.16 + supersession * 0.58 + contradiction * 0.28))
+    total = sum(adjusted) or 1.0
+    values = [
+        {"candidate_id": str(item["candidate_id"]), "score": round(score / total, 4), "statement": str(item["statement"])}
+        for item, score in zip(prior, adjusted[:-1], strict=False)
+    ]
+    values.append({"candidate_id": "new_candidate", "score": round(adjusted[-1] / total, 4), "statement": content[:240]})
+    return values
+
+
+def _candidate_contradiction_score(content: str, rows: list[dict[str, object]]) -> float:
+    text = content.lower()
+    cue_score = min(0.55, 0.14 * sum(1 for cue in ["instead", "no longer", "not anymore", "changed", "stop", "don't", "do not", "现在", "以后", "不要再", "改成", "不再", "不是"] if cue in text))
+    if not rows:
+        return cue_score * 0.5
+    overlap = max((_jaccard(content, str(row.get("statement", ""))) for row in rows), default=0.0)
+    return max(cue_score, min(1.0, cue_score + overlap * 0.35))
+
+
+def _candidate_supersession_score(content: str, rows: list[dict[str, object]], contradiction: float) -> float:
+    if not rows:
+        return 0.0
+    text = content.lower()
+    cue_count = sum(1 for cue in ["instead", "from now on", "now use", "no longer", "changed to", "以后", "现在", "改成", "替代", "不要再"] if cue in text)
+    if cue_count:
+        return min(1.0, max(0.6, contradiction * 0.55 + 0.18 * cue_count))
+    return min(1.0, contradiction * 0.55)
+
+
+def _edge_contradiction_score(rows: list[dict[str, object]], edge_events: list[dict[str, object]]) -> float:
+    targets = {str(row.get("candidate_id")) for row in rows} | {str(item) for row in rows for item in row.get("source_memory_ids", []) if str(item)}
+    if not targets:
+        return 0.0
+    active = [event for event in edge_events if event.get("event_type") == "contradict" and str(event.get("target_id")) in targets]
+    return min(1.0, 0.18 * len(active))
+
+
+def _memory_overlap(event: ExperienceEvent, memories: list[MemoryItem]) -> float:
+    event_terms = _terms(event.content)
+    metadata_terms = set()
+    for key in ["keywords", "entities", "tags"]:
+        raw = event.metadata.get(key)
+        if isinstance(raw, list):
+            metadata_terms.update(str(item).lower() for item in raw if str(item).strip())
+    event_terms |= metadata_terms
+    if not event_terms:
+        return 0.0
+    best = 0.0
+    for memory in memories:
+        terms = _terms(" ".join([memory.content, *memory.keywords, *memory.entities, *memory.tags]))
+        if terms:
+            best = max(best, len(event_terms & terms) / len(event_terms | terms))
+    return best
+
+
 def _distribution(candidates: list[MemoryItem]) -> list[dict[str, object]]:
     if not candidates:
         return [{"candidate_id": "none", "score": 1.0, "statement": "no current candidate"}]
@@ -210,7 +321,7 @@ def _posterior(prior: list[dict[str, object]], content: str, candidates: list[Me
     return values
 
 
-def _classify(vector: WorldviewImpactVector, score: float, candidates: list[MemoryItem]) -> tuple[ImpactType, ImpactDecision]:
+def _classify(vector: WorldviewImpactVector, score: float, candidates: list[MemoryItem], *, has_worldview_candidates: bool = False) -> tuple[ImpactType, ImpactDecision]:
     if vector.risk >= 0.75:
         return "high_risk", "quarantine"
     if vector.contradiction >= 0.55 and vector.source_reliability < 0.7:
@@ -219,7 +330,7 @@ def _classify(vector: WorldviewImpactVector, score: float, candidates: list[Memo
         return "supersession", "propose_worldview_candidate"
     if vector.contradiction >= 0.5:
         return "conflict", "ask_clarification"
-    if not candidates and vector.novelty >= 0.65:
+    if not candidates and not has_worldview_candidates and vector.novelty >= 0.65:
         return "novel_local", "propose_frame"
     if score >= 0.45:
         return "worldview_update", "propose_worldview_candidate"

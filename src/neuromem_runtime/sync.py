@@ -98,6 +98,18 @@ class MemoryRuntime:
     def sleep(self) -> dict[str, object]:
         return _run(self._async_runtime.sleep())
 
+    def after_turn(self, trace_id: str, outcome: str, feedback: str | None = None) -> dict[str, object]:
+        return _run(self._async_runtime.after_turn(trace_id, outcome, feedback=feedback))
+
+    def resolve_worldview(self, query: str | None = None, lens: str = "auto", namespace: str | None = None, as_of: str | None = None) -> dict[str, object]:
+        return _run(self._async_runtime.resolve_worldview(query=query, lens=lens, namespace=namespace, as_of=as_of))
+
+    def materialize_worldview(self, namespace: str | None = None) -> dict[str, object]:
+        return _run(self._async_runtime.materialize_worldview(namespace=namespace))
+
+    def rebuild_materialized_views(self, namespace: str | None = None) -> dict[str, object]:
+        return _run(self._async_runtime.rebuild_materialized_views(namespace=namespace))
+
     def forget(self, memory_id: str, action: str = "inhibit", reason: str = "user-requested forgetting", authorize_delete: bool = False) -> dict[str, object]:
         return _run(self._async_runtime.forget(memory_id, action=action, reason=reason, authorize_delete=authorize_delete))
 

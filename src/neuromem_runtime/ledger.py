@@ -107,6 +107,59 @@ class EdgeEvidenceEvent:
         return asdict(self)
 
 
+@dataclass(slots=True)
+class WorldviewSlotRecord:
+    namespace: str
+    key: str
+    kind: str
+    scope: str = "global"
+    slot_id: str = field(default_factory=lambda: f"slot_{uuid4().hex}")
+    created_at: str = field(default_factory=_now_text)
+    updated_at: str = field(default_factory=_now_text)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class WorldviewCandidateRecord:
+    namespace: str
+    slot_id: str
+    statement: str
+    value: str | None = None
+    status: str = "provisional"
+    confidence: float = 0.5
+    valid_from: str | None = None
+    valid_to: str | None = None
+    source_frame_ids: list[str] = field(default_factory=list)
+    source_memory_ids: list[str] = field(default_factory=list)
+    evidence_ids: list[str] = field(default_factory=list)
+    score: float = 0.0
+    score_components: dict[str, object] = field(default_factory=dict)
+    candidate_id: str = field(default_factory=lambda: f"cand_{uuid4().hex}")
+    created_at: str = field(default_factory=_now_text)
+    updated_at: str = field(default_factory=_now_text)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class WorldviewCandidateEvent:
+    namespace: str
+    slot_id: str
+    candidate_id: str
+    event_type: str
+    evidence_ids: list[str] = field(default_factory=list)
+    payload: dict[str, object] = field(default_factory=dict)
+    proposer: str = "deterministic"
+    candidate_event_id: str = field(default_factory=lambda: f"candevt_{uuid4().hex}")
+    created_at: str = field(default_factory=_now_text)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
 class MemoryLedger:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -251,6 +304,57 @@ class MemoryLedger:
                     entropy_delta REAL NOT NULL,
                     top_candidate_changed INTEGER NOT NULL,
                     contradiction_score REAL NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worldview_slots (
+                    slot_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    key TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(namespace, key, kind, scope)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worldview_candidates (
+                    candidate_id TEXT PRIMARY KEY,
+                    slot_id TEXT NOT NULL,
+                    namespace TEXT NOT NULL,
+                    statement TEXT NOT NULL,
+                    value TEXT,
+                    status TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    valid_from TEXT,
+                    valid_to TEXT,
+                    source_frame_ids_json TEXT NOT NULL,
+                    source_memory_ids_json TEXT NOT NULL,
+                    evidence_ids_json TEXT NOT NULL,
+                    score REAL NOT NULL DEFAULT 0.0,
+                    score_components_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS worldview_candidate_events (
+                    candidate_event_id TEXT PRIMARY KEY,
+                    namespace TEXT NOT NULL,
+                    slot_id TEXT NOT NULL,
+                    candidate_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    evidence_ids_json TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    proposer TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
                 """
@@ -456,6 +560,35 @@ class MemoryLedger:
             "created_at": str(row["created_at"]),
         }
 
+    def impact_assessments(self, *, namespace: str | None = None, limit: int | None = None, conn: Connection | None = None) -> list[dict[str, object]]:
+        query = "SELECT * FROM impact_assessments"
+        params: list[object] = []
+        if namespace is not None:
+            query += " WHERE namespace = ?"
+            params.append(namespace)
+        query += " ORDER BY created_at DESC, impact_id DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        with self._connection(conn) as active:
+            rows = active.execute(query, tuple(params)).fetchall()
+        return [
+            {
+                "impact_id": str(row["impact_id"]),
+                "namespace": str(row["namespace"]),
+                "event_id": str(row["event_id"]),
+                "input_hash": str(row["input_hash"]),
+                "impact_score": float(row["impact_score"]),
+                "impact_type": str(row["impact_type"]),
+                "decision": str(row["decision"]),
+                "vector": json.loads(row["vector_json"]),
+                "impacted_slots": json.loads(row["impacted_slots_json"]),
+                "reason": str(row["reason"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
     def append_edge_evidence(self, event: EdgeEvidenceEvent, *, conn: Connection | None = None) -> EdgeEvidenceEvent:
         with self._connection(conn) as active:
             active.execute(
@@ -540,6 +673,181 @@ class MemoryLedger:
             elif event["event_type"] in {"restore", "reinforce"}:
                 suppressed.discard(target_id)
         return suppressed
+
+    def upsert_worldview_slot(self, slot: WorldviewSlotRecord, *, conn: Connection | None = None) -> WorldviewSlotRecord:
+        with self._connection(conn) as active:
+            row = active.execute(
+                """
+                SELECT slot_id, created_at FROM worldview_slots
+                WHERE namespace = ? AND key = ? AND kind = ? AND scope = ?
+                """,
+                (slot.namespace, slot.key, slot.kind, slot.scope),
+            ).fetchone()
+            if row is not None:
+                slot.slot_id = str(row["slot_id"])
+                slot.created_at = str(row["created_at"])
+            slot.updated_at = _now_text()
+            active.execute(
+                """
+                INSERT INTO worldview_slots (
+                    slot_id, namespace, key, kind, scope, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(namespace, key, kind, scope) DO UPDATE SET
+                    updated_at=excluded.updated_at
+                """,
+                (slot.slot_id, slot.namespace, slot.key, slot.kind, slot.scope, slot.created_at, slot.updated_at),
+            )
+        return slot
+
+    def upsert_worldview_candidate(self, candidate: WorldviewCandidateRecord, *, conn: Connection | None = None) -> WorldviewCandidateRecord:
+        candidate.updated_at = _now_text()
+        with self._connection(conn) as active:
+            active.execute(
+                """
+                INSERT INTO worldview_candidates (
+                    candidate_id, slot_id, namespace, statement, value, status, confidence,
+                    valid_from, valid_to, source_frame_ids_json, source_memory_ids_json,
+                    evidence_ids_json, score, score_components_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(candidate_id) DO UPDATE SET
+                    slot_id=excluded.slot_id,
+                    namespace=excluded.namespace,
+                    statement=excluded.statement,
+                    value=excluded.value,
+                    status=excluded.status,
+                    confidence=excluded.confidence,
+                    valid_from=excluded.valid_from,
+                    valid_to=excluded.valid_to,
+                    source_frame_ids_json=excluded.source_frame_ids_json,
+                    source_memory_ids_json=excluded.source_memory_ids_json,
+                    evidence_ids_json=excluded.evidence_ids_json,
+                    score=excluded.score,
+                    score_components_json=excluded.score_components_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    candidate.candidate_id,
+                    candidate.slot_id,
+                    candidate.namespace,
+                    candidate.statement,
+                    candidate.value,
+                    candidate.status,
+                    candidate.confidence,
+                    candidate.valid_from,
+                    candidate.valid_to,
+                    _canonical(candidate.source_frame_ids),
+                    _canonical(candidate.source_memory_ids),
+                    _canonical(candidate.evidence_ids),
+                    candidate.score,
+                    _canonical(candidate.score_components),
+                    candidate.created_at,
+                    candidate.updated_at,
+                ),
+            )
+        return candidate
+
+    def append_worldview_candidate_event(self, event: WorldviewCandidateEvent, *, conn: Connection | None = None) -> WorldviewCandidateEvent:
+        with self._connection(conn) as active:
+            active.execute(
+                """
+                INSERT OR IGNORE INTO worldview_candidate_events (
+                    candidate_event_id, namespace, slot_id, candidate_id, event_type,
+                    evidence_ids_json, payload_json, proposer, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.candidate_event_id,
+                    event.namespace,
+                    event.slot_id,
+                    event.candidate_id,
+                    event.event_type,
+                    _canonical(event.evidence_ids),
+                    _canonical(event.payload),
+                    event.proposer,
+                    event.created_at,
+                ),
+            )
+        return event
+
+    def worldview_slots(self, *, namespace: str | None = None, conn: Connection | None = None) -> list[dict[str, object]]:
+        query = "SELECT * FROM worldview_slots"
+        params: list[object] = []
+        if namespace is not None:
+            query += " WHERE namespace = ?"
+            params.append(namespace)
+        query += " ORDER BY namespace ASC, kind ASC, key ASC"
+        with self._connection(conn) as active:
+            rows = active.execute(query, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+    def worldview_candidates(self, *, namespace: str | None = None, status: str | None = None, conn: Connection | None = None) -> list[dict[str, object]]:
+        query = "SELECT c.*, s.key AS slot_key, s.kind AS slot_kind, s.scope AS slot_scope FROM worldview_candidates c JOIN worldview_slots s ON c.slot_id = s.slot_id"
+        clauses: list[str] = []
+        params: list[object] = []
+        if namespace is not None:
+            clauses.append("c.namespace = ?")
+            params.append(namespace)
+        if status is not None:
+            clauses.append("c.status = ?")
+            params.append(status)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY c.score DESC, c.confidence DESC, c.updated_at DESC"
+        with self._connection(conn) as active:
+            rows = active.execute(query, tuple(params)).fetchall()
+        return [
+            {
+                "candidate_id": str(row["candidate_id"]),
+                "slot_id": str(row["slot_id"]),
+                "slot_key": str(row["slot_key"]),
+                "slot_kind": str(row["slot_kind"]),
+                "slot_scope": str(row["slot_scope"]),
+                "namespace": str(row["namespace"]),
+                "statement": str(row["statement"]),
+                "value": row["value"],
+                "status": str(row["status"]),
+                "confidence": float(row["confidence"]),
+                "valid_from": row["valid_from"],
+                "valid_to": row["valid_to"],
+                "source_frame_ids": json.loads(row["source_frame_ids_json"]),
+                "source_memory_ids": json.loads(row["source_memory_ids_json"]),
+                "evidence_ids": json.loads(row["evidence_ids_json"]),
+                "score": float(row["score"]),
+                "score_components": json.loads(row["score_components_json"]),
+                "created_at": str(row["created_at"]),
+                "updated_at": str(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    def worldview_candidate_events(self, *, namespace: str | None = None, conn: Connection | None = None) -> list[dict[str, object]]:
+        query = "SELECT * FROM worldview_candidate_events"
+        params: list[object] = []
+        if namespace is not None:
+            query += " WHERE namespace = ?"
+            params.append(namespace)
+        query += " ORDER BY created_at ASC, candidate_event_id ASC"
+        with self._connection(conn) as active:
+            rows = active.execute(query, tuple(params)).fetchall()
+        return [
+            {
+                "candidate_event_id": str(row["candidate_event_id"]),
+                "namespace": str(row["namespace"]),
+                "slot_id": str(row["slot_id"]),
+                "candidate_id": str(row["candidate_id"]),
+                "event_type": str(row["event_type"]),
+                "evidence_ids": json.loads(row["evidence_ids_json"]),
+                "payload": json.loads(row["payload_json"]),
+                "proposer": str(row["proposer"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in rows
+        ]
+
+    def clear_worldview_materialization(self, namespace: str, *, conn: Connection | None = None) -> None:
+        with self._connection(conn) as active:
+            active.execute("DELETE FROM worldview_candidates WHERE namespace = ?", (namespace,))
+            active.execute("DELETE FROM worldview_slots WHERE namespace = ?", (namespace,))
 
     def get_experience(self, event_id: str, *, namespace: str | None = None, conn: Connection | None = None) -> ExperienceEvent | None:
         query = "SELECT * FROM experience_events WHERE event_id = ?"

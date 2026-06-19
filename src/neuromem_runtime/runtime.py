@@ -23,8 +23,9 @@ from neuromem_runtime.crystallization import (
 from neuromem_runtime.deltas import LifecycleDelta, MemoryDelta
 from neuromem_runtime.executor import PolicyExecutionContext, PolicyExecutor
 from neuromem_runtime.impact import WorldviewImpactAssessment, WorldviewImpactMeter
-from neuromem_runtime.ledger import EdgeEvidenceEvent, ExperienceEvent, LedgerEvent, MemoryLedger
-from neuromem_runtime.policy_v2 import EvidenceRef, LogicEdgeProposal, MemoryPolicyV2
+from neuromem_runtime.ledger import EdgeEvidenceEvent, ExperienceEvent, LedgerEvent, MemoryLedger, WorldviewCandidateEvent, WorldviewSlotRecord
+from neuromem_runtime.materializer import EdgeEvidenceAppender, WorldviewMaterializer
+from neuromem_runtime.policy_v2 import EvidenceRef, FrameDeltaProposal, LogicEdgeProposal, MemoryPolicyV2
 from neuromem_runtime.providers import DeterministicPolicyProvider, PolicyProvider
 from neuromem_runtime.performance import BackgroundJobQueue, EmbeddingCache, RetrievalCache, RuntimeTiming, TimingSpan, stable_hash
 from neuromem_runtime.retrieval import (
@@ -86,6 +87,8 @@ class MemoryRuntime:
         self._policy_provider = policy_provider or DeterministicPolicyProvider()
         self._ledger = MemoryLedger(config.db_path)
         self._executor = PolicyExecutor(runtime, self._ledger, self._validator_stack)
+        self._edge_appender = EdgeEvidenceAppender(self._ledger)
+        self._worldview_materializer = WorldviewMaterializer(self._ledger)
         self._impact_meter = WorldviewImpactMeter()
         self._worldview_resolver = WorldviewResolver()
         self._sleep_planner = SleepPlanner()
@@ -326,6 +329,27 @@ class MemoryRuntime:
             if graph_result is not None:
                 result.trace.query_plan["semantic_graph_builder"] = graph_result
             self._persist_trace(result.trace.trace_id, result.trace.to_dict())
+        explicit_evidence: dict[str, object] | None = None
+        if memory_id is not None:
+            edge_event = EdgeEvidenceEvent(
+                namespace=self.config.namespace,
+                source_kind="event",
+                source_id=experience.event_id,
+                target_kind="memory",
+                target_id=memory_id,
+                relation="supports",
+                relation_family="worldview",
+                event_type="support",
+                delta_weight=0.35,
+                confidence=float(payload.get("confidence", 0.85) or 0.85),
+                evidence_ids=[experience.event_id],
+                proof_obligation="explicit observe_and_commit ADD",
+                proposer="deterministic",
+            )
+            self._edge_appender.append(edge_event)
+            explicit_evidence = {"edge_evidence_event": edge_event.to_dict(), "materialized": self._materialize_worldview_sync()}
+            result.trace.query_plan["explicit_add_evidence"] = explicit_evidence
+            self._persist_trace(result.trace.trace_id, result.trace.to_dict())
         return EvidenceBundle(
             memory_id=memory_id,
             content=stored_item.content if stored_item is not None else content,
@@ -353,13 +377,36 @@ class MemoryRuntime:
             raise RuntimeError("observe_and_route() could not record experience")
         impact = observed.impact or await self.assess_impact(observed.event_id)
         decision = str(impact.get("decision"))
-        if decision in {"ledger_only", "ask_clarification", "quarantine"}:
-            return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False}
         experience = self._ledger.get_experience(observed.event_id, namespace=self.config.namespace)
         if experience is None:
             raise RuntimeError("observe_and_route() could not reload experience")
-        committed = await self.observe_and_commit(event, experience=experience)
-        return {"decision": decision, "impact": impact, "bundle": committed.to_dict(), "committed": committed.memory_id is not None}
+        if decision == "ledger_only":
+            return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False}
+        if decision == "ask_clarification":
+            payload = {
+                "event_id": experience.event_id,
+                "slot_keys": [str(slot.get("slot_key")) for slot in impact.get("impacted_slots", []) if isinstance(slot, dict)],
+                "reason": impact.get("reason"),
+                "question": "This input may change an existing worldview slot. Please confirm whether it should supersede the current assumption.",
+            }
+            self._append_route_audit(experience, decision, payload)
+            return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False, "clarification": payload}
+        if decision == "quarantine":
+            payload = {"event_id": experience.event_id, "reason": impact.get("reason"), "risk": (impact.get("vector") or {}).get("risk") if isinstance(impact.get("vector"), dict) else None}
+            self._append_route_audit(experience, decision, payload)
+            return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False, "quarantine": payload}
+        if decision == "append_evidence":
+            evidence_events = self._append_support_evidence(experience, impact)
+            materialized = await self.materialize_worldview()
+            return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False, "edge_evidence_events": evidence_events, "materialized": materialized}
+        if decision in {"propose_frame", "propose_worldview_candidate"}:
+            route = await self._propose_candidate_from_experience(experience, impact, worldview_candidate=decision == "propose_worldview_candidate")
+            return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False, **route}
+        if decision == "sleep_priority":
+            marker = self._append_sleep_priority_marker(experience, impact)
+            return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False, "sleep_priority": marker}
+        self._append_route_audit(experience, decision, {"event_id": experience.event_id, "reason": impact.get("reason")})
+        return {"decision": decision, "impact": impact, "bundle": observed.to_dict(), "committed": False}
 
     async def query(
         self,
@@ -487,17 +534,41 @@ class MemoryRuntime:
         retrieval_metadata = dict(trace.query_plan.get("retrieval_metadata", {})) if isinstance(trace.query_plan.get("retrieval_metadata", {}), dict) else {}
         retrieval_metadata["retrieval_lens"] = resolved_lens
         worldview_payload: dict[str, object] | None = None
+        worldview_trace: dict[str, object] | None = None
+        prompt_sections: dict[str, str] = {}
         if include_worldview and self._runtime.store is not None:
+            materialized = await self.materialize_worldview(namespace=namespace_value)
+            memories = self._runtime.store.list_memories(namespace=namespace_value)
+            frames = self._runtime.store.list_logic_nodes(namespace=namespace_value)
+            associative_edges = self._runtime.store.list_associative_edges(namespace=namespace_value)
+            logic_edges = self._runtime.store.list_logic_edges(namespace=namespace_value)
+            edge_events = self._ledger.edge_evidence_events(namespace=namespace_value)
+            impact_assessments = self._ledger.impact_assessments(namespace=namespace_value, limit=50)
+            worldview_candidates = self._ledger.worldview_candidates(namespace=namespace_value)
             packet = self._worldview_resolver.resolve(
                 namespace=namespace_value,
                 lens=resolved_lens,
                 query=query_obj.query,
-                memories=self._runtime.store.list_memories(namespace=namespace_value),
+                memories=memories,
+                frames=frames,
+                associative_edges=associative_edges,
+                logic_edges=logic_edges,
+                edge_events=edge_events,
+                impact_assessments=impact_assessments,
+                worldview_candidates=worldview_candidates,
                 suppressed_memory_ids=self._ledger.active_suppressed_memory_ids(namespace_value),
             )
             worldview_payload = packet.to_dict()
             worldview_payload["prompt"] = packet.to_prompt()
+            worldview_trace = {
+                "materialized": materialized,
+                "candidate_count": len(worldview_candidates),
+                "edge_event_count": len(edge_events),
+                "impact_assessment_count": len(impact_assessments),
+            }
+            prompt_sections = _prompt_sections_from_worldview(worldview_payload)
             trace.query_plan["worldview_packet"] = {key: value for key, value in worldview_payload.items() if key != "prompt"}
+            trace.query_plan["worldview_trace"] = worldview_trace
             self._persist_trace(trace_id, trace.to_dict())
         context = MemoryContext(
             query=query_obj.query,
@@ -525,6 +596,8 @@ class MemoryRuntime:
             cache=cache_info,
             retrieval_metadata=retrieval_metadata,
             worldview=worldview_payload,
+            worldview_trace=worldview_trace,
+            prompt_sections=prompt_sections,
         )
         self._retrieval_cache.set(cache_key, context, semantic_version=store_version, filter_hash=filter_hash)
         self._retrieval_cache_fingerprints[cache_probe_key] = (store_version, filter_hash)
@@ -558,10 +631,18 @@ class MemoryRuntime:
         )
         self._persist_trace(result.trace.trace_id, result.trace.to_dict())
         structural_mutation = isinstance(policy, MemoryPolicyV2) and bool(policy.frame_deltas or policy.associative_deltas or policy.logic_deltas or policy.graph_deltas)
+        structural_evidence: dict[str, object] | None = None
+        if structural_mutation and isinstance(policy, MemoryPolicyV2) and result.validated_mutation.approved:
+            structural_evidence = self._append_structural_evidence_from_policy(policy, result.trace.trace_id)
+            result.trace.query_plan["append_only_structural_evidence"] = structural_evidence
+            self._persist_trace(result.trace.trace_id, result.trace.to_dict())
+            self._materialize_worldview_sync()
         if phase == "after_step" or structural_mutation:
             self._invalidate_retrieval_cache()
         value = result.trace.to_dict()
         value["mutation_execution_result"] = result.to_dict()
+        if structural_evidence is not None:
+            value["append_only_structural_evidence"] = structural_evidence
         return value
 
     def _append_only_suppression_from_policy(self, policy: MemoryPolicy) -> dict[str, object] | None:
@@ -633,6 +714,7 @@ class MemoryRuntime:
             )
         )
         self._invalidate_retrieval_cache()
+        self._materialize_worldview_sync()
         return _append_only_suppression_result(memory_id, policy.forget.operation, event_type, edge_event, policy.forget.reason or policy.reason)
 
     async def mutate(self, policy: MemoryPolicy | MemoryPolicyV2, *, authorize_delete: bool = False) -> dict[str, object]:
@@ -640,69 +722,44 @@ class MemoryRuntime:
 
     async def sleep(self) -> dict[str, object]:
         assert self._runtime.store is not None
-        memories_before = self._memory_states()
         transaction_id = f"txn_sleep_{uuid4().hex}"
         trace_id = self._runtime.last_trace.trace_id if self._runtime.last_trace is not None else None
         replay_trace_ids = [trace_id] if trace_id is not None else []
         plan = self._sleep_planner.plan(policy="manual", replay_trace_ids=replay_trace_ids)
-        sleep_graph: dict[str, object] = {}
-        sleep_crystallization: dict[str, object] = {}
+        memories = self._runtime.store.list_memories(namespace=self.config.namespace)
+        sleep_clusters = self._select_sleep_replay_clusters(memories)
+        targets = sorted({memory_id for cluster in sleep_clusters for memory_id in cluster})
+        consolidation_report: dict[str, object] = {
+            "processed": len(targets),
+            "replay_clusters": sleep_clusters,
+            "compressed_memory_ids": [],
+            "archived_memory_ids": [],
+            "consolidation_links": {},
+            "append_only": True,
+            "source_memories_mutated": False,
+        }
         with self._runtime.store.transaction() as conn:  # type: ignore[attr-defined]
-            self._ledger.append(
-                LedgerEvent(
-                    transaction_id=transaction_id,
-                    trace_id=trace_id,
-                    namespace=self.config.namespace,
-                    agent_id=self.config.agent_id,
-                    phase="PROPOSED",
-                    event_type="sleep_plan_proposed",
-                    operation="CONSOLIDATE",
-                    proposer="deterministic",
-                    validator_decision="not_applicable",
-                    audit={"plan": plan.to_dict()},
-                ),
-                conn=conn,
-            )
-            self._ledger.append(
-                LedgerEvent(
-                    transaction_id=transaction_id,
-                    trace_id=trace_id,
-                    namespace=self.config.namespace,
-                    agent_id=self.config.agent_id,
-                    phase="VALIDATED",
-                    event_type="sleep_validation_approved",
-                    operation="CONSOLIDATE",
-                    proposer="deterministic",
-                    validator_decision="approved",
-                    audit={"plan": plan.to_dict()},
-                ),
-                conn=conn,
-            )
-            consolidation_report = self._runtime.neuro_sleep().to_dict()
-            sleep_clusters = [[str(memory_id) for memory_id in cluster] for cluster in consolidation_report.get("replay_clusters", []) if isinstance(cluster, list)]
-            memories_after = self._memory_states()
-            deltas = _memory_deltas_for_fields(memories_before, memories_after, fields=None, reason="governed sleep")
-            graph_deltas: list[object] = []
-            targets = sorted({str(delta["memory_id"]) for delta in deltas if delta.get("memory_id")})
-            lifecycle_deltas = [delta for delta in deltas if delta.get("field") in {"maturity", "type", "summary", "tags", "supersedes", "derived_from"}]
-            memory_delta_objs = [_memory_delta_from_dict(delta) for delta in deltas]
-            lifecycle_delta_objs = [_lifecycle_delta_from_dict(delta) for delta in lifecycle_deltas if delta.get("field") == "maturity"]
-            self._ledger.append(
-                LedgerEvent(
-                    transaction_id=transaction_id,
-                    trace_id=trace_id,
-                    namespace=self.config.namespace,
-                    agent_id=self.config.agent_id,
-                    phase="VALIDATED",
-                    event_type="replay_batch_selected",
-                    operation="CONSOLIDATE",
-                    proposer="deterministic",
-                    validator_decision="approved",
-                    targets=targets,
-                    audit={"replay_trace_ids": replay_trace_ids, "replay_clusters": consolidation_report.get("replay_clusters", [])},
-                ),
-                conn=conn,
-            )
+            for phase, event_type, audit in [
+                ("PROPOSED", "sleep_plan_proposed", {"plan": plan.to_dict()}),
+                ("VALIDATED", "sleep_validation_approved", {"plan": plan.to_dict()}),
+                ("VALIDATED", "replay_batch_selected", {"replay_trace_ids": replay_trace_ids, "replay_clusters": sleep_clusters}),
+            ]:
+                self._ledger.append(
+                    LedgerEvent(
+                        transaction_id=transaction_id,
+                        trace_id=trace_id,
+                        namespace=self.config.namespace,
+                        agent_id=self.config.agent_id,
+                        phase=phase,
+                        event_type=event_type,
+                        operation="CONSOLIDATE",
+                        proposer="deterministic",
+                        validator_decision="approved" if phase != "PROPOSED" else "not_applicable",
+                        targets=targets if event_type == "replay_batch_selected" else [],
+                        audit=audit,
+                    ),
+                    conn=conn,
+                )
             self._ledger.append(
                 LedgerEvent(
                     transaction_id=transaction_id,
@@ -715,14 +772,13 @@ class MemoryRuntime:
                     proposer="deterministic",
                     validator_decision="approved",
                     targets=targets,
-                    memory_delta=deltas,
-                    lifecycle_delta=lifecycle_deltas,
+                    memory_delta=[],
+                    lifecycle_delta=[],
                     graph_delta=[],
-                    audit={"consolidation_report": consolidation_report},
+                    audit={"consolidation_report": consolidation_report, "append_only": True},
                 ),
                 conn=conn,
             )
-            suppression_ids = list(consolidation_report.get("archived_memory_ids", []))
             self._ledger.append(
                 LedgerEvent(
                     transaction_id=transaction_id,
@@ -734,9 +790,9 @@ class MemoryRuntime:
                     operation="CONSOLIDATE",
                     proposer="deterministic",
                     validator_decision="approved",
-                    targets=[str(item) for item in suppression_ids],
-                    lifecycle_delta=[delta for delta in lifecycle_deltas if delta.get("new") == "archived"],
-                    audit={"archived_memory_ids": suppression_ids},
+                    targets=[],
+                    lifecycle_delta=[],
+                    audit={"suppression_suggestions": [], "append_only": True},
                 ),
                 conn=conn,
             )
@@ -751,10 +807,10 @@ class MemoryRuntime:
                     operation="CONSOLIDATE",
                     proposer="deterministic",
                     validator_decision="approved",
-                    targets=[str(item) for item in consolidation_report.get("compressed_memory_ids", [])],
-                    memory_delta=[delta for delta in deltas if delta.get("field") in {"type", "summary", "tags", "consolidation_count"}],
+                    targets=[],
+                    memory_delta=[],
                     graph_delta=[],
-                    audit={"compressed_memory_ids": consolidation_report.get("compressed_memory_ids", [])},
+                    audit={"compiled_frame_ids": [], "append_only": True},
                 ),
                 conn=conn,
             )
@@ -770,20 +826,16 @@ class MemoryRuntime:
                     proposer="deterministic",
                     validator_decision="approved",
                     targets=targets,
-                    memory_delta=deltas,
-                    lifecycle_delta=lifecycle_deltas,
+                    memory_delta=[],
+                    lifecycle_delta=[],
                     graph_delta=[],
-                    audit={"consolidation_report": consolidation_report},
+                    audit={"consolidation_report": consolidation_report, "append_only": True},
                 ),
                 conn=conn,
             )
-            for memory_id in targets:
-                state = memories_after.get(memory_id)
-                if state is not None:
-                    self._ledger.record_memory_version(memory_id, transaction_id, state, conn=conn)
         sleep_graph = self._commit_auto_graph(
             selected_memory_ids=[memory_id for cluster in sleep_clusters for memory_id in cluster],
-            target_memory_ids=[str(memory_id) for memory_id in consolidation_report.get("compressed_memory_ids", [])],
+            target_memory_ids=targets,
             evidence_ids=[f"sleep:{transaction_id}"],
             outcome="success",
             sleep_clusters=sleep_clusters,
@@ -798,9 +850,34 @@ class MemoryRuntime:
         graph_deltas = list(((sleep_graph.get("result") or {}).get("graph_deltas", []))) if isinstance(sleep_graph.get("result"), dict) else []
         if isinstance(sleep_crystallization.get("result"), dict):
             graph_deltas.extend(list(sleep_crystallization["result"].get("graph_deltas", [])))
+        compiled_nodes = [str(item.get("frame_id")) for item in sleep_crystallization.get("compiled_schemas", []) if isinstance(item, dict) and item.get("frame_id")]
+        consolidation_report["compressed_memory_ids"] = compiled_nodes
+        consolidation_report["consolidation_links"] = {
+            node: list(cluster)
+            for node, cluster in zip(compiled_nodes, sleep_clusters, strict=False)
+        }
+        for node in compiled_nodes:
+            for memory_id in targets:
+                edge_event = EdgeEvidenceEvent(
+                    namespace=self.config.namespace,
+                    source_kind="memory",
+                    source_id=memory_id,
+                    target_kind="frame",
+                    target_id=node,
+                    relation="derived_from",
+                    relation_family="logic",
+                    event_type="derive",
+                    delta_weight=0.34,
+                    confidence=0.74,
+                    evidence_ids=[f"sleep:{transaction_id}"],
+                    proof_obligation="sleep replay compiled frame from source evidence",
+                    proposer="sleep",
+                )
+                self._edge_appender.append(edge_event)
         trace = self._runtime.last_trace
         if trace is not None:
             self._persist_trace(trace.trace_id, trace.to_dict())
+        materialized = self._materialize_worldview_sync()
         self._invalidate_retrieval_cache()
         sleep_report = SleepReport(
             plan=plan,
@@ -809,16 +886,15 @@ class MemoryRuntime:
                 ConsolidationDelta(source_memory_ids=list(cluster), target_memory_id=str(target), reason="replay consolidation")
                 for target, cluster in dict(consolidation_report.get("consolidation_links", {})).items()
             ],
-            suppression=[SuppressionDelta(memory_id=str(memory_id), reason="sleep archival") for memory_id in consolidation_report.get("archived_memory_ids", [])],
+            suppression=[SuppressionDelta(memory_id=str(memory_id), reason="sleep suppression suggestion") for memory_id in consolidation_report.get("archived_memory_ids", [])],
             compilation=[
-                CompilationDelta(source_memory_ids=list(dict(consolidation_report.get("consolidation_links", {})).get(str(memory_id), [])), compiled_type="procedural", content=str(memories_after.get(str(memory_id), {}).get("summary") or memories_after.get(str(memory_id), {}).get("content", "")))
+                CompilationDelta(source_memory_ids=list(dict(consolidation_report.get("consolidation_links", {})).get(str(memory_id), [])), compiled_type="procedural", content=str(memory_id))
                 for memory_id in consolidation_report.get("compressed_memory_ids", [])
             ],
-            lifecycle=lifecycle_delta_objs,
-            memory_deltas=memory_delta_objs,
+            lifecycle=[],
+            memory_deltas=[],
             ledger=LedgerReport(transaction_ids=[transaction_id]),
         ).to_dict()
-        compiled_nodes = [str(item) for item in consolidation_report.get("compressed_memory_ids", [])]
         if not compiled_nodes:
             compiled_nodes = sorted({str(delta.get("target_id")) for delta in graph_deltas if delta.get("target_id")})
         sleep_report["graph"] = {
@@ -835,6 +911,7 @@ class MemoryRuntime:
             "compiled_schemas": sleep_crystallization.get("compiled_schemas", []),
             "rejected_crystallizations": sleep_crystallization.get("rejected_crystallizations", []),
         }
+        sleep_report["materialized"] = materialized
         return {**consolidation_report, "sleep": sleep_report, "ledger_transaction_id": transaction_id}
 
     async def forget(
@@ -914,6 +991,7 @@ class MemoryRuntime:
                 )
             )
             self._invalidate_retrieval_cache()
+            self._materialize_worldview_sync()
             return _append_only_suppression_result(memory_id, _policy_forget_operation(normalized), event_type, edge_event, reason)
         policy = MemoryPolicy(
             retrieval=RetrievalPlan(enabled=False, query=memory_id),
@@ -943,13 +1021,376 @@ class MemoryRuntime:
             value.update({key: item for key, item in ledger.items() if key not in value or key.endswith("_deltas") or key == "ledger_events"})
         return value
 
+    async def after_turn(self, trace_id: str, outcome: str, feedback: str | None = None) -> dict[str, object]:
+        trace = await self.replay_trace(trace_id)
+        if trace is None:
+            raise ValueError(f"trace not found: {trace_id}")
+        selected = [str(item) for item in trace.get("selected_memory_ids", []) if str(item)]
+        event_type = "reinforce" if outcome.lower() in {"success", "succeeded", "positive", "ok"} else "inhibit"
+        relation = "used_with_success" if event_type == "reinforce" else "used_with_failure"
+        transaction_id = f"txn_after_turn_{uuid4().hex}"
+        events: list[dict[str, object]] = []
+        for index, source_id in enumerate(selected):
+            targets = selected[index + 1 :] or [source_id]
+            for target_id in targets:
+                if source_id == target_id and len(selected) > 1:
+                    continue
+                edge_event = EdgeEvidenceEvent(
+                    namespace=self.config.namespace,
+                    source_kind="memory",
+                    source_id=source_id,
+                    target_kind="memory",
+                    target_id=target_id,
+                    relation=relation,
+                    relation_family="association",
+                    event_type=event_type,
+                    delta_weight=0.22 if event_type == "reinforce" else -0.28,
+                    confidence=0.75,
+                    evidence_ids=[f"trace:{trace_id}"],
+                    outcome=outcome,
+                    proof_obligation=feedback,
+                    proposer="after_turn",
+                )
+                self._edge_appender.append(edge_event)
+                events.append(edge_event.to_dict())
+        self._ledger.append(
+            LedgerEvent(
+                transaction_id=transaction_id,
+                trace_id=trace_id,
+                namespace=self.config.namespace,
+                agent_id=self.config.agent_id,
+                phase="COMMITTED",
+                event_type="turn_outcome_evidence_appended",
+                operation="AFTER_TURN",
+                proposer="deterministic",
+                validator_decision="approved",
+                evidence=[{"trace_id": trace_id, "outcome": outcome, "feedback": feedback}],
+                targets=selected,
+                graph_delta=events,
+                audit={"append_only": True, "edge_evidence_events": events},
+            )
+        )
+        materialized = await self.materialize_worldview()
+        self._invalidate_retrieval_cache()
+        return {"trace_id": trace_id, "outcome": outcome, "edge_evidence_events": events, "materialized": materialized}
+
+    async def materialize_worldview(self, namespace: str | None = None) -> dict[str, object]:
+        namespace_value = namespace or self.config.namespace
+        store = self._runtime.store if isinstance(self._runtime.store, SQLiteMemoryStore) else None
+        memories = self._runtime.store.list_memories(namespace=namespace_value) if self._runtime.store is not None else []
+        frames = self._runtime.store.list_logic_nodes(namespace=namespace_value) if self._runtime.store is not None else []
+        result = self._worldview_materializer.rebuild(namespace=namespace_value, store=store, memories=memories, frames=frames)
+        return result.to_dict()
+
+    async def rebuild_materialized_views(self, namespace: str | None = None) -> dict[str, object]:
+        return await self.materialize_worldview(namespace=namespace)
+
+    async def resolve_worldview(
+        self,
+        query: str | None = None,
+        lens: str = "auto",
+        namespace: str | None = None,
+        as_of: str | None = None,
+    ) -> dict[str, object]:
+        if as_of is not None:
+            raise ValueError("as_of worldview resolution is not implemented yet; append-only records are retained for audit replay")
+        namespace_value = namespace or self.config.namespace
+        resolved_lens = self._resolve_lens(query or "", lens)
+        await self.materialize_worldview(namespace=namespace_value)
+        memories = self._runtime.store.list_memories(namespace=namespace_value) if self._runtime.store is not None else []
+        frames = self._runtime.store.list_logic_nodes(namespace=namespace_value) if self._runtime.store is not None else []
+        associative_edges = self._runtime.store.list_associative_edges(namespace=namespace_value) if self._runtime.store is not None else []
+        logic_edges = self._runtime.store.list_logic_edges(namespace=namespace_value) if self._runtime.store is not None else []
+        packet = self._worldview_resolver.resolve(
+            namespace=namespace_value,
+            lens=resolved_lens,
+            query=query or "",
+            memories=memories,
+            frames=frames,
+            associative_edges=associative_edges,
+            logic_edges=logic_edges,
+            edge_events=self._ledger.edge_evidence_events(namespace=namespace_value),
+            impact_assessments=self._ledger.impact_assessments(namespace=namespace_value, limit=50),
+            worldview_candidates=self._ledger.worldview_candidates(namespace=namespace_value),
+            suppressed_memory_ids=self._ledger.active_suppressed_memory_ids(namespace_value),
+        )
+        payload = packet.to_dict()
+        payload["prompt"] = packet.to_prompt()
+        return payload
+
+    def _materialize_worldview_sync(self, namespace: str | None = None) -> dict[str, object]:
+        namespace_value = namespace or self.config.namespace
+        store = self._runtime.store if isinstance(self._runtime.store, SQLiteMemoryStore) else None
+        memories = self._runtime.store.list_memories(namespace=namespace_value) if self._runtime.store is not None else []
+        frames = self._runtime.store.list_logic_nodes(namespace=namespace_value) if self._runtime.store is not None else []
+        return self._worldview_materializer.rebuild(namespace=namespace_value, store=store, memories=memories, frames=frames).to_dict()
+
+    def _append_route_audit(self, experience: ExperienceEvent, decision: str, payload: dict[str, object]) -> None:
+        self._ledger.append(
+            LedgerEvent(
+                transaction_id=f"txn_route_{experience.event_id}",
+                namespace=experience.namespace,
+                agent_id=self.config.agent_id,
+                phase="AUDITED",
+                event_type="worldview_route_recorded",
+                operation=str(decision).upper(),
+                proposer="deterministic",
+                validator_decision="not_applicable",
+                evidence=[experience.to_dict()],
+                audit={"decision": decision, "payload": payload, "append_only": True},
+            )
+        )
+
+    def _append_support_evidence(self, experience: ExperienceEvent, impact: dict[str, object]) -> list[dict[str, object]]:
+        candidates = self._matching_worldview_candidates(impact)
+        events: list[dict[str, object]] = []
+        for candidate in candidates[:3]:
+            target_ids = [str(item) for item in candidate.get("source_memory_ids", [])] or [str(item) for item in candidate.get("source_frame_ids", [])]
+            target_kind = "memory" if candidate.get("source_memory_ids") else "frame"
+            for target_id in target_ids[:2]:
+                edge_event = EdgeEvidenceEvent(
+                    namespace=experience.namespace,
+                    source_kind="event",
+                    source_id=experience.event_id,
+                    target_kind=target_kind,
+                    target_id=target_id,
+                    relation="supports",
+                    relation_family="worldview",
+                    event_type="support",
+                    delta_weight=0.22,
+                    confidence=0.72,
+                    evidence_ids=[experience.event_id],
+                    proof_obligation=str(impact.get("reason") or "worldview impact routing"),
+                    proposer="worldview_impact_meter",
+                )
+                self._edge_appender.append(edge_event)
+                events.append(edge_event.to_dict())
+        self._append_route_audit(experience, "append_evidence", {"edge_evidence_events": events, "impact_id": impact.get("impact_id")})
+        return events
+
+    async def _propose_candidate_from_experience(self, experience: ExperienceEvent, impact: dict[str, object], *, worldview_candidate: bool) -> dict[str, object]:
+        slot_key = _impact_slot_key(impact) or _slot_key_from_experience(experience)
+        frame_type = _frame_type_from_experience(experience)
+        frame_id = f"frame_evt_{stable_hash({'namespace': experience.namespace, 'event_id': experience.event_id, 'slot_key': slot_key})[:16]}"
+        frame = FrameDeltaProposal(
+            operation="propose_frame",
+            frame_id=frame_id,
+            frame_type=frame_type,  # type: ignore[arg-type]
+            content=experience.content,
+            canonical_key=slot_key,
+            payload={"route": "propose_worldview_candidate" if worldview_candidate else "propose_frame", "source": experience.source, "metadata": dict(experience.metadata)},
+            source_event_ids=[experience.event_id],
+            evidence_ids=[experience.event_id],
+            confidence=max(0.55, min(0.78, float(impact.get("impact_score", 0.45)) + 0.35)),
+            commitment_level="candidate_frame",
+            lifecycle_state="candidate",
+            reason=str(impact.get("reason") or "worldview impact route proposed candidate frame"),
+            proposer="worldview_impact_meter",
+        )
+        policy = MemoryPolicyV2(
+            intent="consolidate",
+            proposer="WorldviewImpactMeter",
+            proposal_source="deterministic",
+            evidence_chain=[EvidenceRef(event_id=experience.event_id, source="experience_event", content_hash=experience.content_hash)],
+            target_selector={"memory_ids": [], "namespace": experience.namespace},
+            frame_deltas=[frame],
+            safety_annotations={"write_gate": {"decision": "defer", "durability_horizon": "thread", "commitment_level": "candidate_frame", "basis": "current_user_message", "signals": ["worldview_impact"], "rationale": str(impact.get("reason") or "")}},
+            rollback_plan=f"append-only candidate frame from {experience.event_id}",
+        )
+        commit_result = await self.commit(policy)
+        slot = self._ledger.upsert_worldview_slot(
+            WorldviewSlotRecord(
+                namespace=experience.namespace,
+                key=slot_key,
+                kind=_slot_kind_from_frame_type(frame_type),
+                scope="global",
+            )
+        )
+        candidate_event = WorldviewCandidateEvent(
+            namespace=experience.namespace,
+            slot_id=slot.slot_id,
+            candidate_id=frame_id,
+            event_type="proposed",
+            evidence_ids=[experience.event_id],
+            payload={"impact": impact, "frame_id": frame_id, "statement": experience.content},
+            proposer="worldview_impact_meter",
+        )
+        self._ledger.append_worldview_candidate_event(candidate_event)
+        supersession_events: list[dict[str, object]] = []
+        if worldview_candidate and float((impact.get("vector") or {}).get("supersession", 0.0) if isinstance(impact.get("vector"), dict) else 0.0) >= 0.5:
+            for candidate in self._matching_worldview_candidates(impact)[:3]:
+                for target_id in [str(item) for item in candidate.get("source_frame_ids", [])] or [str(item) for item in candidate.get("source_memory_ids", [])]:
+                    edge_event = EdgeEvidenceEvent(
+                        namespace=experience.namespace,
+                        source_kind="frame",
+                        source_id=frame_id,
+                        target_kind="frame" if candidate.get("source_frame_ids") else "memory",
+                        target_id=target_id,
+                        relation="supersedes",
+                        relation_family="worldview",
+                        event_type="supersede",
+                        delta_weight=-0.7,
+                        confidence=0.74,
+                        evidence_ids=[experience.event_id],
+                        proof_obligation=str(impact.get("reason") or "supersession proposed by impact meter"),
+                        proposer="worldview_impact_meter",
+                    )
+                    self._edge_appender.append(edge_event)
+                    supersession_events.append(edge_event.to_dict())
+        materialized = self._materialize_worldview_sync(experience.namespace)
+        self._append_route_audit(
+            experience,
+            "propose_worldview_candidate" if worldview_candidate else "propose_frame",
+            {"frame_id": frame_id, "candidate_event": candidate_event.to_dict(), "supersession_events": supersession_events},
+        )
+        return {
+            "frame_id": frame_id,
+            "candidate_event": candidate_event.to_dict(),
+            "supersession_events": supersession_events,
+            "commit_result": commit_result,
+            "materialized": materialized,
+        }
+
+    def _append_sleep_priority_marker(self, experience: ExperienceEvent, impact: dict[str, object]) -> dict[str, object]:
+        self._ledger.append(
+            LedgerEvent(
+                transaction_id=f"txn_sleep_priority_{experience.event_id}",
+                namespace=experience.namespace,
+                agent_id=self.config.agent_id,
+                phase="COMMITTED",
+                event_type="sleep_priority_marker_appended",
+                operation="PRIORITIZE_REPLAY",
+                proposer="worldview_impact_meter",
+                validator_decision="approved",
+                evidence=[experience.to_dict()],
+                targets=[experience.event_id],
+                audit={"impact": impact, "append_only": True},
+            )
+        )
+        return {"event_id": experience.event_id, "priority": impact.get("impact_score"), "reason": impact.get("reason")}
+
+    def _matching_worldview_candidates(self, impact: dict[str, object]) -> list[dict[str, object]]:
+        slot_key = _impact_slot_key(impact)
+        candidates = self._ledger.worldview_candidates(namespace=self.config.namespace)
+        if slot_key is None:
+            return candidates[:5]
+        matches = [candidate for candidate in candidates if str(candidate.get("slot_key")) == slot_key]
+        if matches:
+            return matches
+        terms = set(slot_key.replace(":", " ").replace("_", " ").split())
+        return [candidate for candidate in candidates if terms & set(str(candidate.get("statement", "")).lower().replace("_", " ").split())]
+
+    def _append_structural_evidence_from_policy(self, policy: MemoryPolicyV2, trace_id: str) -> dict[str, object]:
+        events: list[dict[str, object]] = []
+        candidate_events: list[dict[str, object]] = []
+        for delta in policy.associative_deltas:
+            event_type = _event_type_for_delta_operation(delta.operation, delta.relation)
+            edge_event = EdgeEvidenceEvent(
+                namespace=self.config.namespace,
+                source_kind="memory",
+                source_id=delta.source_memory_id,
+                target_kind="memory",
+                target_id=delta.target_memory_id,
+                relation=delta.relation,
+                relation_family="association",
+                event_type=event_type,
+                delta_weight=delta.weight if event_type in {"support", "reinforce", "restore", "generalize", "derive"} else -max(delta.weight, 0.2),
+                confidence=delta.confidence,
+                evidence_ids=list(delta.evidence_ids) or [f"trace:{trace_id}"],
+                proof_obligation=delta.reason,
+                proposer=delta.proposer,
+            )
+            self._edge_appender.append(edge_event)
+            events.append(edge_event.to_dict())
+        for delta in policy.logic_deltas:
+            event_type = _event_type_for_delta_operation(delta.operation, delta.relation)
+            edge_event = EdgeEvidenceEvent(
+                namespace=self.config.namespace,
+                source_kind="frame",
+                source_id=delta.source_frame_id,
+                target_kind="frame",
+                target_id=delta.target_frame_id,
+                relation=delta.relation,
+                relation_family="logic",
+                event_type=event_type,
+                delta_weight=delta.weight if event_type in {"support", "reinforce", "restore", "generalize", "derive"} else -max(delta.weight, 0.2),
+                confidence=delta.confidence,
+                evidence_ids=list(delta.evidence_ids) or [f"trace:{trace_id}"],
+                proof_obligation=delta.proof_obligation or delta.reason,
+                proposer=delta.proposer,
+            )
+            self._edge_appender.append(edge_event)
+            events.append(edge_event.to_dict())
+        for delta in policy.graph_deltas:
+            event_type = _event_type_for_delta_operation(delta.operation, delta.relation)
+            edge_event = EdgeEvidenceEvent(
+                namespace=self.config.namespace,
+                source_kind="memory",
+                source_id=delta.source_memory_id,
+                target_kind="memory",
+                target_id=delta.target_memory_id,
+                relation=delta.relation,
+                relation_family="logic" if delta.relation in {"supports", "contradicts", "supersedes", "inhibits", "derived_from", "generalizes"} else "association",
+                event_type=event_type,
+                delta_weight=delta.weight if event_type in {"support", "reinforce", "restore", "generalize", "derive"} else -max(delta.weight, 0.2),
+                confidence=delta.confidence,
+                evidence_ids=list(delta.evidence_ids) or [f"trace:{trace_id}"],
+                proof_obligation=delta.reason,
+                proposer=delta.proposer,
+            )
+            self._edge_appender.append(edge_event)
+            events.append(edge_event.to_dict())
+            associative_relation = _associative_relation_for_graph_delta(delta.relation, list(delta.candidate_sources))
+            if associative_relation is not None:
+                assoc_event = EdgeEvidenceEvent(
+                    namespace=self.config.namespace,
+                    source_kind="memory",
+                    source_id=delta.source_memory_id,
+                    target_kind="memory",
+                    target_id=delta.target_memory_id,
+                    relation=associative_relation,
+                    relation_family="association",
+                    event_type="support",
+                    delta_weight=min(delta.weight, 0.35),
+                    confidence=min(delta.confidence, 0.62),
+                    evidence_ids=list(delta.evidence_ids) or [f"trace:{trace_id}"],
+                    proof_obligation=delta.reason or f"activation association derived alongside {delta.relation}",
+                    proposer=delta.proposer,
+                )
+                self._edge_appender.append(assoc_event)
+                events.append(assoc_event.to_dict())
+        for frame in policy.frame_deltas:
+            slot = self._ledger.upsert_worldview_slot(
+                WorldviewSlotRecord(
+                    namespace=self.config.namespace,
+                    key=frame.canonical_key or _slot_key_from_text(frame.content, _slot_kind_from_frame_type(frame.frame_type)),
+                    kind=_slot_kind_from_frame_type(frame.frame_type),
+                    scope="global",
+                )
+            )
+            candidate_event = WorldviewCandidateEvent(
+                namespace=self.config.namespace,
+                slot_id=slot.slot_id,
+                candidate_id=frame.frame_id or f"frame_{stable_hash({'content': frame.content})[:16]}",
+                event_type=str(frame.operation),
+                evidence_ids=list(frame.evidence_ids) or [f"trace:{trace_id}"],
+                payload=frame.model_dump(mode="json"),
+                proposer=frame.proposer,
+            )
+            self._ledger.append_worldview_candidate_event(candidate_event)
+            candidate_events.append(candidate_event.to_dict())
+        return {"edge_evidence_events": events, "worldview_candidate_events": candidate_events}
+
     def _persist_trace(self, trace_id: str, data: dict[str, object]) -> None:
         self.config.traces_path.mkdir(parents=True, exist_ok=True)
         (self.config.traces_path / f"{trace_id}.json").write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
     def _assess_experience(self, experience: ExperienceEvent) -> WorldviewImpactAssessment:
         memories = self._runtime.store.list_memories(namespace=experience.namespace) if self._runtime.store is not None else []
-        return self._impact_meter.assess(experience, memories)
+        worldview_candidates = self._ledger.worldview_candidates(namespace=experience.namespace)
+        frames = self._runtime.store.list_logic_nodes(namespace=experience.namespace) if self._runtime.store is not None else []
+        edge_events = self._ledger.edge_evidence_events(namespace=experience.namespace)
+        return self._impact_meter.assess(experience, memories, worldview_candidates=worldview_candidates, frames=frames, edge_events=edge_events)
 
     def _memory_states(self) -> dict[str, dict[str, object]]:
         if self._runtime.store is None:
@@ -1220,12 +1661,46 @@ class MemoryRuntime:
         )
         if invalidate_retrieval_cache:
             self._invalidate_retrieval_cache()
+        if result.validated_mutation.approved:
+            result.trace.query_plan["append_only_structural_evidence"] = self._append_structural_evidence_from_policy(policy, result.trace.trace_id)
+            self._materialize_worldview_sync()
         self._persist_trace(result.trace.trace_id, result.trace.to_dict())
         return {
             "candidates": [candidate.to_dict() for candidate in candidates],
             "proposals": [proposal.model_dump(mode="json") for proposal in proposals],
             "result": result.to_dict(),
         }
+
+    def _select_sleep_replay_clusters(self, memories: list[MemoryItem]) -> list[list[str]]:
+        by_id = {memory.id: memory for memory in memories}
+        clusters: list[list[str]] = []
+        last_trace = self._runtime.last_trace
+        if last_trace is not None:
+            selected = [memory_id for memory_id in getattr(last_trace, "selected_memory_ids", []) if memory_id in by_id]
+            if len(selected) >= 2:
+                clusters.append(list(dict.fromkeys(selected))[:6])
+        high_impact_events = self._ledger.impact_assessments(namespace=self.config.namespace, limit=30)
+        high_impact_hashes = {str(item.get("event_id")) for item in high_impact_events if float(item.get("impact_score", 0.0)) >= 0.28 or str(item.get("impact_type")) in {"conflict", "supersession", "sleep_worthy"}}
+        impacted = [memory.id for memory in memories if set(memory.evidence) & high_impact_hashes or set(memory.source_event_ids) & high_impact_hashes]
+        if len(impacted) >= 2:
+            clusters.append(list(dict.fromkeys(impacted))[:6])
+        conflict_targets = {
+            str(event.get("target_id"))
+            for event in self._ledger.edge_evidence_events(namespace=self.config.namespace)
+            if event.get("event_type") in {"contradict", "supersede", "inhibit"}
+        }
+        conflict_cluster = [memory.id for memory in memories if memory.id in conflict_targets]
+        if len(conflict_cluster) >= 2:
+            clusters.append(conflict_cluster[:6])
+        clusters.extend(_fallback_sleep_clusters(memories))
+        deduped: list[list[str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for cluster in clusters:
+            key = tuple(sorted(set(cluster)))
+            if len(key) >= 2 and key not in seen:
+                seen.add(key)
+                deduped.append(list(key))
+        return deduped[:4]
 
     def _commit_sleep_crystallization(self, *, sleep_clusters: list[list[str]], evidence_ids: list[str], transaction_id: str) -> dict[str, object]:
         if self._runtime.store is None:
@@ -1298,6 +1773,10 @@ class MemoryRuntime:
                 agent_id=self.config.agent_id,
             ),
         )
+        self._persist_trace(result.trace.trace_id, result.trace.to_dict())
+        if result.validated_mutation.approved:
+            result.trace.query_plan["append_only_structural_evidence"] = self._append_structural_evidence_from_policy(policy, result.trace.trace_id)
+            self._materialize_worldview_sync()
         self._persist_trace(result.trace.trace_id, result.trace.to_dict())
         approved = result.validated_mutation.approved
         frame_payloads = [frame.model_dump(mode="json") for frame in frame_deltas]
@@ -1415,6 +1894,8 @@ def _copy_memory_context(context: MemoryContext) -> MemoryContext:
         cache=dict(context.cache),
         retrieval_metadata=dict(context.retrieval_metadata),
         worldview=dict(context.worldview) if context.worldview is not None else None,
+        worldview_trace=dict(context.worldview_trace) if context.worldview_trace is not None else None,
+        prompt_sections=dict(context.prompt_sections),
     )
 
 
@@ -1499,3 +1980,121 @@ def _fallback_sleep_clusters(memories: list[MemoryItem]) -> list[list[str]]:
             seen.add(unique)
             clusters.append(list(unique))
     return clusters[:3]
+
+
+def _impact_slot_key(impact: dict[str, object]) -> str | None:
+    slots = impact.get("impacted_slots", [])
+    if not isinstance(slots, list) or not slots:
+        return None
+    first = slots[0]
+    if isinstance(first, dict) and first.get("slot_key"):
+        return str(first["slot_key"])
+    return None
+
+
+def _slot_key_from_experience(experience: ExperienceEvent) -> str:
+    explicit = experience.metadata.get("slot_key") or experience.metadata.get("canonical_key")
+    if explicit:
+        return str(explicit).strip().lower().replace(" ", "_")
+    kind = _slot_kind_from_frame_type(_frame_type_from_experience(experience))
+    return _slot_key_from_text(experience.content, kind)
+
+
+def _slot_key_from_text(content: str, kind: str) -> str:
+    terms = [term.strip(".,:;!?()[]{}\"'").lower() for term in content.split() if len(term.strip(".,:;!?()[]{}\"'")) > 3]
+    return f"{kind}:{'_'.join(terms[:4]) or 'general'}"
+
+
+def _frame_type_from_experience(experience: ExperienceEvent) -> str:
+    kind = str(experience.metadata.get("type") or "").lower()
+    text = experience.content.lower()
+    if kind in {"user_preference", "preference"} or any(cue in text for cue in ["prefer", "喜欢", "偏好"]):
+        return "preference"
+    if kind in {"constraint"} or any(cue in text for cue in ["must", "never", "不要", "必须"]):
+        return "constraint"
+    if kind in {"rule", "procedure", "procedural"} or any(cue in text for cue in ["workflow", "procedure", "steps", "run", "流程"]):
+        return "procedure"
+    if kind in {"schema"}:
+        return "schema"
+    if kind in {"fact", "semantic"}:
+        return "fact"
+    return "claim"
+
+
+def _slot_kind_from_frame_type(frame_type: str) -> str:
+    if frame_type in {"fact", "entity"}:
+        return "fact"
+    if frame_type == "claim":
+        return "hypothesis"
+    if frame_type in {"preference", "constraint", "procedure", "schema"}:
+        return frame_type
+    if frame_type == "failure_pattern":
+        return "procedure"
+    return "hypothesis"
+
+
+def _event_type_for_delta_operation(operation: str, relation: str) -> str:
+    op = operation.lower()
+    rel = relation.lower()
+    if op in {"inhibit_edge"} or rel in {"inhibits"}:
+        return "inhibit"
+    if op in {"expire_edge"}:
+        return "expire"
+    if rel in {"contradicts"}:
+        return "contradict"
+    if rel in {"supersedes"}:
+        return "supersede"
+    if rel in {"generalizes", "specializes"}:
+        return "generalize"
+    if rel in {"derived_from", "compresses_to"}:
+        return "derive"
+    if rel in {"used_with_success"}:
+        return "reinforce"
+    if rel in {"used_with_failure"}:
+        return "inhibit"
+    return "support"
+
+
+def _associative_relation_for_graph_delta(relation: str, candidate_sources: list[str]) -> str | None:
+    sources = set(candidate_sources)
+    if relation in {"associated_with", "coactivated_with", "precedes", "retrieved_with", "same_trace", "same_episode", "nearby_context", "used_with_success", "used_with_failure"}:
+        return relation
+    if not sources & {"same_query_retrieval", "co_use_outcome", "same_sleep_cluster", "same_evidence_chain"}:
+        return None
+    if "same_sleep_cluster" in sources:
+        return "same_episode"
+    if "same_evidence_chain" in sources:
+        return "same_trace"
+    if "same_query_retrieval" in sources:
+        return "retrieved_with"
+    return "coactivated_with"
+
+
+def _prompt_sections_from_worldview(worldview: dict[str, object]) -> dict[str, str]:
+    sections: dict[str, str] = {}
+    prompt = worldview.get("prompt")
+    if prompt:
+        sections["worldview"] = str(prompt)
+    for key, title in [
+        ("facts", "Current facts"),
+        ("preferences", "User preferences"),
+        ("constraints", "Constraints"),
+        ("procedures", "Procedures"),
+        ("suppressions", "Suppressions / stale assumptions"),
+        ("conflicts", "Open conflicts"),
+    ]:
+        items = worldview.get(key, [])
+        if isinstance(items, list) and items:
+            lines = [f"[{title}]"]
+            for item in items[:8]:
+                if isinstance(item, dict):
+                    lines.append(f"- {item.get('statement') or item.get('slot_key')}")
+            sections[key] = "\n".join(lines)
+    supporting = worldview.get("supporting_memories", [])
+    if isinstance(supporting, list) and supporting:
+        lines = ["[Supporting memories]"]
+        for item in supporting[:8]:
+            if isinstance(item, dict):
+                lines.append(f"- {item.get('memory_id')}: {item.get('content')}")
+        sections["supporting_memories"] = "\n".join(lines)
+    return sections

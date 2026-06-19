@@ -140,9 +140,9 @@ def test_observe_and_route_uses_worldview_impact_gate(tmp_path) -> None:
         memory = await nmem.MemoryRuntime.local(namespace="demo", path=tmp_path / ".neuromem", allow_unsafe_internal=True)
         first = await memory.observe_and_route({"content": "User prefers concise answers.", "type": "user_preference", "keywords": ["style"]})
         assert first["impact"]["decision"] in {"propose_frame", "propose_worldview_candidate", "sleep_priority", "append_evidence"}
-        assert first["committed"] is True
-        created_id = first["bundle"]["memory_id"]
-        assert created_id is not None
+        assert first["committed"] is False
+        assert first["bundle"]["memory_id"] is None
+        assert first.get("frame_id") or first.get("edge_evidence_events") or first.get("sleep_priority")
 
         duplicate = await memory.observe_and_route({"content": "User prefers concise answers.", "type": "user_preference", "keywords": ["style"]})
         assert duplicate["impact"]["impact_type"] == "redundant"
