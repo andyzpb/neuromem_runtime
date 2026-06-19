@@ -38,6 +38,8 @@ QUERY_INTENTS = {
     "summary",
     "unknown",
 }
+SEMANTIC_RETRIEVAL_CHANNELS = frozenset({"dense", "entity", "canonical_fact", "fts5", "bm25", "lexical", "rewrite", "hyde"})
+CONTEXT_RETRIEVAL_CHANNELS = frozenset({"recent_current", "procedural_preference", "graph_seed"})
 
 
 class RerankProvider(Protocol):
@@ -158,6 +160,8 @@ class RetrievalCandidate:
     channel_scores: dict[str, float] = field(default_factory=dict)
     rrf_score: float = 0.0
     graph_score: float = 0.0
+    semantic_score: float = 0.0
+    context_score: float = 0.0
     reranker_score: float = 0.0
     final_score: float = 0.0
     graph_paths: list[list[str]] = field(default_factory=list)
@@ -171,6 +175,8 @@ class RetrievalCandidate:
             {
                 "rrf_score": round(self.rrf_score, 4),
                 "graph_score": round(self.graph_score, 4),
+                "semantic_score": round(self.semantic_score, 4),
+                "context_score": round(self.context_score, 4),
                 "reranker_score": round(self.reranker_score, 4),
                 "final_score": round(self.final_score, 4),
                 "provenance_trust": round(self.card.trust_score, 4),
@@ -531,20 +537,15 @@ class ActivationRetrievalEngine:
             memory = candidate.memory
             graph_score = activation.scores.get(memory.id, 0.0)
             candidate.graph_score = graph_score
-            channel_score = max(candidate.channel_scores.values(), default=0.0)
-            dense_or_entity = max(
-                candidate.channel_scores.get("dense", 0.0),
-                candidate.channel_scores.get("entity", 0.0),
-                candidate.channel_scores.get("canonical_fact", 0.0),
-                candidate.channel_scores.get("fts5", 0.0),
-                candidate.channel_scores.get("bm25", 0.0),
-            )
+            semantic_score = max((candidate.channel_scores.get(channel, 0.0) for channel in SEMANTIC_RETRIEVAL_CHANNELS), default=0.0)
+            context_score = max((candidate.channel_scores.get(channel, 0.0) for channel in CONTEXT_RETRIEVAL_CHANNELS), default=0.0)
+            candidate.semantic_score = semantic_score
+            candidate.context_score = context_score
             recency_style_penalty = 0.0
-            if plan.intent in {"fact_lookup", "temporal_current"}:
-                if not dense_or_entity and memory.type in {"preference", "procedural", "schema"}:
-                    recency_style_penalty += 0.12
-                if set(candidate.channel_scores) <= {"recent_current", "procedural_preference", "graph_seed"}:
-                    recency_style_penalty += 0.18
+            if not semantic_score and memory.type in {"preference", "procedural", "schema"}:
+                recency_style_penalty += 0.12
+            if candidate.channel_scores and set(candidate.channel_scores) <= CONTEXT_RETRIEVAL_CHANNELS:
+                recency_style_penalty += 0.2
             provenance_trust = candidate.card.trust_score
             lifecycle_boost = _lifecycle_boost(memory, plan)
             outcome_utility = min(1.0, memory.future_utility + memory.reinforcement_score)
@@ -556,13 +557,13 @@ class ActivationRetrievalEngine:
                 + (0.15 if config.require_provenance and not memory.evidence else 0.0)
             )
             candidate.reranker_score = (
-                0.28 * min(1.0, candidate.rrf_score * 20)
-                + (0.24 if plan.intent in {"fact_lookup", "temporal_current"} else 0.18) * channel_score
-                + (0.12 if plan.intent in {"fact_lookup", "temporal_current"} else 0.22) * graph_score
-                + (0.16 if plan.intent in {"fact_lookup", "temporal_current"} else 0.0) * dense_or_entity
+                0.16 * min(1.0, candidate.rrf_score * 20)
+                + 0.42 * semantic_score
+                + 0.12 * context_score
+                + 0.12 * graph_score
                 + 0.12 * provenance_trust
-                + 0.1 * lifecycle_boost
-                + 0.1 * outcome_utility
+                + 0.04 * lifecycle_boost
+                + 0.06 * outcome_utility
                 - penalty
             )
             candidate.final_score = max(0.0, candidate.reranker_score)

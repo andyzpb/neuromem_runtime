@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from neuromem.core.models import MemoryEdge, MemoryItem, MemoryQuery
-from neuromem.retrieval.activation import ActivationRetrievalEngine, build_query_plan_v2
+from neuromem.retrieval.activation import ActivationResult, ActivationRetrievalEngine, RetrievalCandidate, RetrievalConfig, build_memory_card, build_query_plan_v2
 from neuromem.stores.sqlite_store import SQLiteMemoryStore
 
 
@@ -59,6 +59,29 @@ def test_activation_retrieval_rrf_ppr_and_typed_edge_suppression(tmp_path) -> No
     assert stale.id in result.ledger_record.suppressed_ids
     assert result.ledger_record.fusion_scores
     assert result.ledger_record.reranker_scores
+
+
+def test_semantic_match_beats_context_only_candidate() -> None:
+    semantic = _memory("The user shared a specific travel meal memory with a named companion.", keywords=["travel", "meal", "companion"])
+    context_only = _memory("The user likes concise answers.", memory_type="preference", keywords=["preference"])
+    semantic_candidate = RetrievalCandidate(memory=semantic, card=build_memory_card(semantic))
+    semantic_candidate.channel_scores = {"dense": 0.82, "entity": 0.7}
+    semantic_candidate.rrf_score = 1 / 61
+    context_candidate = RetrievalCandidate(memory=context_only, card=build_memory_card(context_only))
+    context_candidate.channel_scores = {"recent_current": 1.0, "graph_seed": 0.95}
+    context_candidate.rrf_score = 1 / 60
+
+    plan = build_query_plan_v2("Who was involved in that travel meal?", filters={"query_intent": "fact_lookup"})
+    ActivationRetrievalEngine()._score(  # noqa: SLF001 - regression checks score composition directly.
+        [semantic_candidate, context_candidate],
+        plan,
+        RetrievalConfig(),
+        ActivationResult(scores={context_only.id: 0.8}),
+    )
+
+    assert semantic_candidate.semantic_score > 0
+    assert context_candidate.semantic_score == 0
+    assert semantic_candidate.final_score > context_candidate.final_score
 
 
 def test_lifecycle_gate_suppresses_inhibited_without_historical(tmp_path) -> None:
